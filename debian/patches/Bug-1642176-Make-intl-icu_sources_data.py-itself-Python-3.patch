@@ -1,0 +1,34 @@
+From: Jeff Walden <jwalden@mit.edu>
+Date: Tue, 2 Jun 2020 21:26:38 +0100
+Subject: Bug 1642176 - Make intl/icu_sources_data.py itself Python
+ 3-compatible
+
+Its dependencies, however, remain not fully Python 3-compatible. r=anba
+
+Differential Revision: https://phabricator.services.mozilla.com/D77605
+Origin: upstream, commit:https://hg.mozilla.org/mozilla-central/raw-rev/0b321870afdbde2cef5994f2f4e7504680d3d4b7
+---
+ intl/icu_sources_data.py | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/intl/icu_sources_data.py b/intl/icu_sources_data.py
+index 1037861..003f6a7 100644
+--- a/intl/icu_sources_data.py
++++ b/intl/icu_sources_data.py
+@@ -16,7 +16,6 @@ from __future__ import print_function
+ import glob
+ import multiprocessing
+ import os
+-import sets
+ import shutil
+ import subprocess
+ import sys
+@@ -29,7 +28,7 @@ from mozpack import path as mozpath
+ # if you need them. However, files marked with a "Cluster" comment
+ # can only be removed together, as they have (directional) dependencies.
+ # If you want to rerun this analysis, contact :decoder.
+-UNUSED_SOURCES = sets.Set([
++UNUSED_SOURCES = set([
+     'intl/icu/source/common/bytestrieiterator.cpp',
+     'intl/icu/source/common/cstr.cpp',
+     'intl/icu/source/common/cwchar.cpp',

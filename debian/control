@@ -6,7 +6,7 @@ Source: mozjs78
 Section: libs
 Priority: optional
 Maintainer: Debian GNOME Maintainers <pkg-gnome-maintainers@lists.alioth.debian.org>
-Uploaders: Iain Lane <laney@debian.org>, Jeremy Bicha <jbicha@debian.org>
+Uploaders: Iain Lane <laney@debian.org>, Jeremy Bicha <jbicha@ubuntu.com>, Tim Lunn <tim@feathertop.org>
 Build-Depends: debhelper-compat (= 13),
                gnome-pkg-tools,
                cargo,
@@ -14,7 +14,6 @@ Build-Depends: debhelper-compat (= 13),
                autoconf,
                autoconf2.13,
                automake,
-               libicu-dev (>= 67.1-4~),
                libreadline-dev,
                llvm,
                zlib1g-dev (>= 1:1.2.3),
