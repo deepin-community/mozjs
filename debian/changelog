@@ -1,3 +1,80 @@
+mozjs78 (78.15.0-5) unstable; urgency=medium
+
+  [ Steve Langasek ]
+  * Disable LTO, which gets confused trying to import the ICU dat file
+  * Invoke the js binary from the dist directory, not the source directory,
+    in debian/test.sh because for some reason the latter is not marked
+    executable
+
+  [ Jeremy Bicha ]
+  * Release to unstable (Closes: #1009442)
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Tue, 12 Apr 2022 16:05:50 -0400
+
+mozjs78 (78.15.0-4) experimental; urgency=medium
+
+  * Team upload
+  * Don't rebuild ICU data from first principles every time.
+    The version of its build system that went upstream in Mozilla
+    generates the data file when a new version is imported, and just
+    converts it from little-endian to big-endian during build if
+    necessary. Doing this resolves two FTBFS issues:
+    - regenerating the data file on a big-endian system breaks
+      build system assumptions in this area, so not doing that fixes
+      s390x and others;
+    - some parts of the vendored ICU library that are needed by
+      icu_sources_data.py, but not needed by a normal build, don't
+      link libatomic often enough for armel, so not doing that fixes
+      armel
+  * Remove downstream patches for icu_sources_data.py, since we no
+    longer run it.
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 22 Mar 2022 11:34:42 +0000
+
+mozjs78 (78.15.0-3) experimental; urgency=medium
+
+  * Team upload
+
+  [ Matthias Klose ]
+  * d/p/python3.10.diff:
+    Fix build with Python 3.10 as default
+
+  [ Simon McVittie ]
+  * d/rules, d/control: Disable system ICU library.
+    This gets mozjs78 out of the way of a planned transition from ICU 67
+    to either 70 or 71.
+  * d/patches/series: Don't apply system-ICU patches for this build
+  * d/p/Bug-1642176-Make-intl-icu_sources_data.py-itself-Python-3.patch,
+    d/p/Bug-1645779-Make-icu_sources_data.py-Python-3-compliant.patch:
+    Add patches to make vendored ICU Python-3-compatible.
+    Taken from upstream, already in version 91.
+  * d/p/Bug-1650299-Unify-the-inclusion-of-the-ICU-data-file.-r-f.patch,
+    d/p/Bug-1264836-Automatically-convert-the-little-endian-ICU-d.patch:
+    Add patches to fix vendored ICU for big-endian.
+    Taken from firefox-esr, already applied upstream in version 91.
+  * d/p/vendored-ICU/:
+    Move downstream patches that only affect vendored ICU into a
+    subdirectory
+  * d/p/Bug-1526653-Include-struct-definitions-for-user_vfp-and-u.patch:
+    Add patch from firefox-esr to fix WASM on armhf
+  * d/p/Don-t-build-ICU-in-parallel.patch:
+    Add patch from firefox-esr to not always build ICU in parallel
+  * d/p/Skip-a-test-for-backward-compatible-time-zone-aliases.patch:
+    Skip one test even when not using system ICU.
+    This turns out to fail with the vendored ICU as well.
+  * Move patches for system ICU (not currently applied) into a subdirectory
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 21 Mar 2022 20:48:22 +0000
+
+mozjs78 (78.15.0-2) unstable; urgency=medium
+
+  * Team upload
+  * d/p/Fix-armhf-build-for-GCC-11-627.patch:
+    Add patch from cc-rs to fix FTBFS on armhf with gcc-11 build-time
+    configuration changes (Closes: #1001314)
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 08 Dec 2021 09:51:24 +0000
+
 mozjs78 (78.15.0-1) unstable; urgency=medium
 
   * New upstream release

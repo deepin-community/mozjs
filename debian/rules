@@ -11,12 +11,12 @@ export DEB_CFLAGS_MAINT_APPEND=-fcf-protection=none
 export DEB_CXXFLAGS_MAINT_APPEND=-fcf-protection=none
 endif
 
+export DEB_BUILD_MAINT_OPTIONS=optimize=-lto
+
 # Uncomment this to turn on verbose mode.
 #export DH_VERBOSE=1
 
-# This can be disabled if the bundled icu overtakes the system version,
-# or for backporting
-WITH_SYSTEM_ICU = yes
+WITH_SYSTEM_ICU = no
 
 export DEB_HOST_ARCH
 # mozjs' build process does not seem to be compatible with other shells
@@ -121,9 +121,6 @@ CXX := $(DEB_HOST_GNU_TYPE)-g++
 endif
 
 override_dh_auto_configure:
-ifneq ($(WITH_SYSTEM_ICU),yes)
-	VERBOSE=1 $(PYTHON3) intl/icu_sources_data.py "$(CURDIR)"
-endif
 	mkdir -p $(BUILDDIR)
 	cd $(BUILDDIR); \
 	if env \

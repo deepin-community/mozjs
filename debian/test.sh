@@ -4,7 +4,7 @@
 : "${BUILDDIR:=./debian/build}"
 : "${DEB_HOST_ARCH:=$(dpkg --print-architecture)}"
 
-if "$BUILDDIR/js/src/js" -e 'print("Hello, world")'; then
+if "$BUILDDIR/dist/bin/js" -e 'print("Hello, world")'; then
 	echo "Smoke-test successful, continuing with full test suite"
 else
 	echo "Smoke-test failed: did interpreter initialization fail? (see #873778)"
