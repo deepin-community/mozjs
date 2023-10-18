@@ -7,7 +7,10 @@
 #ifndef js_SliceBudget_h
 #define js_SliceBudget_h
 
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
 #include "mozilla/TimeStamp.h"
+#include "mozilla/Variant.h"
 
 #include <stdint.h>
 
@@ -16,77 +19,123 @@
 namespace js {
 
 struct JS_PUBLIC_API TimeBudget {
-  int64_t budget;
+  const mozilla::TimeDuration budget;
+  mozilla::TimeStamp deadline;  // Calculated when SliceBudget is constructed.
 
-  explicit TimeBudget(int64_t milliseconds) { budget = milliseconds; }
+  explicit TimeBudget(mozilla::TimeDuration duration) : budget(duration) {}
+  explicit TimeBudget(int64_t milliseconds)
+      : budget(mozilla::TimeDuration::FromMilliseconds(milliseconds)) {}
+
+  void setDeadlineFromNow();
 };
 
 struct JS_PUBLIC_API WorkBudget {
-  int64_t budget;
+  const int64_t budget;
 
-  explicit WorkBudget(int64_t work) { budget = work; }
+  explicit WorkBudget(int64_t work) : budget(work) {}
 };
 
+struct UnlimitedBudget {};
+
 /*
- * This class records how much work has been done in a given collection slice,
- * so that we can return before pausing for too long. Some slices are allowed
- * to run for unlimited time, and others are bounded. To reduce the number of
- * gettimeofday calls, we only check the time every 1000 operations.
+ * This class describes a limit to the amount of work to be performed in a GC
+ * slice, so that we can return to the mutator without pausing for too long. The
+ * budget may be based on a deadline time or an amount of work to be performed,
+ * or may be unlimited.
+ *
+ * To reduce the number of gettimeofday calls, we only check the time every 1000
+ * operations.
  */
 class JS_PUBLIC_API SliceBudget {
-  static mozilla::TimeStamp unlimitedDeadline;
-  static const intptr_t unlimitedStartCounter = INTPTR_MAX;
+ public:
+  using InterruptRequestFlag = mozilla::Atomic<bool>;
+
+  // Whether this slice is running in (predicted to be) idle time.
+  // Only used for recording in the profile.
+  bool idle = false;
+
+  // Whether this slice was given an extended budget, larger than
+  // the predicted idle time.
+  bool extended = false;
+
+ private:
+  static const intptr_t UnlimitedCounter = INTPTR_MAX;
+
+  // Most calls to isOverBudget will only check the counter value. Every N
+  // steps, do a more "expensive" check -- look at the current time and/or
+  // check the atomic interrupt flag.
+  static constexpr intptr_t StepsPerExpensiveCheck = 1000;
+
+  // Configuration
+
+  mozilla::Variant<TimeBudget, WorkBudget, UnlimitedBudget> budget;
+
+  // External flag to request the current slice to be interrupted
+  // (and return isOverBudget() early.) Applies only to time-based budgets.
+  InterruptRequestFlag* interruptRequested = nullptr;
+
+  // How many steps to count before checking the time and possibly the interrupt
+  // flag.
+  int64_t counter = StepsPerExpensiveCheck;
+
+  // This SliceBudget is considered interrupted from the time isOverBudget()
+  // finds the interrupt flag set.
+  bool interrupted = false;
+
+  explicit SliceBudget(InterruptRequestFlag* irqPtr)
+      : budget(UnlimitedBudget()),
+        interruptRequested(irqPtr),
+        counter(irqPtr ? StepsPerExpensiveCheck : UnlimitedCounter) {}
 
   bool checkOverBudget();
 
-  SliceBudget();
-
  public:
-  // Memory of the originally requested budget. If isUnlimited, neither of
-  // these are in use. If deadline==0, then workBudget is valid. Otherwise
-  // timeBudget is valid.
-  TimeBudget timeBudget;
-  WorkBudget workBudget;
+  // Use to create an unlimited budget.
+  static SliceBudget unlimited() { return SliceBudget(nullptr); }
 
-  mozilla::TimeStamp deadline;
-  intptr_t counter;
+  // Instantiate as SliceBudget(TimeBudget(n)).
+  explicit SliceBudget(TimeBudget time,
+                       InterruptRequestFlag* interrupt = nullptr);
 
-  static const intptr_t CounterReset = 1000;
+  explicit SliceBudget(mozilla::TimeDuration duration,
+                       InterruptRequestFlag* interrupt = nullptr)
+      : SliceBudget(TimeBudget(duration.ToMilliseconds()), interrupt) {}
 
-  static const int64_t UnlimitedTimeBudget = -1;
-  static const int64_t UnlimitedWorkBudget = -1;
-
-  /* Use to create an unlimited budget. */
-  static SliceBudget unlimited() { return SliceBudget(); }
-
-  /* Instantiate as SliceBudget(TimeBudget(n)). */
-  explicit SliceBudget(TimeBudget time);
-
-  /* Instantiate as SliceBudget(WorkBudget(n)). */
+  // Instantiate as SliceBudget(WorkBudget(n)).
   explicit SliceBudget(WorkBudget work);
 
-  void makeUnlimited() {
-    MOZ_ASSERT(unlimitedDeadline);
-    deadline = unlimitedDeadline;
-    counter = unlimitedStartCounter;
+  // Register having performed the given number of steps (counted against a
+  // work budget, or progress towards the next time or callback check).
+  void step(uint64_t steps = 1) {
+    MOZ_ASSERT(steps > 0);
+    counter -= steps;
   }
 
-  void step(intptr_t amt = 1) { counter -= amt; }
-
-  bool isOverBudget() {
-    if (counter > 0) {
-      return false;
+  // Do enough steps to force an "expensive" (time and/or callback) check on
+  // the next call to isOverBudget. Useful when switching between major phases
+  // of an operation like a cycle collection.
+  void stepAndForceCheck() {
+    if (!isUnlimited()) {
+      counter = 0;
     }
-    return checkOverBudget();
   }
 
-  bool isWorkBudget() const { return deadline.IsNull(); }
-  bool isTimeBudget() const { return !deadline.IsNull() && !isUnlimited(); }
-  bool isUnlimited() const { return deadline == unlimitedDeadline; }
+  bool isOverBudget() { return counter <= 0 && checkOverBudget(); }
+
+  bool isWorkBudget() const { return budget.is<WorkBudget>(); }
+  bool isTimeBudget() const { return budget.is<TimeBudget>(); }
+  bool isUnlimited() const { return budget.is<UnlimitedBudget>(); }
+
+  int64_t timeBudget() const {
+    return budget.as<TimeBudget>().budget.ToMilliseconds();
+  }
+  int64_t workBudget() const { return budget.as<WorkBudget>().budget; }
+
+  mozilla::TimeStamp deadline() const {
+    return budget.as<TimeBudget>().deadline;
+  }
 
   int describe(char* buffer, size_t maxlen) const;
-
-  static void Init();
 };
 
 }  // namespace js

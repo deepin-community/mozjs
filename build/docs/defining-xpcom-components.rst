@@ -4,6 +4,11 @@
 Defining XPCOM C++-implemented Components
 =========================================
 
+This document explains how to write a :code:`components.conf` file. For
+documentation on the idl format see :ref:`XPIDL`. For a tutorial on writing
+a new XPCOM interface, see
+:ref:`writing_xpcom_interface`.
+
 Native XPCOM components are registered at build time, and compiled into static
 data structures which allow them to be accessed with little runtime overhead.
 Each module which wishes to register components must provide a manifest
@@ -29,13 +34,13 @@ The files may define any of the following special variables:
     # Optional: A function to be called at shutdown if any component listed in
     # this manifest has been instantiated.
     UnloadFunc = 'nsUnloadFooModule'
-    
+
     # Optional: A processing priority, to determine how early or late the
     # manifest is processed. Defaults to 50. In practice, this mainly affects
     # the order in which unload functions are called at shutdown, with higher
     # priority numbers being called later.
     Priority = 10
-    
+
     # Optional: A list of header files to include before calling init or
     # unload functions, or any legacy constructor functions.
     #
@@ -47,7 +52,7 @@ The files may define any of the following special variables:
         '/foo/nsFooModule.h',
         'nsFoo.h',
     ]
-    
+
     # A list of component classes provided by this module.
     Classes = [
         {
@@ -55,6 +60,16 @@ The files may define any of the following special variables:
         },
         # ...
     ]
+
+    # A list of category registrations
+    Categories = {
+        'category': {
+            'name': 'value',
+            'other-name': ('value', ProcessSelector.MAIN_PROCESS_ONLY),
+            # ...
+        },
+        # ...
+    }
 
 Class definitions may have the following properties:
 
@@ -66,7 +81,7 @@ Class definitions may have the following properties:
   ``components::Foo::Create()``, respectively.
 
 ``cid``
-  A UUID string containing this component's CID, in the form 
+  A UUID string containing this component's CID, in the form
   ``'{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}'``.
 
 ``contract_ids`` (optional)
@@ -75,7 +90,11 @@ Class definitions may have the following properties:
 ``categories`` (optional)
   A dict of category entries to register for this component's contract ID.
   Each key in the dict is the name of the category. Each value is either a
-  string containing a single entry name, or a list of entry name strings.
+  string containing a single entry, or a list of entries.  Each entry is either
+  a string name, or a dictionary of the form ``{'name': 'value', 'backgroundtasks':
+  BackgroundTasksSelector.ALL_TASKS}``.  By default, category entries are registered
+  for **no background tasks**: they have
+  ``'backgroundtasks': BackgroundTasksSelector.NO_TASKS``.
 
 ``type`` (optional, default=``nsISupports``)
   The fully-qualified type of the class implementing this component. Defaults
@@ -99,7 +118,7 @@ Class definitions may have the following properties:
   headers listed in the ``headers`` property, must take no arguments, and must
   return ``already_AddRefed<iface>`` where ``iface`` is the interface provided
   in the ``type`` property.
-  
+
   This property is incompatible with ``legacy_constructor``.
 
 ``jsm`` (optional)
@@ -110,13 +129,13 @@ Class definitions may have the following properties:
 
 ``legacy_constructor`` (optional)
   This property is deprecated, and should not be used in new code.
-  
+
   The fully-qualified name of a constructor function to call in order to
   create instances of this class. This function must be declared in one of the
   headers listed in the ``headers`` property, and must have the signature
-  ``nsresult(nsISupports* aOuter, const nsID& aIID, void** aResult)``, and
-  behave equivalently to ``nsIFactory::CreateInstance``.
-  
+  ``nsresult(const nsID& aIID, void** aResult)``, and behave equivalently to
+  ``nsIFactory::CreateInstance``.
+
   This property is incompatible with ``constructor``.
 
 ``singleton`` (optional, default=``False``)
@@ -129,10 +148,10 @@ Class definitions may have the following properties:
   tests, and its ``mozilla::components::<name>::Service()`` getter will
   therefore look it up by contract ID for every call. This component must,
   therefore, provide at least one contract ID in its ``contract_ids`` array.
-  
+
   If false, the ``Service()`` getter will always retrieve the service based on
   its static data, and it cannot be overridden.
-  
+
   Note: Enabling this option is expensive, and should not be done when it can
   be avoided, or when the getter is used by any hot code.
 
@@ -141,10 +160,10 @@ Class definitions may have the following properties:
   another translation unit, using ``NS_IMPL_COMPONENT_FACTORY(type)``. The
   constructor must return an ``already_AddRefed<nsISupports>``, and will be
   used to construct instances of this type.
-  
+
   This option should only be used in cases where the headers which define the
   component's concrete type cannot be easily included without local includes.
-  
+
   Note: External constructors may not specify an ``init_method``, since the
   generated code will not have the necessary type information required to call
   it. This option is also incompatible with ``constructor`` and
@@ -270,3 +289,25 @@ This will define each of the following category entries:
 * ``"content-policy"`` ``"m-foo",`` ``"@mozilla.org/foo;1"``
 * ``"Gecko-Content-Viewers"`` ``"image/jpeg"`` ``"@mozilla.org/foo;1"``
 * ``"Gecko-Content-Viewers"`` ``"image/png"`` ``"@mozilla.org/foo;1"``
+
+Some category entries do not have a contract ID as a value. These entries can
+be specified by adding to a global ``Categories`` dictionary:
+
+.. code-block:: python
+
+    Categories = {
+        'app-startup': {
+            'Mapi Support': 'service,@mozilla.org/mapisupport;1',
+        }
+    }
+
+It is possible to limit these on a per-process basis by using a tuple as the
+value:
+
+.. code-block:: python
+
+    Categories = {
+        'app-startup': {
+            'MainProcessSingleton': ('service,@mozilla.org/main-process-singleton;1', ProcessSelector.MAIN_PROCESS_ONLY),
+        }
+    }

@@ -1,3 +1,337 @@
+mozjs102 (102.15.1-1) unstable; urgency=medium
+
+  * New upstream release
+    - This is the final upstream release in the 102 series.
+      It's recommended to switch to mozjs115 instead.
+
+ -- Jeremy Bícha <jbicha@ubuntu.com>  Mon, 18 Sep 2023 16:30:07 -0400
+
+mozjs102 (102.15.0-1) unstable; urgency=medium
+
+  * New upstream release
+    - This is the final upstream release in the 102 series.
+      It's recommended to switch to mozjs115 instead.
+
+ -- Jeremy Bícha <jbicha@ubuntu.com>  Fri, 01 Sep 2023 16:58:48 -0400
+
+mozjs102 (102.14.0-1) unstable; urgency=high
+
+  * New upstream release
+    - CVE-2023-4046: Incorrect value used during WASM compilation
+
+ -- Jeremy Bícha <jbicha@ubuntu.com>  Thu, 03 Aug 2023 11:29:17 -0400
+
+mozjs102 (102.13.0-1) unstable; urgency=high
+
+  * New upstream release (LP: #2026197)
+    - CVE-2023-37202: Potential use-after-free from compartment mismatch
+      in SpiderMonkey
+    - CVE-2023-37211: Memory safety bugs
+
+ -- Jeremy Bícha <jbicha@ubuntu.com>  Wed, 05 Jul 2023 09:05:35 -0400
+
+mozjs102 (102.12.0-1) unstable; urgency=high
+
+  * New upstream release (LP: #2023047) (Closes: #1037158)
+    - CVE-2023-34416: Memory safety bugs
+  * Update debian/upstream/signing-key.asc per upstream rotation
+
+ -- Jeremy Bícha <jbicha@ubuntu.com>  Tue, 06 Jun 2023 11:20:22 -0400
+
+mozjs102 (102.11.0-1) unstable; urgency=high
+
+  * New upstream release (LP: #2018905)
+    - CVE-2023-32205: Browser prompts could have been obscured by popups
+    - CVE-2023-32206: Crash in RLBox Expat driver
+    - CVE-2023-32207: Potential permissions request bypass via clickjacking
+    - CVE-2023-32211: Content process crash due to invalid wasm code
+    - CVE-2023-32212: Potential spoof due to obscured address bar
+    - CVE-2023-32213: Potential memory corruption in FileReader::DoReadData()
+    - CVE-2023-32214: Potential DoS via exposed protocol handlers
+    - CVE-2023-32215: Memory safety bugs
+
+ -- Jeremy Bícha <jbicha@ubuntu.com>  Mon, 08 May 2023 11:59:12 -0400
+
+mozjs102 (102.10.0-1) unstable; urgency=high
+
+  * New upstream release (LP: #2015880)
+    - CVE-2023-29536: Invalid free from JavaScript code
+    - CVE-2023-29548: Incorrect optimization result on ARM64
+    - CVE-2023-29550: Memory safety bugs
+    - CVE-2023-29535: Potential Memory Corruption following Garbage Collector
+      compaction
+
+ -- Jeremy Bícha <jbicha@ubuntu.com>  Mon, 10 Apr 2023 19:48:42 -0400
+
+mozjs102 (102.9.0-1) unstable; urgency=high
+
+  [ Jeremy Bicha ]
+  * New upstream release
+    - CVE-2023-25751: Incorrect code generation during JIT compilation
+
+  [ John Paul Adrian Glaubitz ]
+  * Disable large-arraybuffers/base.js on all big-endian targets
+    (Closes: #1020700)
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Mon, 13 Mar 2023 11:03:53 -0400
+
+mozjs102 (102.8.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * Drop Python 3.11 patch: applied in new release
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Wed, 15 Feb 2023 08:57:21 -0500
+
+mozjs102 (102.7.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * Cherry-pick patch to fix build with Python 3.11 (Closes: #1028716)
+  * Re-export upstream signing key without extra signatures
+  * Update standards version to 4.6.2, no changes needed
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Tue, 17 Jan 2023 15:57:16 -0500
+
+mozjs102 (102.6.0-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Mon, 12 Dec 2022 17:16:33 -0500
+
+mozjs102 (102.5.0-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Tue, 15 Nov 2022 12:28:41 -0500
+
+mozjs102 (102.4.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * Drop ARMv7 atomic operations patch: applied in new release
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Mon, 17 Oct 2022 14:03:07 -0400
+
+mozjs102 (102.3.0-1) unstable; urgency=medium
+
+  * Team upload
+
+  [ Jeremy Bicha ]
+  * New upstream release
+
+  [ Simon McVittie ]
+  * d/p/jit-Only-use-ARMv7-atomic-operations-on-ARMv7-or-higher.patch:
+  * Add patch to avoid using ARMv7 atomic operations on armel
+  * d/p/js-Enable-JIT-by-default-on-ARMv7-or-up-but-not-ARMv6-or-.patch:
+    Attempt to solve FTBFS on armel by disabling JIT
+  * Update Lintian overrides
+  * d/copyright: Remove patterns that no longer match anything
+  * Standards-Version: 4.6.1 (no changes required)
+
+  [ Adrian Bunk ]
+  * d/p/js-arm-i386-no-simd.patch:
+    Avoid SIMD (SSE/NEON) on 32-bit ARM and x86. It is not in the baseline
+    of our i386/armel/armhf ports.
+  * d/rules: Build with -Wl,--allow-multiple-definition on armel
+    (works around mozjs102's equivalent of mozjs91 bug #1017979)
+  * Go back to using the default gcc on armel (Closes: #1018047)
+  * Exclude basic/bug-1649234-1.js test on armel (Closes: #1017961)
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 24 Sep 2022 20:53:33 +0100
+
+mozjs102 (102.2.0-2) unstable; urgency=medium
+
+  [ Simon McVittie ]
+  * d/rules: Pre-create debian/build/dist/cppunittests/ as a directory
+  * d/test.sh: Explicitly mark js executable as executable
+  * Build using gcc-11 on armel
+    (works around mozjs102's equivalent of mozjs91 bug #1017979)
+  * Add patch to avoid "impossible constraints" on armhf (Closes: #1017962)
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Wed, 24 Aug 2022 11:39:02 -0400
+
+mozjs102 (102.2.0-1) unstable; urgency=medium
+
+  [ Jeremy Bicha ]
+  * New upstream release
+  * Drop 2 cherry-picked patches applied in new release
+
+  [ Mike Homney ]
+  * Add patch to remove workaround for old libstdc++ problem,
+    which now causes problems with GCC 12 on arm
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Mon, 22 Aug 2022 11:55:51 -0400
+
+mozjs102 (102.1.0-2) unstable; urgency=medium
+
+  * Rebuild after NEW acceptance
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Tue, 16 Aug 2022 07:34:33 -0400
+
+mozjs102 (102.1.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * Refresh patches
+  * Cherry-pick 2 patches recommended by GNOME
+  * Copy patch from Debian Firefox to allow building with older cargo
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Mon, 08 Aug 2022 16:21:11 -0400
+
+mozjs91 (91.12.0-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Mon, 08 Aug 2022 13:50:42 -0400
+
+mozjs91 (91.10.0-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Wed, 01 Jun 2022 10:07:16 -0400
+
+mozjs91 (91.8.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * Drop Bug-1687417-MIPS32 patch: applied in new release
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Thu, 21 Apr 2022 15:34:55 -0400
+
+mozjs91 (91.7.0-5) unstable; urgency=medium
+
+  * Upload to unstable
+
+ -- Jeremy Bicha <jbicha@ubuntu.com>  Wed, 23 Mar 2022 10:45:50 -0400
+
+mozjs91 (91.7.0-4) experimental; urgency=medium
+
+  * Team upload
+  * Build with vendored copy of ICU until the system copy is >= 69.1.
+    This decouples the GNOME Shell 42 (libmutter-10.so.0) transition from
+    the ICU 70 (or possibly 71) transition.
+  * d/p/series:
+    Don't apply patches to skip tests that failed with system ICU
+    (the patches are still present, and we should reapply them when
+    the system copy catches up)
+  * d/p/vendored-ICU/tests-Skip-comparison-of-tzdata-version-number.patch:
+    Add patch to fix test failure with vendored ICU
+  * Don't rebuild ICU data from first principles every time.
+    The version of its build system that went upstream in Mozilla
+    generates the data file when a new version is imported, and just
+    converts it from little-endian to big-endian during build if
+    necessary. Doing this resolves two FTBFS issues:
+    - regenerating the data file on a big-endian system breaks
+      build system assumptions in this area, so not doing that fixes
+      s390x and others;
+    - some parts of the vendored ICU library that are needed by
+      icu_sources_data.py, but not needed by a normal build, don't
+      link libatomic often enough for armel, so not doing that fixes
+      armel
+  * Remove downstream patches for icu_sources_data.py, since we no
+    longer run it.
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 22 Mar 2022 13:04:52 +0000
+
+mozjs91 (91.7.0-3) experimental; urgency=medium
+
+  * Team upload
+  * Re-upload to experimental, to avoid the experimental version being
+    superseded by the version in unstable, which can't be built until
+    after the icu 70 transition (unless we start building with the
+    bundled icu).
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 09 Mar 2022 12:12:22 +0000
+
+mozjs91 (91.7.0-2) unstable; urgency=medium
+
+  * Include changes from 91.6.0-2 that were accidentally dropped
+
+ -- Jeremy Bicha <jeremy.bicha@canonical.com>  Tue, 08 Mar 2022 16:30:35 -0500
+
+mozjs91 (91.7.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * Release to unstable
+
+ -- Jeremy Bicha <jeremy.bicha@canonical.com>  Tue, 08 Mar 2022 15:40:50 -0500
+
+mozjs91 (91.6.0-2) experimental; urgency=medium
+
+  Team upload
+
+  [ Marco Trevisan (Treviño) ]
+  * d/p/jstests-skip-fp-evaluation-order-test-in-some-archs.patch:
+    Skip fp-evaluation-order.js on all ppc64 architectures
+
+  [ Simon McVittie ]
+  * d/p/Bug-1687417-MIPS32-nojit-silence-an-assert.patch:
+    Add patch from Firefox 94 to fix compilation on mipsel.
+    Thanks to Adrian Bunk
+  * d/p/Fix-math_private.h-for-i386-FTBFS.patch:
+    Add patch from firefox-esr to fix compilation on i386.
+    This partially resolves FTBFS on i386, although there is also a test
+    failure in test262/built-ins/Date/UTC/fp-evaluation-order.js which is
+    not yet resolved.
+    Thanks to Mike Hommey
+  * d/p/jstests-skip-fp-evaluation-order-test-in-some-archs.patch:
+    Add i386 to the architectures where fp-evaluation-order.js is skipped.
+    Reduces severity of: #1006152
+  * d/rules: Skip another test on i386.
+    The result differs very slightly from what was expected, presumably
+    because as long as our baseline doesn't guarantee SSE, we have no way
+    to disable i387 extended precision.
+  * d/p/tests-Accept-out-of-memory-as-close-enough-to-allocation-.patch
+    Add patch to fix FTBFS on machines with relatively limited RAM
+    (Closes: #1006196)
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 21 Feb 2022 21:48:05 +0000
+
+mozjs91 (91.6.0-1) experimental; urgency=medium
+
+  [ Marco Trevisan (Treviño) ]
+  * New upstream release
+  * debian/patches: Refresh
+  * debian/patches: Skip fp-evauation-order tests in some archs
+  * debian/rules: Skip large arraybuffers tests in s390x
+
+  [ Jeremy Bicha ]
+  * Revert "debian/patches/series: Disable system-ICU related patches"
+  * Revert "debian/rules: Disable building with system ICU for now"
+  * Disable non262-Intl-DateTimeFormat-timeZone_version.js-Update-ver.patch
+  * Revert "debian/control: Remove dependency on libicu, given it's disabled for now"
+
+ -- Marco Trevisan (Treviño) <marco@ubuntu.com>  Tue, 15 Feb 2022 19:56:29 +0100
+
+mozjs91 (91.5.1-1) experimental; urgency=medium
+
+  [ Marco Trevisan (Treviño) ]
+  * New upstream release (Closes: #1004739)
+  * debian/patches: Refresh
+  * debian/control: Bump dependency on libicu-dev 69.1
+  * debian/tests.sh: Update python3 path for running JIT tests
+  * debian/patches: Move system-ICU related ones to different topic
+  * jstests: Skip property-escapes tests, unsupported by system ICU
+  * tests: Ignore POSIX/posix mismatch in tests
+  * tests: Use debian provided locale format to check formatted CN dates
+  * tests: Adapt subtags test to debian ICU computed values
+  * tests: Disable failing DateTimeFormat tests with system ICU
+  * DateTimeFormat: Use normal parenthesis instead of ICU "├ ┤"
+  * debian/patches: Also skip Date-time-zones-imported test with embedded ICU
+  * non262/Intl/DateTimeFormat/timeZone_version.js: Update version to match source
+  * debian/control: Remove dependency on libicu, given it's disabled for now
+  * debian/patches/series: Disable system-ICU related patches
+
+  [ Jeremy Bicha ]
+  * debian/rules: Disable building with system ICU for now
+
+ -- Jeremy Bicha <jeremy.bicha@canonical.com>  Sat, 05 Feb 2022 14:18:20 -0500
+
+mozjs78 (78.15.0-2) unstable; urgency=medium
+
+  * Team upload
+  * d/p/Fix-armhf-build-for-GCC-11-627.patch:
+    Add patch from cc-rs to fix FTBFS on armhf with gcc-11 build-time
+    configuration changes (Closes: #1001314)
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 08 Dec 2021 09:51:24 +0000
+
 mozjs78 (78.15.0-1) unstable; urgency=medium
 
   * New upstream release
@@ -832,7 +1166,7 @@ mozjs24 (24.2.0-0ubuntu1) trusty; urgency=medium
   * debian/copyright: Upgrade to 1.0 format, add python-which license,
     remove unused MPL-1.1 license.
 
- -- Tim Lunn <tim@feathertop.org>  Wed, 11 Feb 2014 21:55:34 +1100
+ -- Tim Lunn <tim@feathertop.org>  Tue, 11 Feb 2014 21:55:34 +1100
 
 mozjs17 (17.0.0-1ubuntu1) trusty; urgency=medium
 

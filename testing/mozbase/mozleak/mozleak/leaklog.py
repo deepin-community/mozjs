@@ -7,31 +7,43 @@ from __future__ import absolute_import
 import os
 import re
 
+from geckoprocesstypes import process_types
+
 
 def _get_default_logger():
     from mozlog import get_default_logger
-    log = get_default_logger(component='mozleak')
+
+    log = get_default_logger(component="mozleak")
 
     if not log:
         import logging
+
         log = logging.getLogger(__name__)
     return log
 
 
-def process_single_leak_file(leakLogFileName, processType, leakThreshold,
-                             ignoreMissingLeaks, log=None,
-                             stackFixer=None, scope=None, allowed=None):
-    """Process a single leak log.
-    """
+def process_single_leak_file(
+    leakLogFileName,
+    processType,
+    leakThreshold,
+    ignoreMissingLeaks,
+    log=None,
+    stackFixer=None,
+    scope=None,
+    allowed=None,
+):
+    """Process a single leak log."""
 
     #     |              |Per-Inst  Leaked|     Total  Rem|
     #   0 |TOTAL         |      17     192| 419115886    2|
     # 833 |nsTimerImpl   |      60     120|     24726    2|
     # 930 |Foo<Bar, Bar> |      32       8|       100    1|
-    lineRe = re.compile(r"^\s*\d+ \|"
-                        r"(?P<name>[^|]+)\|"
-                        r"\s*(?P<size>-?\d+)\s+(?P<bytesLeaked>-?\d+)\s*\|"
-                        r"\s*-?\d+\s+(?P<numLeaked>-?\d+)")
+    lineRe = re.compile(
+        r"^\s*\d+ \|"
+        r"(?P<name>[^|]+)\|"
+        r"\s*(?P<size>-?\d+)\s+(?P<bytesLeaked>-?\d+)\s*\|"
+        r"\s*-?\d+\s+(?P<numLeaked>-?\d+)"
+    )
     # The class name can contain spaces. We remove trailing whitespace later.
 
     log = log or _get_default_logger()
@@ -45,8 +57,8 @@ def process_single_leak_file(leakLogFileName, processType, leakThreshold,
     leakedObjectAnalysis = []
     leakedObjectNames = []
     recordLeakedObjects = False
-    log.info("leakcheck | Processing leak log file %s"
-             % leakLogFileName)
+    header = []
+    log.info("leakcheck | Processing leak log file %s" % leakLogFileName)
 
     with open(leakLogFileName, "r") as leaks:
         for line in leaks:
@@ -56,16 +68,28 @@ def process_single_leak_file(leakLogFileName, processType, leakThreshold,
             if not matches:
                 # eg: the leak table header row
                 strippedLine = line.rstrip()
-                log.info(stackFixer(strippedLine) if stackFixer else strippedLine)
+                logLine = stackFixer(strippedLine) if stackFixer else strippedLine
+                if recordLeakedObjects:
+                    log.info(logLine)
+                else:
+                    header.append(logLine)
                 continue
             name = matches.group("name").rstrip()
             size = int(matches.group("size"))
             bytesLeaked = int(matches.group("bytesLeaked"))
             numLeaked = int(matches.group("numLeaked"))
-            # Output the raw line from the leak log table if it is the TOTAL row,
-            # or is for an object row that has been leaked.
-            if numLeaked != 0 or name == "TOTAL":
+            # Output the raw line from the leak log table if it is for an object
+            # row that has been leaked.
+            if numLeaked != 0:
+                # If this is the TOTAL line, first output the header lines.
+                if name == "TOTAL":
+                    for logLine in header:
+                        log.info(logLine)
                 log.info(line.rstrip())
+            # If this is the TOTAL line, we're done with the header lines,
+            # whether or not it leaked.
+            if name == "TOTAL":
+                header = []
             # Analyse the leak log, but output later or it will interrupt the
             # leak table
             if name == "TOTAL":
@@ -73,9 +97,10 @@ def process_single_leak_file(leakLogFileName, processType, leakThreshold,
                 # log, particularly on B2G. Eventually, these should be split into multiple
                 # logs (bug 1068869), but for now, we report the largest leak.
                 if totalBytesLeaked is not None:
-                    log.warning("leakcheck | %s "
-                                "multiple BloatView byte totals found"
-                                % processString)
+                    log.warning(
+                        "leakcheck | %s "
+                        "multiple BloatView byte totals found" % processString
+                    )
                 else:
                     totalBytesLeaked = 0
                 if bytesLeaked > totalBytesLeaked:
@@ -88,8 +113,10 @@ def process_single_leak_file(leakLogFileName, processType, leakThreshold,
                 else:
                     recordLeakedObjects = False
             if (size < 0 or bytesLeaked < 0 or numLeaked < 0) and leakThreshold >= 0:
-                log.error("TEST-UNEXPECTED-FAIL | leakcheck | %s negative leaks caught!"
-                          % processString)
+                log.error(
+                    "TEST-UNEXPECTED-FAIL | leakcheck | %s negative leaks caught!"
+                    % processString
+                )
                 continue
             if name != "TOTAL" and numLeaked != 0 and recordLeakedObjects:
                 leakedObjectNames.append(name)
@@ -100,24 +127,30 @@ def process_single_leak_file(leakLogFileName, processType, leakThreshold,
         if name in allowed:
             limit = leak_allowed[name]
             leak_allowed = limit is None or numLeaked <= limit
-        log.mozleak_object(processType,
-                           numLeaked,
-                           name,
-                           scope=scope,
-                           allowed=leak_allowed)
+        log.mozleak_object(
+            processType, numLeaked, name, scope=scope, allowed=leak_allowed
+        )
 
-    log.mozleak_total(processType,
-                      totalBytesLeaked,
-                      leakThreshold,
-                      leakedObjectNames,
-                      scope=scope,
-                      induced_crash=crashedOnPurpose,
-                      ignore_missing=ignoreMissingLeaks)
+    log.mozleak_total(
+        processType,
+        totalBytesLeaked,
+        leakThreshold,
+        leakedObjectNames,
+        scope=scope,
+        induced_crash=crashedOnPurpose,
+        ignore_missing=ignoreMissingLeaks,
+    )
 
 
-def process_leak_log(leak_log_file, leak_thresholds=None,
-                     ignore_missing_leaks=None, log=None,
-                     stack_fixer=None, scope=None, allowed=None):
+def process_leak_log(
+    leak_log_file,
+    leak_thresholds=None,
+    ignore_missing_leaks=None,
+    log=None,
+    stack_fixer=None,
+    scope=None,
+    allowed=None,
+):
     """Process the leak log, including separate leak logs created
     by child processes.
 
@@ -152,38 +185,36 @@ def process_leak_log(leak_log_file, leak_thresholds=None,
 
     leakLogFile = leak_log_file
     if not os.path.exists(leakLogFile):
-        log.warning(
-            "leakcheck | refcount logging is off, so leaks can't be detected!")
+        log.warning("leakcheck | refcount logging is off, so leaks can't be detected!")
         return
 
-    log.info("leakcheck | Processing log file %s%s" %
-             (leakLogFile, (" for scope %s" % scope) if scope is not None else ""))
+    log.info(
+        "leakcheck | Processing log file %s%s"
+        % (leakLogFile, (" for scope %s" % scope) if scope is not None else "")
+    )
 
     leakThresholds = leak_thresholds or {}
     ignoreMissingLeaks = ignore_missing_leaks or []
 
-    # This list is based on kGeckoProcessTypeString. ipdlunittest processes likely
+    # This list is based on XRE_GeckoProcessTypeToString. ipdlunittest processes likely
     # are not going to produce leak logs we will ever see.
+
     knownProcessTypes = [
-                         "default",
-                         "forkserver",
-                         "gmplugin",
-                         "gpu",
-                         "plugin",
-                         "rdd",
-                         "socket",
-                         "tab",
-                         "vr",
-                        ]
+        p.string_name for p in process_types if p.string_name != "ipdlunittest"
+    ]
 
     for processType in knownProcessTypes:
-        log.info("TEST-INFO | leakcheck | %s process: leak threshold set at %d bytes"
-                 % (processType, leakThresholds.get(processType, 0)))
+        log.info(
+            "TEST-INFO | leakcheck | %s process: leak threshold set at %d bytes"
+            % (processType, leakThresholds.get(processType, 0))
+        )
 
     for processType in leakThresholds:
         if processType not in knownProcessTypes:
-            log.error("TEST-UNEXPECTED-FAIL | leakcheck | "
-                      "Unknown process type %s in leakThresholds" % processType)
+            log.error(
+                "TEST-UNEXPECTED-FAIL | leakcheck | "
+                "Unknown process type %s in leakThresholds" % processType
+            )
 
     (leakLogFileDir, leakFileBase) = os.path.split(leakLogFile)
     if leakFileBase[-4:] == ".log":
@@ -201,10 +232,18 @@ def process_leak_log(leak_log_file, leak_thresholds=None,
             else:
                 processType = "default"
             if processType not in knownProcessTypes:
-                log.error("TEST-UNEXPECTED-FAIL | leakcheck | "
-                          "Leak log with unknown process type %s" % processType)
+                log.error(
+                    "TEST-UNEXPECTED-FAIL | leakcheck | "
+                    "Leak log with unknown process type %s" % processType
+                )
             leakThreshold = leakThresholds.get(processType, 0)
-            process_single_leak_file(thisFile, processType, leakThreshold,
-                                     processType in ignoreMissingLeaks,
-                                     log=log, stackFixer=stack_fixer,
-                                     scope=scope, allowed=allowed)
+            process_single_leak_file(
+                thisFile,
+                processType,
+                leakThreshold,
+                processType in ignoreMissingLeaks,
+                log=log,
+                stackFixer=stack_fixer,
+                scope=scope,
+                allowed=allowed,
+            )

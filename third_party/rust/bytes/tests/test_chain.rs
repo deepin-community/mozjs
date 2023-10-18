@@ -1,7 +1,7 @@
-#![deny(warnings, rust_2018_idioms)]
+#![warn(rust_2018_idioms)]
 
 use bytes::{Buf, BufMut, Bytes};
-use bytes::buf::{BufExt, BufMutExt};
+#[cfg(feature = "std")]
 use std::io::IoSlice;
 
 #[test]
@@ -9,7 +9,7 @@ fn collect_two_bufs() {
     let a = Bytes::from(&b"hello"[..]);
     let b = Bytes::from(&b"world"[..]);
 
-    let res = a.chain(b).to_bytes();
+    let res = a.chain(b).copy_to_bytes(10);
     assert_eq!(res, &b"helloworld"[..]);
 }
 
@@ -42,6 +42,7 @@ fn iterating_two_bufs() {
     assert_eq!(res, &b"helloworld"[..]);
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn vectored_read() {
     let a = Bytes::from(&b"hello"[..]);
@@ -61,7 +62,7 @@ fn vectored_read() {
             IoSlice::new(b4),
         ];
 
-        assert_eq!(2, buf.bytes_vectored(&mut iovecs));
+        assert_eq!(2, buf.chunks_vectored(&mut iovecs));
         assert_eq!(iovecs[0][..], b"hello"[..]);
         assert_eq!(iovecs[1][..], b"world"[..]);
         assert_eq!(iovecs[2][..], b""[..]);
@@ -82,7 +83,7 @@ fn vectored_read() {
             IoSlice::new(b4),
         ];
 
-        assert_eq!(2, buf.bytes_vectored(&mut iovecs));
+        assert_eq!(2, buf.chunks_vectored(&mut iovecs));
         assert_eq!(iovecs[0][..], b"llo"[..]);
         assert_eq!(iovecs[1][..], b"world"[..]);
         assert_eq!(iovecs[2][..], b""[..]);
@@ -103,7 +104,7 @@ fn vectored_read() {
             IoSlice::new(b4),
         ];
 
-        assert_eq!(1, buf.bytes_vectored(&mut iovecs));
+        assert_eq!(1, buf.chunks_vectored(&mut iovecs));
         assert_eq!(iovecs[0][..], b"world"[..]);
         assert_eq!(iovecs[1][..], b""[..]);
         assert_eq!(iovecs[2][..], b""[..]);
@@ -124,10 +125,31 @@ fn vectored_read() {
             IoSlice::new(b4),
         ];
 
-        assert_eq!(1, buf.bytes_vectored(&mut iovecs));
+        assert_eq!(1, buf.chunks_vectored(&mut iovecs));
         assert_eq!(iovecs[0][..], b"ld"[..]);
         assert_eq!(iovecs[1][..], b""[..]);
         assert_eq!(iovecs[2][..], b""[..]);
         assert_eq!(iovecs[3][..], b""[..]);
     }
+}
+
+#[test]
+fn chain_get_bytes() {
+    let mut ab = Bytes::copy_from_slice(b"ab");
+    let mut cd = Bytes::copy_from_slice(b"cd");
+    let ab_ptr = ab.as_ptr();
+    let cd_ptr = cd.as_ptr();
+    let mut chain = (&mut ab).chain(&mut cd);
+    let a = chain.copy_to_bytes(1);
+    let bc = chain.copy_to_bytes(2);
+    let d = chain.copy_to_bytes(1);
+
+    assert_eq!(Bytes::copy_from_slice(b"a"), a);
+    assert_eq!(Bytes::copy_from_slice(b"bc"), bc);
+    assert_eq!(Bytes::copy_from_slice(b"d"), d);
+
+    // assert `get_bytes` did not allocate
+    assert_eq!(ab_ptr, a.as_ptr());
+    // assert `get_bytes` did not allocate
+    assert_eq!(cd_ptr.wrapping_offset(1), d.as_ptr());
 }

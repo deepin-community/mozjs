@@ -338,7 +338,8 @@ void test_resampler_duplex(uint32_t input_channels, uint32_t output_channels,
 
   cubeb_resampler * resampler =
     cubeb_resampler_create((cubeb_stream*)nullptr, &input_params, &output_params, target_rate,
-                           data_cb_resampler, (void*)&state, CUBEB_RESAMPLER_QUALITY_VOIP);
+                           data_cb_resampler, (void*)&state, CUBEB_RESAMPLER_QUALITY_VOIP,
+                           CUBEB_RESAMPLER_RECLOCK_NONE);
 
   long latency = cubeb_resampler_latency(resampler);
 
@@ -484,8 +485,8 @@ TEST(cubeb, resampler_output_only_noop)
   cubeb_resampler * resampler =
     cubeb_resampler_create((cubeb_stream*)nullptr, nullptr, &output_params, target_rate,
                            test_output_only_noop_data_cb, nullptr,
-                           CUBEB_RESAMPLER_QUALITY_VOIP);
-
+                           CUBEB_RESAMPLER_QUALITY_VOIP,
+                           CUBEB_RESAMPLER_RECLOCK_NONE);
   const long out_frames = 128;
   float out_buffer[out_frames];
   long got;
@@ -523,7 +524,8 @@ TEST(cubeb, resampler_drain)
   cubeb_resampler * resampler =
     cubeb_resampler_create((cubeb_stream*)nullptr, nullptr, &output_params, target_rate,
                            test_drain_data_cb, &cb_count,
-                           CUBEB_RESAMPLER_QUALITY_VOIP);
+                           CUBEB_RESAMPLER_QUALITY_VOIP,
+                           CUBEB_RESAMPLER_RECLOCK_NONE);
 
   const long out_frames = 128;
   float out_buffer[out_frames];
@@ -572,7 +574,8 @@ TEST(cubeb, resampler_passthrough_output_only)
   cubeb_resampler * resampler =
     cubeb_resampler_create((cubeb_stream*)nullptr, nullptr, &output_params,
                            target_rate, cb_passthrough_resampler_output, nullptr,
-                           CUBEB_RESAMPLER_QUALITY_VOIP);
+                           CUBEB_RESAMPLER_QUALITY_VOIP,
+                           CUBEB_RESAMPLER_RECLOCK_NONE);
 
   float output_buffer[output_channels * 256];
 
@@ -616,7 +619,8 @@ TEST(cubeb, resampler_passthrough_input_only)
   cubeb_resampler * resampler =
     cubeb_resampler_create((cubeb_stream*)nullptr, &input_params, nullptr,
                            target_rate, cb_passthrough_resampler_input, nullptr,
-                           CUBEB_RESAMPLER_QUALITY_VOIP);
+                           CUBEB_RESAMPLER_QUALITY_VOIP,
+                           CUBEB_RESAMPLER_RECLOCK_NONE);
 
   float input_buffer[input_channels * 256];
 
@@ -737,7 +741,8 @@ TEST(cubeb, resampler_passthrough_duplex_callback_reordering)
   cubeb_resampler * resampler =
     cubeb_resampler_create((cubeb_stream*)nullptr, &input_params, &output_params,
                            target_rate, cb_passthrough_resampler_duplex, &c,
-                           CUBEB_RESAMPLER_QUALITY_VOIP);
+                           CUBEB_RESAMPLER_QUALITY_VOIP,
+                           CUBEB_RESAMPLER_RECLOCK_NONE);
 
   const long BUF_BASE_SIZE = 256;
   float input_buffer_prebuffer[input_channels * BUF_BASE_SIZE * 2];
@@ -820,7 +825,7 @@ TEST(cubeb, resampler_drift_drop_data)
     cubeb_resampler * resampler =
       cubeb_resampler_create((cubeb_stream*)nullptr, &input_params, &output_params,
         target_rate, cb_passthrough_resampler_duplex, &c,
-        CUBEB_RESAMPLER_QUALITY_VOIP);
+        CUBEB_RESAMPLER_QUALITY_VOIP, CUBEB_RESAMPLER_RECLOCK_NONE);
 
     const long BUF_BASE_SIZE = 256;
 
@@ -1059,5 +1064,23 @@ TEST(cubeb, passthrough_resampler_fill_input_left) {
   ASSERT_EQ(got, output_frame_count);
   // Input frames used are less than the output frames due to glitch.
   ASSERT_EQ(input_frame_count, output_frame_count - 8);
+}
+
+TEST(cubeb, individual_methods) {
+  const uint32_t channels = 2;
+  const uint32_t sample_rate = 44100;
+  const uint32_t frames = 256;
+
+  delay_line<float> dl(10, channels, sample_rate);
+  uint32_t frames_needed1 = dl.input_needed_for_output(0);
+  ASSERT_EQ(frames_needed1, 0u);
+
+  cubeb_resampler_speex_one_way<float> one_way(channels, sample_rate, sample_rate, CUBEB_RESAMPLER_QUALITY_DEFAULT);
+  float buffer[channels * frames] = {0.0};
+  // Add all frames in the resampler's internal buffer.
+  one_way.input(buffer, frames);
+  // Ask for less than the existing frames, this would create a uint overlflow without the fix.
+  uint32_t frames_needed2 = one_way.input_needed_for_output(0);
+  ASSERT_EQ(frames_needed2, 0u);
 }
 

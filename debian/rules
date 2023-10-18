@@ -16,7 +16,7 @@ endif
 
 # This can be disabled if the bundled icu overtakes the system version,
 # or for backporting
-WITH_SYSTEM_ICU = yes
+WITH_SYSTEM_ICU = no
 
 export DEB_HOST_ARCH
 # mozjs' build process does not seem to be compatible with other shells
@@ -54,7 +54,13 @@ ifneq (,$(findstring $(DEB_BUILD_ARCH),sh4))
         DEB_CFLAGS_MAINT_APPEND += -mlra
         DEB_CXXFLAGS_MAINT_APPEND += -mlra
 endif
-export DEB_CFLAGS_MAINT_APPEND DEB_CXXFLAGS_MAINT_APPEND
+
+ifneq (,$(findstring $(DEB_BUILD_ARCH),armel))
+        DEB_LDFLAGS_MAINT_APPEND += -Wl,--allow-multiple-definition
+        CONFIGURE_FLAGS += --disable-shared-memory
+endif
+
+export DEB_CFLAGS_MAINT_APPEND DEB_CXXFLAGS_MAINT_APPEND DEB_LDFLAGS_MAINT_APPEND
 
 EXCLUDED_TESTS :=
 
@@ -65,6 +71,16 @@ EXCLUDED_TESTS :=
 # https://bugzilla.mozilla.org/show_bug.cgi?id=1621900
 ifneq (,$(findstring $(DEB_BUILD_ARCH),i386))
 	EXCLUDED_TESTS += basic/bug653153.js
+	EXCLUDED_TESTS += basic/fdlibm-for-sin-cos-tan-argument.js
+endif
+
+# See: https://bugzilla.mozilla.org/show_bug.cgi?id=1755540
+ifneq (,$(findstring $(DEB_BUILD_ARCH),powerpc ppc64 sparc64 s390x))
+	EXCLUDED_TESTS += large-arraybuffers/basic.js
+endif
+
+ifneq (,$(findstring $(DEB_BUILD_ARCH),armel))
+	EXCLUDED_TESTS += basic/bug-1649234-1.js
 endif
 
 ifneq (,$(findstring $(DEB_HOST_ARCH),mips mipsel mips64el))
@@ -121,10 +137,7 @@ CXX := $(DEB_HOST_GNU_TYPE)-g++
 endif
 
 override_dh_auto_configure:
-ifneq ($(WITH_SYSTEM_ICU),yes)
-	VERBOSE=1 $(PYTHON3) intl/icu_sources_data.py "$(CURDIR)"
-endif
-	mkdir -p $(BUILDDIR)
+	mkdir -p $(BUILDDIR)/dist/cppunittests
 	cd $(BUILDDIR); \
 	if env \
 		CC=$(CC) \

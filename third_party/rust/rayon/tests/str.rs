@@ -1,7 +1,3 @@
-extern crate rand;
-extern crate rand_xorshift;
-extern crate rayon;
-
 use rand::distributions::Standard;
 use rand::{Rng, SeedableRng};
 use rand_xorshift::XorShiftRng;
@@ -15,7 +11,7 @@ fn seeded_rng() -> XorShiftRng {
 
 #[test]
 pub fn execute_strings() {
-    let mut rng = seeded_rng();
+    let rng = seeded_rng();
     let s: String = rng.sample_iter::<char, _>(&Standard).take(1024).collect();
 
     let par_chars: String = s.par_chars().collect();
@@ -68,6 +64,11 @@ pub fn execute_strings_split() {
         let parallel: Vec<_> = string.par_split(separator).collect();
         assert_eq!(serial, parallel);
 
+        let pattern: &[char] = &['\u{0}', separator, '\u{1F980}'];
+        let serial: Vec<_> = string.split(pattern).collect();
+        let parallel: Vec<_> = string.par_split(pattern).collect();
+        assert_eq!(serial, parallel);
+
         let serial_fn: Vec<_> = string.split(|c| c == separator).collect();
         let parallel_fn: Vec<_> = string.par_split(|c| c == separator).collect();
         assert_eq!(serial_fn, parallel_fn);
@@ -77,9 +78,12 @@ pub fn execute_strings_split() {
         let serial: Vec<_> = string.split_terminator(separator).collect();
         let parallel: Vec<_> = string.par_split_terminator(separator).collect();
         assert_eq!(serial, parallel);
-    }
 
-    for &(string, separator) in &tests {
+        let pattern: &[char] = &['\u{0}', separator, '\u{1F980}'];
+        let serial: Vec<_> = string.split_terminator(pattern).collect();
+        let parallel: Vec<_> = string.par_split_terminator(pattern).collect();
+        assert_eq!(serial, parallel);
+
         let serial: Vec<_> = string.split_terminator(|c| c == separator).collect();
         let parallel: Vec<_> = string.par_split_terminator(|c| c == separator).collect();
         assert_eq!(serial, parallel);
@@ -103,6 +107,11 @@ pub fn execute_strings_split() {
         let parallel: Vec<_> = string.par_matches(separator).collect();
         assert_eq!(serial, parallel);
 
+        let pattern: &[char] = &['\u{0}', separator, '\u{1F980}'];
+        let serial: Vec<_> = string.matches(pattern).collect();
+        let parallel: Vec<_> = string.par_matches(pattern).collect();
+        assert_eq!(serial, parallel);
+
         let serial_fn: Vec<_> = string.matches(|c| c == separator).collect();
         let parallel_fn: Vec<_> = string.par_matches(|c| c == separator).collect();
         assert_eq!(serial_fn, parallel_fn);
@@ -111,6 +120,11 @@ pub fn execute_strings_split() {
     for &(string, separator) in &tests {
         let serial: Vec<_> = string.match_indices(separator).collect();
         let parallel: Vec<_> = string.par_match_indices(separator).collect();
+        assert_eq!(serial, parallel);
+
+        let pattern: &[char] = &['\u{0}', separator, '\u{1F980}'];
+        let serial: Vec<_> = string.match_indices(pattern).collect();
+        let parallel: Vec<_> = string.par_match_indices(pattern).collect();
         assert_eq!(serial, parallel);
 
         let serial_fn: Vec<_> = string.match_indices(|c| c == separator).collect();

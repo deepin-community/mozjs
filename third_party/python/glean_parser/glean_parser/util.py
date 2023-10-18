@@ -11,24 +11,67 @@ import json
 from pathlib import Path
 import sys
 import textwrap
+from typing import Any, Callable, Iterable, Sequence, Tuple, Union, Optional
 import urllib.request
 
-import appdirs
-import diskcache
+import appdirs  # type: ignore
+import diskcache  # type: ignore
 import jinja2
-import jsonschema
-from jsonschema import _utils
+import jsonschema  # type: ignore
+from jsonschema import _utils  # type: ignore
 import yaml
 
 if sys.version_info < (3, 7):
-    import iso8601
+    import iso8601  # type: ignore
+
+    def date_fromisoformat(datestr: str) -> datetime.date:
+        try:
+            return iso8601.parse_date(datestr).date()
+        except iso8601.ParseError:
+            raise ValueError()
+
+    def datetime_fromisoformat(datestr: str) -> datetime.datetime:
+        try:
+            return iso8601.parse_date(datestr)
+        except iso8601.ParseError:
+            raise ValueError()
+
+else:
+
+    def date_fromisoformat(datestr: str) -> datetime.date:
+        return datetime.date.fromisoformat(datestr)
+
+    def datetime_fromisoformat(datestr: str) -> datetime.datetime:
+        return datetime.datetime.fromisoformat(datestr)
 
 
 TESTING_MODE = "pytest" in sys.modules
 
 
+JSONType = Union[list, dict, str, int, float, None]
+"""
+The types supported by JSON.
+
+This is only an approximation -- this should really be a recursive type.
+"""
+
 # Adapted from
 # https://stackoverflow.com/questions/34667108/ignore-dates-and-times-while-parsing-yaml
+
+
+# A wrapper around OrderedDict for Python < 3.7 (where dict ordering is not
+# maintained by default), and regular dict everywhere else.
+if sys.version_info < (3, 7):
+
+    class DictWrapper(OrderedDict):
+        pass
+
+else:
+
+    class DictWrapper(dict):
+        pass
+
+
 class _NoDatesSafeLoader(yaml.SafeLoader):
     @classmethod
     def remove_implicit_resolver(cls, tag_to_remove):
@@ -56,47 +99,41 @@ class _NoDatesSafeLoader(yaml.SafeLoader):
 _NoDatesSafeLoader.remove_implicit_resolver("tag:yaml.org,2002:timestamp")
 
 
-if sys.version_info < (3, 7):
-    # In Python prior to 3.7, dictionary order is not preserved. However, we
-    # want the metrics to appear in the output in the same order as they are in
-    # the metrics.yaml file, so on earlier versions of Python we must use an
-    # OrderedDict object.
-    def ordered_yaml_load(stream):
-        class OrderedLoader(_NoDatesSafeLoader):
-            pass
+def yaml_load(stream):
+    """
+    Map line number to yaml nodes, and preserve the order
+    of metrics as they appear in the metrics.yaml file.
+    """
 
-        def construct_mapping(loader, node):
-            loader.flatten_mapping(node)
-            return OrderedDict(loader.construct_pairs(node))
+    class SafeLineLoader(_NoDatesSafeLoader):
+        pass
 
-        OrderedLoader.add_constructor(
-            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping
+    def _construct_mapping_adding_line(loader, node):
+        loader.flatten_mapping(node)
+        mapping = DictWrapper(loader.construct_pairs(node))
+        mapping.defined_in = {"line": node.start_mark.line}
+        return mapping
+
+    SafeLineLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping_adding_line
+    )
+    return yaml.load(stream, SafeLineLoader)
+
+
+def ordered_yaml_dump(data, **kwargs):
+    class OrderedDumper(yaml.Dumper):
+        pass
+
+    def _dict_representer(dumper, data):
+        return dumper.represent_mapping(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, data.items()
         )
-        return yaml.load(stream, OrderedLoader)
 
-    def ordered_yaml_dump(data, **kwargs):
-        class OrderedDumper(yaml.Dumper):
-            pass
-
-        def _dict_representer(dumper, data):
-            return dumper.represent_mapping(
-                yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, data.items()
-            )
-
-        OrderedDumper.add_representer(OrderedDict, _dict_representer)
-        return yaml.dump(data, Dumper=OrderedDumper, **kwargs)
+    OrderedDumper.add_representer(DictWrapper, _dict_representer)
+    return yaml.dump(data, Dumper=OrderedDumper, **kwargs)
 
 
-else:
-
-    def ordered_yaml_load(stream):
-        return yaml.load(stream, Loader=_NoDatesSafeLoader)
-
-    def ordered_yaml_dump(data, **kwargs):
-        return yaml.dump(data, **kwargs)
-
-
-def load_yaml_or_json(path, ordered_dict=False):
+def load_yaml_or_json(path: Path):
     """
     Load the content from either a .json or .yaml file, based on the filename
     extension.
@@ -104,28 +141,23 @@ def load_yaml_or_json(path, ordered_dict=False):
     :param path: `pathlib.Path` object
     :rtype object: The tree of objects as a result of parsing the file.
     :raises ValueError: The file is neither a .json, .yml or .yaml file.
+    :raises FileNotFoundError: The file does not exist.
     """
     # If in py.test, support bits of literal JSON/YAML content
     if TESTING_MODE and isinstance(path, dict):
-        return path
-
-    if not path.is_file():
-        return {}
+        return yaml_load(yaml.dump(path))
 
     if path.suffix == ".json":
-        with path.open("r") as fd:
+        with path.open("r", encoding="utf-8") as fd:
             return json.load(fd)
     elif path.suffix in (".yml", ".yaml", ".yamlx"):
-        with path.open("r") as fd:
-            if ordered_dict:
-                return ordered_yaml_load(fd)
-            else:
-                return yaml.load(fd, Loader=_NoDatesSafeLoader)
+        with path.open("r", encoding="utf-8") as fd:
+            return yaml_load(fd)
     else:
-        raise ValueError("Unknown file extension {}".format(path.suffix))
+        raise ValueError(f"Unknown file extension {path.suffix}")
 
 
-def ensure_list(value):
+def ensure_list(value: Any) -> Sequence[Any]:
     """
     Ensures that the value is a list. If it is anything but a list or tuple, a
     list with a single element containing only value is returned.
@@ -135,7 +167,7 @@ def ensure_list(value):
     return value
 
 
-def to_camel_case(input, capitalize_first_letter):
+def to_camel_case(input: str, capitalize_first_letter: bool) -> str:
     """
     Convert the value to camelCase.
 
@@ -150,10 +182,10 @@ def to_camel_case(input, capitalize_first_letter):
     if not capitalize_first_letter:
         tokens[0] = tokens[0].lower()
     # Finally join the tokens and capitalize.
-    return ''.join(tokens)
+    return "".join(tokens)
 
 
-def camelize(value):
+def camelize(value: str) -> str:
     """
     Convert the value to camelCase (with a lower case first letter).
 
@@ -163,7 +195,7 @@ def camelize(value):
     return to_camel_case(value, False)
 
 
-def Camelize(value):
+def Camelize(value: str) -> str:
     """
     Convert the value to CamelCase (with an upper case first letter).
 
@@ -173,8 +205,17 @@ def Camelize(value):
     return to_camel_case(value, True)
 
 
+def snake_case(value: str) -> str:
+    """
+    Convert the value to snake_case.
+    """
+    return value.lower().replace(".", "_").replace("-", "_")
+
+
 @functools.lru_cache()
-def get_jinja2_template(template_name, filters=()):
+def get_jinja2_template(
+    template_name: str, filters: Iterable[Tuple[str, Callable]] = ()
+):
     """
     Get a Jinja2 template that ships with glean_parser.
 
@@ -236,35 +277,32 @@ def get_null_resolver(schema):
     return NullResolver.from_schema(schema)
 
 
-def fetch_remote_url(url, cache=True):
+def fetch_remote_url(url: str, cache: bool = True):
     """
     Fetches the contents from an HTTP url or local file path, and optionally
     caches it to disk.
     """
+    # Include the Python version in the cache key, since caches aren't
+    # sharable across Python versions.
+    key = (url, str(sys.version_info))
+
     is_http = url.startswith("http")
 
     if not is_http:
         with open(url, "r", encoding="utf-8") as fd:
-            contents = fd.read()
-        return contents
+            return fd.read()
 
     if cache:
         cache_dir = appdirs.user_cache_dir("glean_parser", "mozilla")
         with diskcache.Cache(cache_dir) as dc:
-            if url in dc:
-                return dc[url]
+            if key in dc:
+                return dc[key]
 
-    contents = urllib.request.urlopen(url).read()
-
-    # On Python 3.5, urlopen does not handle the unicode decoding for us. This
-    # is ok because we control these files and we know they are in UTF-8,
-    # however, this wouldn't be correct in general.
-    if sys.version_info < (3, 6):
-        contents = contents.decode("utf8")
+    contents: str = urllib.request.urlopen(url).read()
 
     if cache:
         with diskcache.Cache(cache_dir) as dc:
-            dc[url] = contents
+            dc[key] = contents
 
     return contents
 
@@ -272,7 +310,7 @@ def fetch_remote_url(url, cache=True):
 _unset = _utils.Unset()
 
 
-def pprint_validation_error(error):
+def pprint_validation_error(error) -> str:
     """
     A version of jsonschema's ValidationError __str__ method that doesn't
     include the schema fragment that failed.  This makes the error messages
@@ -308,12 +346,19 @@ def pprint_validation_error(error):
 
     description = error.schema.get("description")
     if description:
-        parts.extend(["", "Documentation for this node:", _utils.indent(description)])
+        parts.extend(
+            ["", "Documentation for this node:", textwrap.indent(description, "    ")]
+        )
 
     return "\n".join(parts)
 
 
-def format_error(filepath, header, content):
+def format_error(
+    filepath: Union[str, Path],
+    header: str,
+    content: str,
+    lineno: Optional[int] = None,
+) -> str:
     """
     Format a jsonshema validation error.
     """
@@ -321,13 +366,49 @@ def format_error(filepath, header, content):
         filepath = filepath.resolve()
     else:
         filepath = "<string>"
+    if lineno:
+        filepath = f"{filepath}:{lineno}"
     if header:
-        return "{}: {}\n{}".format(filepath, header, _utils.indent(content))
+        return f"{filepath}: {header}\n{textwrap.indent(content, '    ')}"
     else:
-        return "{}:\n{}".format(filepath, _utils.indent(content))
+        return f"{filepath}:\n{textwrap.indent(content, '    ')}"
 
 
-def is_expired(expires):
+def parse_expiration_date(expires: str) -> datetime.date:
+    """
+    Parses the expired field date (yyyy-mm-dd) as a date.
+    Raises a ValueError in case the string is not properly formatted.
+    """
+    try:
+        return date_fromisoformat(expires)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid expiration date '{expires}'. "
+            "Must be of the form yyyy-mm-dd in UTC."
+        )
+
+
+def parse_expiration_version(expires: str) -> int:
+    """
+    Parses the expired field version string as an integer.
+    Raises a ValueError in case the string does not contain a valid
+    positive integer.
+    """
+    try:
+        if isinstance(expires, int):
+            version_number = int(expires)
+            if version_number > 0:
+                return version_number
+        # Fall-through: if it's not an integer or is not greater than zero,
+        # raise an error.
+        raise ValueError()
+    except ValueError:
+        raise ValueError(
+            f"Invalid expiration version '{expires}'. Must be a positive integer."
+        )
+
+
+def is_expired(expires: str, major_version: Optional[int] = None) -> bool:
     """
     Parses the `expires` field in a metric or ping and returns whether
     the object should be considered expired.
@@ -336,41 +417,136 @@ def is_expired(expires):
         return False
     elif expires == "expired":
         return True
+    elif major_version is not None:
+        return parse_expiration_version(expires) <= major_version
     else:
-        try:
-            if sys.version_info < (3, 7):
-                date = iso8601.parse_date(expires).date()
-            else:
-                date = datetime.date.fromisoformat(expires)
-        except ValueError:
-            raise ValueError(
-                (
-                    "Invalid expiration date '{}'. "
-                    "Must be of the form yyyy-mm-dd in UTC."
-                ).format(expires)
-            )
+        date = parse_expiration_date(expires)
         return date <= datetime.datetime.utcnow().date()
 
 
-def validate_expires(expires):
+def validate_expires(expires: str, major_version: Optional[int] = None) -> None:
     """
-    Raises ValueError if `expires` is not valid.
+    If expiration by major version is enabled, raises a ValueError in
+    case `expires` is not a positive integer.
+    Otherwise raises a ValueError in case the `expires` is not ISO8601
+    parseable, or in case the date is more than 730 days (~2 years) in
+    the future.
     """
     if expires in ("never", "expired"):
         return
-    if sys.version_info < (3, 7):
-        iso8601.parse_date(expires)
+
+    if major_version is not None:
+        parse_expiration_version(expires)
+        # Don't need to keep parsing dates if expiration by version
+        # is enabled. We don't allow mixing dates and versions for a
+        # single product.
+        return
+
+    date = parse_expiration_date(expires)
+    max_date = datetime.datetime.now() + datetime.timedelta(days=730)
+    if date > max_date.date():
+        raise ValueError(
+            f"'{expires}' is more than 730 days (~2 years) in the future.",
+            "Please make sure this is intentional.",
+            "You can supress this warning by adding EXPIRATION_DATE_TOO_FAR to no_lint",
+            "See: https://mozilla.github.io/glean_parser/metrics-yaml.html#no_lint",
+        )
+
+
+def build_date(date: Optional[str]) -> datetime.datetime:
+    """
+    Generate the build timestamp.
+
+    If `date` is set to `0` a static unix epoch time will be used.
+    If `date` it is set to a ISO8601 datetime string (e.g. `2022-01-03T17:30:00`)
+    it will use that date.
+    Note that any timezone offset will be ignored and UTC will be used.
+    Otherwise it will throw an error.
+
+    If `date` is `None` it will use the current date & time.
+    """
+
+    if date is not None:
+        date = str(date)
+        if date == "0":
+            ts = datetime.datetime(1970, 1, 1, 0, 0, 0)
+        else:
+            ts = datetime_fromisoformat(date).replace(tzinfo=datetime.timezone.utc)
     else:
-        datetime.date.fromisoformat(expires)
+        ts = datetime.datetime.utcnow()
+
+    return ts
 
 
 def report_validation_errors(all_objects):
     """
     Report any validation errors found to the console.
+
+    Returns the number of errors reported.
     """
-    found_error = False
+    found_errors = 0
     for error in all_objects:
-        found_error = True
+        found_errors += 1
         print("=" * 78, file=sys.stderr)
         print(error, file=sys.stderr)
-    return found_error
+    return found_errors
+
+
+def remove_output_params(d, output_params):
+    """
+    Remove output-only params, such as "defined_in",
+    in order to validate the output against the input schema.
+    """
+    modified_dict = {}
+    for key, value in d.items():
+        if key is not output_params:
+            modified_dict[key] = value
+    return modified_dict
+
+
+# Names of  parameters to pass to all metrics constructors constructors.
+common_metric_args = [
+    "category",
+    "name",
+    "send_in_pings",
+    "lifetime",
+    "disabled",
+]
+
+
+# Names of parameters that only apply to some of the metrics types.
+# **CAUTION**: This list needs to be in the order the Swift & Rust type constructors
+# expects them. (The other language bindings don't care about the order).
+extra_metric_args = [
+    "time_unit",
+    "memory_unit",
+    "allowed_extra_keys",
+    "reason_codes",
+    "range_min",
+    "range_max",
+    "bucket_count",
+    "histogram_type",
+    "numerators",
+]
+
+
+# This includes only things that the language bindings care about, not things
+# that are metadata-only or are resolved into other parameters at parse time.
+# **CAUTION**: This list needs to be in the order the Swift & Rust type constructors
+# expects them. (The other language bindings don't care about the order). The
+# `test_order_of_fields` test checks that the generated code is valid.
+# **DO NOT CHANGE THE ORDER OR ADD NEW FIELDS IN THE MIDDLE**
+metric_args = common_metric_args + extra_metric_args
+
+
+# Names of ping parameters to pass to constructors.
+ping_args = [
+    "include_client_id",
+    "send_if_empty",
+    "name",
+    "reason_codes",
+]
+
+
+# Names of parameters to pass to both metric and ping constructors (no duplicates).
+extra_args = metric_args + [v for v in ping_args if v not in metric_args]

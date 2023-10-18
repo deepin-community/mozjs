@@ -11,6 +11,7 @@
 #include <type_traits>
 
 #include "vm/Realm.h"
+#include "vm/SymbolType.h"
 
 #include "gc/Heap-inl.h"
 
@@ -25,29 +26,23 @@ inline size_t GetAtomBit(TenuredCell* thing) {
   return arena->atomBitmapStart() * JS_BITS_PER_WORD + arenaBit;
 }
 
-inline bool ThingIsPermanent(JSAtom* atom) { return atom->isPinned(); }
-
-inline bool ThingIsPermanent(JS::Symbol* symbol) {
-  return symbol->isWellKnownSymbol();
-}
-
 template <typename T, bool Fallible>
 MOZ_ALWAYS_INLINE bool AtomMarkingRuntime::inlinedMarkAtomInternal(
     JSContext* cx, T* thing) {
   static_assert(std::is_same_v<T, JSAtom> || std::is_same_v<T, JS::Symbol>,
                 "Should only be called with JSAtom* or JS::Symbol* argument");
 
+  MOZ_ASSERT(cx->isMainThreadContext());
+  MOZ_ASSERT(cx->zone());
+  MOZ_ASSERT(!cx->zone()->isAtomsZone());
+
   MOZ_ASSERT(thing);
   js::gc::TenuredCell* cell = &thing->asTenured();
   MOZ_ASSERT(cell->zoneFromAnyThread()->isAtomsZone());
 
-  // The context's zone will be null during initialization of the runtime.
-  if (!cx->zone()) {
-    return true;
-  }
-  MOZ_ASSERT(!cx->zone()->isAtomsZone());
-
-  if (ThingIsPermanent(thing)) {
+  // This doesn't check for pinned atoms since that might require taking a
+  // lock. This is not required for correctness.
+  if (thing->isPermanentAndMayBeShared()) {
     return true;
   }
 
@@ -62,13 +57,11 @@ MOZ_ALWAYS_INLINE bool AtomMarkingRuntime::inlinedMarkAtomInternal(
     cx->zone()->markedAtoms().setBit(bit);
   }
 
-  if (!cx->isHelperThreadContext()) {
-    // Trigger a read barrier on the atom, in case there is an incremental
-    // GC in progress. This is necessary if the atom is being marked
-    // because a reference to it was obtained from another zone which is
-    // not being collected by the incremental GC.
-    T::readBarrier(thing);
-  }
+  // Trigger a read barrier on the atom, in case there is an incremental
+  // GC in progress. This is necessary if the atom is being marked
+  // because a reference to it was obtained from another zone which is
+  // not being collected by the incremental GC.
+  ReadBarrier(thing);
 
   // Children of the thing also need to be marked in the context's zone.
   // We don't have a JSTracer for this so manually handle the cases in which
@@ -76,6 +69,14 @@ MOZ_ALWAYS_INLINE bool AtomMarkingRuntime::inlinedMarkAtomInternal(
   markChildren(cx, thing);
 
   return true;
+}
+
+void AtomMarkingRuntime::markChildren(JSContext* cx, JSAtom*) {}
+
+void AtomMarkingRuntime::markChildren(JSContext* cx, JS::Symbol* symbol) {
+  if (JSAtom* description = symbol->description()) {
+    markAtom(cx, description);
+  }
 }
 
 template <typename T>

@@ -3,9 +3,12 @@
 //! This module contains a number of functions for working with `Stream`s,
 //! including the `StreamExt` trait which adds methods to `Stream` types.
 
-use crate::future::Either;
+use crate::future::{assert_future, Either};
+use crate::stream::assert_stream;
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 use core::pin::Pin;
 #[cfg(feature = "sink")]
 use futures_core::stream::TryStream;
@@ -19,6 +22,8 @@ use futures_core::{
 #[cfg(feature = "sink")]
 use futures_sink::Sink;
 
+use crate::fns::{inspect_fn, InspectFn};
+
 mod chain;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::chain::Chain;
@@ -27,9 +32,21 @@ mod collect;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::collect::Collect;
 
+mod unzip;
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::unzip::Unzip;
+
 mod concat;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::concat::Concat;
+
+mod count;
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::count::Count;
+
+mod cycle;
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::cycle::Cycle;
 
 mod enumerate;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
@@ -44,18 +61,39 @@ mod filter_map;
 pub use self::filter_map::FilterMap;
 
 mod flatten;
-#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
-pub use self::flatten::Flatten;
+
+delegate_all!(
+    /// Stream for the [`flatten`](StreamExt::flatten) method.
+    Flatten<St>(
+        flatten::Flatten<St, St::Item>
+    ): Debug + Sink + Stream + FusedStream + AccessInner[St, (.)] + New[|x: St| flatten::Flatten::new(x)]
+    where St: Stream
+);
 
 mod fold;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::fold::Fold;
 
+mod any;
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::any::Any;
+
+mod all;
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::all::All;
+
 #[cfg(feature = "sink")]
 mod forward;
+
 #[cfg(feature = "sink")]
-#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
-pub use self::forward::Forward;
+delegate_all!(
+    /// Future for the [`forward`](super::StreamExt::forward) method.
+    #[cfg_attr(docsrs, doc(cfg(feature = "sink")))]
+    Forward<St, Si>(
+        forward::Forward<St, Si, St::Ok>
+    ): Debug + Future + FusedFuture + New[|x: St, y: Si| forward::Forward::new(x, y)]
+    where St: TryStream
+);
 
 mod for_each;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
@@ -69,14 +107,23 @@ mod into_future;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::into_future::StreamFuture;
 
-mod inspect;
-pub(crate) use self::inspect::inspect; // used by `TryStreamExt::{inspect_ok, inspect_err}`
-#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
-pub use self::inspect::Inspect;
+delegate_all!(
+    /// Stream for the [`inspect`](StreamExt::inspect) method.
+    Inspect<St, F>(
+        map::Map<St, InspectFn<F>>
+    ): Debug + Sink + Stream + FusedStream + AccessInner[St, (.)] + New[|x: St, f: F| map::Map::new(x, inspect_fn(f))]
+);
 
 mod map;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::map::Map;
+
+delegate_all!(
+    /// Stream for the [`flat_map`](StreamExt::flat_map) method.
+    FlatMap<St, U, F>(
+        flatten::Flatten<Map<St, F>, U>
+    ): Debug + Sink + Stream + FusedStream + AccessInner[St, (. .)] + New[|x: St, f: F| flatten::Flatten::new(Map::new(x, f))]
+);
 
 mod next;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
@@ -88,7 +135,7 @@ pub use self::select_next_some::SelectNextSome;
 
 mod peek;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
-pub use self::peek::{Peek, Peekable};
+pub use self::peek::{NextIf, NextIfEq, Peek, PeekMut, Peekable};
 
 mod skip;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
@@ -106,6 +153,10 @@ mod take_while;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::take_while::TakeWhile;
 
+mod take_until;
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::take_until::TakeUntil;
+
 mod then;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::then::Then;
@@ -120,37 +171,70 @@ mod chunks;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::chunks::Chunks;
 
+#[cfg(feature = "alloc")]
+mod ready_chunks;
+#[cfg(feature = "alloc")]
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::ready_chunks::ReadyChunks;
+
 mod scan;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::scan::Scan;
 
-cfg_target_has_atomic! {
-    #[cfg(feature = "alloc")]
-    mod buffer_unordered;
-    #[cfg(feature = "alloc")]
-    #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
-    pub use self::buffer_unordered::BufferUnordered;
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "alloc")]
+mod buffer_unordered;
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "alloc")]
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::buffer_unordered::BufferUnordered;
 
-    #[cfg(feature = "alloc")]
-    mod buffered;
-    #[cfg(feature = "alloc")]
-    #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
-    pub use self::buffered::Buffered;
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "alloc")]
+mod buffered;
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "alloc")]
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::buffered::Buffered;
 
-    #[cfg(feature = "alloc")]
-    mod for_each_concurrent;
-    #[cfg(feature = "alloc")]
-    #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
-    pub use self::for_each_concurrent::ForEachConcurrent;
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "alloc")]
+mod flatten_unordered;
 
-    #[cfg(feature = "sink")]
-    #[cfg(feature = "alloc")]
-    mod split;
-    #[cfg(feature = "sink")]
-    #[cfg(feature = "alloc")]
-    #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
-    pub use self::split::{SplitStream, SplitSink, ReuniteError};
-}
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "alloc")]
+#[allow(unreachable_pub)]
+pub use self::flatten_unordered::FlattenUnordered;
+
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "alloc")]
+delegate_all!(
+    /// Stream for the [`flat_map_unordered`](StreamExt::flat_map_unordered) method.
+    FlatMapUnordered<St, U, F>(
+        FlattenUnordered<Map<St, F>>
+    ): Debug + Sink + Stream + FusedStream + AccessInner[St, (. .)] + New[|x: St, limit: Option<usize>, f: F| FlattenUnordered::new(Map::new(x, f), limit)]
+    where St: Stream, U: Stream, U: Unpin, F: FnMut(St::Item) -> U
+);
+
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "alloc")]
+mod for_each_concurrent;
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "alloc")]
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::for_each_concurrent::ForEachConcurrent;
+
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "sink")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sink")))]
+#[cfg(feature = "alloc")]
+mod split;
+#[cfg(not(futures_no_atomic_cas))]
+#[cfg(feature = "sink")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sink")))]
+#[cfg(feature = "alloc")]
+#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
+pub use self::split::{ReuniteError, SplitSink, SplitStream};
 
 #[cfg(feature = "std")]
 mod catch_unwind;
@@ -190,7 +274,7 @@ pub trait StreamExt: Stream {
     where
         Self: Unpin,
     {
-        Next::new(self)
+        assert_future::<Option<Self::Item>, _>(Next::new(self))
     }
 
     /// Converts this stream into a future of `(next_item, tail_of_stream)`.
@@ -225,7 +309,7 @@ pub trait StreamExt: Stream {
     where
         Self: Sized + Unpin,
     {
-        StreamFuture::new(self)
+        assert_future::<(Option<Self::Item>, Self), _>(StreamFuture::new(self))
     }
 
     /// Maps this stream's items to a different type, returning a new stream of
@@ -256,7 +340,7 @@ pub trait StreamExt: Stream {
         F: FnMut(Self::Item) -> T,
         Self: Sized,
     {
-        Map::new(self, f)
+        assert_stream::<T, _>(Map::new(self, f))
     }
 
     /// Creates a stream which gives the current iteration count as well as
@@ -273,7 +357,7 @@ pub trait StreamExt: Stream {
     /// # Overflow Behavior
     ///
     /// The method does no guarding against overflows, so enumerating more than
-    /// [`usize::max_value()`] elements either produces the wrong result or panics. If
+    /// [`prim@usize::max_value()`] elements either produces the wrong result or panics. If
     /// debug assertions are enabled, a panic is guaranteed.
     ///
     /// # Panics
@@ -301,7 +385,7 @@ pub trait StreamExt: Stream {
     where
         Self: Sized,
     {
-        Enumerate::new(self)
+        assert_stream::<(usize, Self::Item), _>(Enumerate::new(self))
     }
 
     /// Filters the values produced by this stream according to the provided
@@ -325,9 +409,9 @@ pub trait StreamExt: Stream {
     /// use futures::stream::{self, StreamExt};
     ///
     /// let stream = stream::iter(1..=10);
-    /// let evens = stream.filter(|x| future::ready(x % 2 == 0));
+    /// let events = stream.filter(|x| future::ready(x % 2 == 0));
     ///
-    /// assert_eq!(vec![2, 4, 6, 8, 10], evens.collect::<Vec<_>>().await);
+    /// assert_eq!(vec![2, 4, 6, 8, 10], events.collect::<Vec<_>>().await);
     /// # });
     /// ```
     fn filter<Fut, F>(self, f: F) -> Filter<Self, Fut, F>
@@ -336,7 +420,7 @@ pub trait StreamExt: Stream {
         Fut: Future<Output = bool>,
         Self: Sized,
     {
-        Filter::new(self, f)
+        assert_stream::<Self::Item, _>(Filter::new(self, f))
     }
 
     /// Filters the values produced by this stream while simultaneously mapping
@@ -357,11 +441,11 @@ pub trait StreamExt: Stream {
     /// use futures::stream::{self, StreamExt};
     ///
     /// let stream = stream::iter(1..=10);
-    /// let evens = stream.filter_map(|x| async move {
+    /// let events = stream.filter_map(|x| async move {
     ///     if x % 2 == 0 { Some(x + 1) } else { None }
     /// });
     ///
-    /// assert_eq!(vec![3, 5, 7, 9, 11], evens.collect::<Vec<_>>().await);
+    /// assert_eq!(vec![3, 5, 7, 9, 11], events.collect::<Vec<_>>().await);
     /// # });
     /// ```
     fn filter_map<Fut, T, F>(self, f: F) -> FilterMap<Self, Fut, F>
@@ -370,7 +454,7 @@ pub trait StreamExt: Stream {
         Fut: Future<Output = Option<T>>,
         Self: Sized,
     {
-        FilterMap::new(self, f)
+        assert_stream::<T, _>(FilterMap::new(self, f))
     }
 
     /// Computes from this stream's items new items of a different type using
@@ -401,7 +485,7 @@ pub trait StreamExt: Stream {
         Fut: Future,
         Self: Sized,
     {
-        Then::new(self, f)
+        assert_stream::<Fut::Output, _>(Then::new(self, f))
     }
 
     /// Transforms a stream into a collection, returning a
@@ -433,7 +517,46 @@ pub trait StreamExt: Stream {
     where
         Self: Sized,
     {
-        Collect::new(self)
+        assert_future::<C, _>(Collect::new(self))
+    }
+
+    /// Converts a stream of pairs into a future, which
+    /// resolves to pair of containers.
+    ///
+    /// `unzip()` produces a future, which resolves to two
+    /// collections: one from the left elements of the pairs,
+    /// and one from the right elements.
+    ///
+    /// The returned future will be resolved when the stream terminates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # futures::executor::block_on(async {
+    /// use futures::channel::mpsc;
+    /// use futures::stream::StreamExt;
+    /// use std::thread;
+    ///
+    /// let (tx, rx) = mpsc::unbounded();
+    ///
+    /// thread::spawn(move || {
+    ///     tx.unbounded_send((1, 2)).unwrap();
+    ///     tx.unbounded_send((3, 4)).unwrap();
+    ///     tx.unbounded_send((5, 6)).unwrap();
+    /// });
+    ///
+    /// let (o1, o2): (Vec<_>, Vec<_>) = rx.unzip().await;
+    /// assert_eq!(o1, vec![1, 3, 5]);
+    /// assert_eq!(o2, vec![2, 4, 6]);
+    /// # });
+    /// ```
+    fn unzip<A, B, FromA, FromB>(self) -> Unzip<Self, FromA, FromB>
+    where
+        FromA: Default + Extend<A>,
+        FromB: Default + Extend<B>,
+        Self: Sized + Stream<Item = (A, B)>,
+    {
+        assert_future::<(FromA, FromB), _>(Unzip::new(self))
     }
 
     /// Concatenate all items of a stream into a single extendable
@@ -473,7 +596,69 @@ pub trait StreamExt: Stream {
         Self: Sized,
         Self::Item: Extend<<<Self as Stream>::Item as IntoIterator>::Item> + IntoIterator + Default,
     {
-        Concat::new(self)
+        assert_future::<Self::Item, _>(Concat::new(self))
+    }
+
+    /// Drives the stream to completion, counting the number of items.
+    ///
+    /// # Overflow Behavior
+    ///
+    /// The method does no guarding against overflows, so counting elements of a
+    /// stream with more than [`usize::MAX`] elements either produces the wrong
+    /// result or panics. If debug assertions are enabled, a panic is guaranteed.
+    ///
+    /// # Panics
+    ///
+    /// This function might panic if the iterator has more than [`usize::MAX`]
+    /// elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # futures::executor::block_on(async {
+    /// use futures::stream::{self, StreamExt};
+    ///
+    /// let stream = stream::iter(1..=10);
+    /// let count = stream.count().await;
+    ///
+    /// assert_eq!(count, 10);
+    /// # });
+    /// ```
+    fn count(self) -> Count<Self>
+    where
+        Self: Sized,
+    {
+        assert_future::<usize, _>(Count::new(self))
+    }
+
+    /// Repeats a stream endlessly.
+    ///
+    /// The stream never terminates. Note that you likely want to avoid
+    /// usage of `collect` or such on the returned stream as it will exhaust
+    /// available memory as it tries to just fill up all RAM.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # futures::executor::block_on(async {
+    /// use futures::stream::{self, StreamExt};
+    /// let a = [1, 2, 3];
+    /// let mut s = stream::iter(a.iter()).cycle();
+    ///
+    /// assert_eq!(s.next().await, Some(&1));
+    /// assert_eq!(s.next().await, Some(&2));
+    /// assert_eq!(s.next().await, Some(&3));
+    /// assert_eq!(s.next().await, Some(&1));
+    /// assert_eq!(s.next().await, Some(&2));
+    /// assert_eq!(s.next().await, Some(&3));
+    /// assert_eq!(s.next().await, Some(&1));
+    /// # });
+    /// ```
+    fn cycle(self) -> Cycle<Self>
+    where
+        Self: Sized + Clone,
+    {
+        assert_stream::<Self::Item, _>(Cycle::new(self))
     }
 
     /// Execute an accumulating asynchronous computation over a stream,
@@ -502,7 +687,51 @@ pub trait StreamExt: Stream {
         Fut: Future<Output = T>,
         Self: Sized,
     {
-        Fold::new(self, f, init)
+        assert_future::<T, _>(Fold::new(self, f, init))
+    }
+
+    /// Execute predicate over asynchronous stream, and return `true` if any element in stream satisfied a predicate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # futures::executor::block_on(async {
+    /// use futures::stream::{self, StreamExt};
+    ///
+    /// let number_stream = stream::iter(0..10);
+    /// let contain_three = number_stream.any(|i| async move { i == 3 });
+    /// assert_eq!(contain_three.await, true);
+    /// # });
+    /// ```
+    fn any<Fut, F>(self, f: F) -> Any<Self, Fut, F>
+    where
+        F: FnMut(Self::Item) -> Fut,
+        Fut: Future<Output = bool>,
+        Self: Sized,
+    {
+        assert_future::<bool, _>(Any::new(self, f))
+    }
+
+    /// Execute predicate over asynchronous stream, and return `true` if all element in stream satisfied a predicate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # futures::executor::block_on(async {
+    /// use futures::stream::{self, StreamExt};
+    ///
+    /// let number_stream = stream::iter(0..10);
+    /// let less_then_twenty = number_stream.all(|i| async move { i < 20 });
+    /// assert_eq!(less_then_twenty.await, true);
+    /// # });
+    /// ```
+    fn all<Fut, F>(self, f: F) -> All<Self, Fut, F>
+    where
+        F: FnMut(Self::Item) -> Fut,
+        Fut: Future<Output = bool>,
+        Self: Sized,
+    {
+        assert_future::<bool, _>(All::new(self, f))
     }
 
     /// Flattens a stream of streams into just one continuous stream.
@@ -541,13 +770,146 @@ pub trait StreamExt: Stream {
         Self::Item: Stream,
         Self: Sized,
     {
-        Flatten::new(self)
+        assert_stream::<<Self::Item as Stream>::Item, _>(Flatten::new(self))
     }
 
-    /// Combinator similar to [`StreamExt::fold`] that holds internal state and produces a new stream.
+    /// Flattens a stream of streams into just one continuous stream. Polls
+    /// inner streams concurrently.
     ///
-    /// Accepts initial state and closure which will be applied to each element of the stream until provided closure
-    /// returns `None`. Once `None` is returned, stream will be terminated.
+    /// # Examples
+    ///
+    /// ```
+    /// # futures::executor::block_on(async {
+    /// use futures::channel::mpsc;
+    /// use futures::stream::StreamExt;
+    /// use std::thread;
+    ///
+    /// let (tx1, rx1) = mpsc::unbounded();
+    /// let (tx2, rx2) = mpsc::unbounded();
+    /// let (tx3, rx3) = mpsc::unbounded();
+    ///
+    /// thread::spawn(move || {
+    ///     tx1.unbounded_send(1).unwrap();
+    ///     tx1.unbounded_send(2).unwrap();
+    /// });
+    /// thread::spawn(move || {
+    ///     tx2.unbounded_send(3).unwrap();
+    ///     tx2.unbounded_send(4).unwrap();
+    /// });
+    /// thread::spawn(move || {
+    ///     tx3.unbounded_send(rx1).unwrap();
+    ///     tx3.unbounded_send(rx2).unwrap();
+    /// });
+    ///
+    /// let mut output = rx3.flatten_unordered(None).collect::<Vec<i32>>().await;
+    /// output.sort();
+    ///
+    /// assert_eq!(output, vec![1, 2, 3, 4]);
+    /// # });
+    /// ```
+    #[cfg(not(futures_no_atomic_cas))]
+    #[cfg(feature = "alloc")]
+    fn flatten_unordered(self, limit: impl Into<Option<usize>>) -> FlattenUnordered<Self>
+    where
+        Self::Item: Stream + Unpin,
+        Self: Sized,
+    {
+        FlattenUnordered::new(self, limit.into())
+    }
+
+    /// Maps a stream like [`StreamExt::map`] but flattens nested `Stream`s.
+    ///
+    /// [`StreamExt::map`] is very useful, but if it produces a `Stream` instead,
+    /// you would have to chain combinators like `.map(f).flatten()` while this
+    /// combinator provides ability to write `.flat_map(f)` instead of chaining.
+    ///
+    /// The provided closure which produces inner streams is executed over all elements
+    /// of stream as last inner stream is terminated and next stream item is available.
+    ///
+    /// Note that this function consumes the stream passed into it and returns a
+    /// wrapped version of it, similar to the existing `flat_map` methods in the
+    /// standard library.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # futures::executor::block_on(async {
+    /// use futures::stream::{self, StreamExt};
+    ///
+    /// let stream = stream::iter(1..=3);
+    /// let stream = stream.flat_map(|x| stream::iter(vec![x + 3; x]));
+    ///
+    /// assert_eq!(vec![4, 5, 5, 6, 6, 6], stream.collect::<Vec<_>>().await);
+    /// # });
+    /// ```
+    fn flat_map<U, F>(self, f: F) -> FlatMap<Self, U, F>
+    where
+        F: FnMut(Self::Item) -> U,
+        U: Stream,
+        Self: Sized,
+    {
+        assert_stream::<U::Item, _>(FlatMap::new(self, f))
+    }
+
+    /// Maps a stream like [`StreamExt::map`] but flattens nested `Stream`s
+    /// and polls them concurrently, yielding items in any order, as they made
+    /// available.
+    ///
+    /// [`StreamExt::map`] is very useful, but if it produces `Stream`s
+    /// instead, and you need to poll all of them concurrently, you would
+    /// have to use something like `for_each_concurrent` and merge values
+    /// by hand. This combinator provides ability to collect all values
+    /// from concurrently polled streams into one stream.
+    ///
+    /// The first argument is an optional limit on the number of concurrently
+    /// polled streams. If this limit is not `None`, no more than `limit` streams
+    /// will be polled concurrently. The `limit` argument is of type
+    /// `Into<Option<usize>>`, and so can be provided as either `None`,
+    /// `Some(10)`, or just `10`. Note: a limit of zero is interpreted as
+    /// no limit at all, and will have the same result as passing in `None`.
+    ///
+    /// The provided closure which produces inner streams is executed over
+    /// all elements of stream as next stream item is available and limit
+    /// of concurrently processed streams isn't exceeded.
+    ///
+    /// Note that this function consumes the stream passed into it and
+    /// returns a wrapped version of it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # futures::executor::block_on(async {
+    /// use futures::stream::{self, StreamExt};
+    ///
+    /// let stream = stream::iter(1..5);
+    /// let stream = stream.flat_map_unordered(1, |x| stream::iter(vec![x; x]));
+    /// let mut values = stream.collect::<Vec<_>>().await;
+    /// values.sort();
+    ///
+    /// assert_eq!(vec![1usize, 2, 2, 3, 3, 3, 4, 4, 4, 4], values);
+    /// # });
+    /// ```
+    #[cfg(not(futures_no_atomic_cas))]
+    #[cfg(feature = "alloc")]
+    fn flat_map_unordered<U, F>(
+        self,
+        limit: impl Into<Option<usize>>,
+        f: F,
+    ) -> FlatMapUnordered<Self, U, F>
+    where
+        U: Stream + Unpin,
+        F: FnMut(Self::Item) -> U,
+        Self: Sized,
+    {
+        FlatMapUnordered::new(self, limit.into(), f)
+    }
+
+    /// Combinator similar to [`StreamExt::fold`] that holds internal state
+    /// and produces a new stream.
+    ///
+    /// Accepts initial state and closure which will be applied to each element
+    /// of the stream until provided closure returns `None`. Once `None` is
+    /// returned, stream will be terminated.
     ///
     /// # Examples
     ///
@@ -572,7 +934,7 @@ pub trait StreamExt: Stream {
         Fut: Future<Output = Option<B>>,
         Self: Sized,
     {
-        Scan::new(self, initial_state, f)
+        assert_stream::<B, _>(Scan::new(self, initial_state, f))
     }
 
     /// Skip elements on this stream while the provided asynchronous predicate
@@ -580,7 +942,7 @@ pub trait StreamExt: Stream {
     ///
     /// This function, like `Iterator::skip_while`, will skip elements on the
     /// stream until the predicate `f` resolves to `false`. Once one element
-    /// returns false all future elements will be returned from the underlying
+    /// returns `false`, all future elements will be returned from the underlying
     /// stream.
     ///
     /// # Examples
@@ -603,7 +965,7 @@ pub trait StreamExt: Stream {
         Fut: Future<Output = bool>,
         Self: Sized,
     {
-        SkipWhile::new(self, f)
+        assert_stream::<Self::Item, _>(SkipWhile::new(self, f))
     }
 
     /// Take elements from this stream while the provided asynchronous predicate
@@ -611,7 +973,7 @@ pub trait StreamExt: Stream {
     ///
     /// This function, like `Iterator::take_while`, will take elements from the
     /// stream until the predicate `f` resolves to `false`. Once one element
-    /// returns false it will always return that the stream is done.
+    /// returns `false`, it will always return that the stream is done.
     ///
     /// # Examples
     ///
@@ -633,7 +995,51 @@ pub trait StreamExt: Stream {
         Fut: Future<Output = bool>,
         Self: Sized,
     {
-        TakeWhile::new(self, f)
+        assert_stream::<Self::Item, _>(TakeWhile::new(self, f))
+    }
+
+    /// Take elements from this stream until the provided future resolves.
+    ///
+    /// This function will take elements from the stream until the provided
+    /// stopping future `fut` resolves. Once the `fut` future becomes ready,
+    /// this stream combinator will always return that the stream is done.
+    ///
+    /// The stopping future may return any type. Once the stream is stopped
+    /// the result of the stopping future may be accessed with `TakeUntil::take_result()`.
+    /// The stream may also be resumed with `TakeUntil::take_future()`.
+    /// See the documentation of [`TakeUntil`] for more information.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # futures::executor::block_on(async {
+    /// use futures::future;
+    /// use futures::stream::{self, StreamExt};
+    /// use futures::task::Poll;
+    ///
+    /// let stream = stream::iter(1..=10);
+    ///
+    /// let mut i = 0;
+    /// let stop_fut = future::poll_fn(|_cx| {
+    ///     i += 1;
+    ///     if i <= 5 {
+    ///         Poll::Pending
+    ///     } else {
+    ///         Poll::Ready(())
+    ///     }
+    /// });
+    ///
+    /// let stream = stream.take_until(stop_fut);
+    ///
+    /// assert_eq!(vec![1, 2, 3, 4, 5], stream.collect::<Vec<_>>().await);
+    /// # });
+    /// ```
+    fn take_until<Fut>(self, fut: Fut) -> TakeUntil<Self, Fut>
+    where
+        Fut: Future,
+        Self: Sized,
+    {
+        assert_stream::<Self::Item, _>(TakeUntil::new(self, fut))
     }
 
     /// Runs this stream to completion, executing the provided asynchronous
@@ -675,7 +1081,7 @@ pub trait StreamExt: Stream {
         Fut: Future<Output = ()>,
         Self: Sized,
     {
-        ForEach::new(self, f)
+        assert_future::<(), _>(ForEach::new(self, f))
     }
 
     /// Runs this stream to completion, executing the provided asynchronous
@@ -723,7 +1129,7 @@ pub trait StreamExt: Stream {
     /// fut.await;
     /// # })
     /// ```
-    #[cfg_attr(feature = "cfg-target-has-atomic", cfg(target_has_atomic = "ptr"))]
+    #[cfg(not(futures_no_atomic_cas))]
     #[cfg(feature = "alloc")]
     fn for_each_concurrent<Fut, F>(
         self,
@@ -735,7 +1141,7 @@ pub trait StreamExt: Stream {
         Fut: Future<Output = ()>,
         Self: Sized,
     {
-        ForEachConcurrent::new(self, limit.into(), f)
+        assert_future::<(), _>(ForEachConcurrent::new(self, limit.into(), f))
     }
 
     /// Creates a new stream of at most `n` items of the underlying stream.
@@ -758,7 +1164,7 @@ pub trait StreamExt: Stream {
     where
         Self: Sized,
     {
-        Take::new(self, n)
+        assert_stream::<Self::Item, _>(Take::new(self, n))
     }
 
     /// Creates a new stream which skips `n` items of the underlying stream.
@@ -781,7 +1187,7 @@ pub trait StreamExt: Stream {
     where
         Self: Sized,
     {
-        Skip::new(self, n)
+        assert_stream::<Self::Item, _>(Skip::new(self, n))
     }
 
     /// Fuse a stream such that [`poll_next`](Stream::poll_next) will never
@@ -827,7 +1233,7 @@ pub trait StreamExt: Stream {
     where
         Self: Sized,
     {
-        Fuse::new(self)
+        assert_stream::<Self::Item, _>(Fuse::new(self))
     }
 
     /// Borrows a stream, rather than consuming it.
@@ -905,7 +1311,7 @@ pub trait StreamExt: Stream {
     where
         Self: Sized + std::panic::UnwindSafe,
     {
-        CatchUnwind::new(self)
+        assert_stream(CatchUnwind::new(self))
     }
 
     /// Wrap the stream in a Box, pinning it.
@@ -917,7 +1323,7 @@ pub trait StreamExt: Stream {
     where
         Self: Sized + Send + 'a,
     {
-        Box::pin(self)
+        assert_stream::<Self::Item, _>(Box::pin(self))
     }
 
     /// Wrap the stream in a Box, pinning it.
@@ -931,7 +1337,7 @@ pub trait StreamExt: Stream {
     where
         Self: Sized + 'a,
     {
-        Box::pin(self)
+        assert_stream::<Self::Item, _>(Box::pin(self))
     }
 
     /// An adaptor for creating a buffered list of pending futures.
@@ -946,14 +1352,14 @@ pub trait StreamExt: Stream {
     ///
     /// This method is only available when the `std` or `alloc` feature of this
     /// library is activated, and it is activated by default.
-    #[cfg_attr(feature = "cfg-target-has-atomic", cfg(target_has_atomic = "ptr"))]
+    #[cfg(not(futures_no_atomic_cas))]
     #[cfg(feature = "alloc")]
     fn buffered(self, n: usize) -> Buffered<Self>
     where
         Self::Item: Future,
         Self: Sized,
     {
-        Buffered::new(self, n)
+        assert_stream::<<Self::Item as Future>::Output, _>(Buffered::new(self, n))
     }
 
     /// An adaptor for creating a buffered list of pending futures (unordered).
@@ -991,14 +1397,14 @@ pub trait StreamExt: Stream {
     /// assert_eq!(buffered.next().await, None);
     /// # Ok::<(), i32>(()) }).unwrap();
     /// ```
-    #[cfg_attr(feature = "cfg-target-has-atomic", cfg(target_has_atomic = "ptr"))]
+    #[cfg(not(futures_no_atomic_cas))]
     #[cfg(feature = "alloc")]
     fn buffer_unordered(self, n: usize) -> BufferUnordered<Self>
     where
         Self::Item: Future,
         Self: Sized,
     {
-        BufferUnordered::new(self, n)
+        assert_stream::<<Self::Item as Future>::Output, _>(BufferUnordered::new(self, n))
     }
 
     /// An adapter for zipping two streams together.
@@ -1028,7 +1434,7 @@ pub trait StreamExt: Stream {
         St: Stream,
         Self: Sized,
     {
-        Zip::new(self, other)
+        assert_stream::<(Self::Item, St::Item), _>(Zip::new(self, other))
     }
 
     /// Adapter for chaining two streams.
@@ -1059,7 +1465,7 @@ pub trait StreamExt: Stream {
         St: Stream<Item = Self::Item>,
         Self: Sized,
     {
-        Chain::new(self, other)
+        assert_stream::<Self::Item, _>(Chain::new(self, other))
     }
 
     /// Creates a new stream which exposes a `peek` method.
@@ -1069,7 +1475,7 @@ pub trait StreamExt: Stream {
     where
         Self: Sized,
     {
-        Peekable::new(self)
+        assert_stream::<Self::Item, _>(Peekable::new(self))
     }
 
     /// An adaptor for chunking up items of the stream inside a vector.
@@ -1095,7 +1501,33 @@ pub trait StreamExt: Stream {
     where
         Self: Sized,
     {
-        Chunks::new(self, capacity)
+        assert_stream::<Vec<Self::Item>, _>(Chunks::new(self, capacity))
+    }
+
+    /// An adaptor for chunking up ready items of the stream inside a vector.
+    ///
+    /// This combinator will attempt to pull ready items from this stream and
+    /// buffer them into a local vector. At most `capacity` items will get
+    /// buffered before they're yielded from the returned stream. If underlying
+    /// stream returns `Poll::Pending`, and collected chunk is not empty, it will
+    /// be immediately returned.
+    ///
+    /// If the underlying stream ended and only a partial vector was created,
+    /// it'll be returned. Additionally if an error happens from the underlying
+    /// stream then the currently buffered items will be yielded.
+    ///
+    /// This method is only available when the `std` or `alloc` feature of this
+    /// library is activated, and it is activated by default.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if `capacity` is zero.
+    #[cfg(feature = "alloc")]
+    fn ready_chunks(self, capacity: usize) -> ReadyChunks<Self>
+    where
+        Self: Sized,
+    {
+        assert_stream::<Vec<Self::Item>, _>(ReadyChunks::new(self, capacity))
     }
 
     /// A future that completes after the given stream has been fully processed
@@ -1107,17 +1539,22 @@ pub trait StreamExt: Stream {
     /// the sink is closed. Note that neither the original stream nor provided
     /// sink will be output by this future. Pass the sink by `Pin<&mut S>`
     /// (for example, via `forward(&mut sink)` inside an `async` fn/block) in
-    /// order to preserve access to the `Sink`.
+    /// order to preserve access to the `Sink`. If the stream produces an error,
+    /// that error will be returned by this future without flushing/closing the sink.
     #[cfg(feature = "sink")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "sink")))]
     fn forward<S>(self, sink: S) -> Forward<Self, S>
     where
-        S: Sink<<Self as TryStream>::Ok>,
-        Self: TryStream<Error = S::Error> + Sized,
+        S: Sink<Self::Ok, Error = Self::Error>,
+        Self: TryStream + Sized,
+        // Self: TryStream + Sized + Stream<Item = Result<<Self as TryStream>::Ok, <Self as TryStream>::Error>>,
     {
+        // TODO: type mismatch resolving `<Self as futures_core::Stream>::Item == std::result::Result<<Self as futures_core::TryStream>::Ok, <Self as futures_core::TryStream>::Error>`
+        // assert_future::<Result<(), Self::Error>, _>(Forward::new(self, sink))
         Forward::new(self, sink)
     }
 
-    /// Splits this `Stream + Sink` object into separate `Stream` and `Sink`
+    /// Splits this `Stream + Sink` object into separate `Sink` and `Stream`
     /// objects.
     ///
     /// This can be useful when you want to split ownership between tasks, or
@@ -1127,13 +1564,18 @@ pub trait StreamExt: Stream {
     /// This method is only available when the `std` or `alloc` feature of this
     /// library is activated, and it is activated by default.
     #[cfg(feature = "sink")]
-    #[cfg_attr(feature = "cfg-target-has-atomic", cfg(target_has_atomic = "ptr"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "sink")))]
+    #[cfg(not(futures_no_atomic_cas))]
     #[cfg(feature = "alloc")]
     fn split<Item>(self) -> (SplitSink<Self, Item>, SplitStream<Self>)
     where
         Self: Sink<Item> + Sized,
     {
-        split::split(self)
+        let (sink, stream) = split::split(self);
+        (
+            crate::sink::assert_sink::<Item, Self::Error, _>(sink),
+            assert_stream::<Self::Item, _>(stream),
+        )
     }
 
     /// Do something with each item of this stream, afterwards passing it on.
@@ -1146,7 +1588,7 @@ pub trait StreamExt: Stream {
         F: FnMut(&Self::Item),
         Self: Sized,
     {
-        Inspect::new(self, f)
+        assert_stream::<Self::Item, _>(Inspect::new(self, f))
     }
 
     /// Wrap this stream in an `Either` stream, making it the left-hand variant
@@ -1159,7 +1601,7 @@ pub trait StreamExt: Stream {
         B: Stream<Item = Self::Item>,
         Self: Sized,
     {
-        Either::Left(self)
+        assert_stream::<Self::Item, _>(Either::Left(self))
     }
 
     /// Wrap this stream in an `Either` stream, making it the right-hand variant
@@ -1172,7 +1614,7 @@ pub trait StreamExt: Stream {
         B: Stream<Item = Self::Item>,
         Self: Sized,
     {
-        Either::Right(self)
+        assert_stream::<Self::Item, _>(Either::Right(self))
     }
 
     /// A convenience method for calling [`Stream::poll_next`] on [`Unpin`]
@@ -1236,6 +1678,6 @@ pub trait StreamExt: Stream {
     where
         Self: Unpin + FusedStream,
     {
-        SelectNextSome::new(self)
+        assert_future::<Self::Item, _>(SelectNextSome::new(self))
     }
 }

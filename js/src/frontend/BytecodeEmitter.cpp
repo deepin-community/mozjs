@@ -10,23 +10,22 @@
 
 #include "frontend/BytecodeEmitter.h"
 
-#include "mozilla/ArrayUtils.h"  // mozilla::ArrayLength
-#include "mozilla/Casting.h"     // mozilla::AssertedCast
-#include "mozilla/DebugOnly.h"   // mozilla::DebugOnly
+#include "mozilla/Casting.h"    // mozilla::AssertedCast
+#include "mozilla/DebugOnly.h"  // mozilla::DebugOnly
 #include "mozilla/FloatingPoint.h"  // mozilla::NumberEqualsInt32, mozilla::NumberIsInt32
+#include "mozilla/HashTable.h"      // mozilla::HashSet
 #include "mozilla/Maybe.h"          // mozilla::{Maybe,Nothing,Some}
 #include "mozilla/PodOperations.h"  // mozilla::PodCopy
 #include "mozilla/Sprintf.h"        // SprintfLiteral
-#include "mozilla/Unused.h"         // mozilla::Unused
 #include "mozilla/Variant.h"        // mozilla::AsVariant
 
 #include <algorithm>
+#include <iterator>
 #include <string.h>
 
 #include "jstypes.h"  // JS_BIT
 
-#include "ds/Nestable.h"  // Nestable
-#include "frontend/AbstractScopePtr.h"
+#include "frontend/AbstractScopePtr.h"           // ScopeIndex
 #include "frontend/BytecodeControlStructures.h"  // NestableControl, BreakableControl, LabelControl, LoopControl, TryFinallyControl
 #include "frontend/CallOrNewEmitter.h"           // CallOrNewEmitter
 #include "frontend/CForEmitter.h"                // CForEmitter
@@ -43,38 +42,40 @@
 #include "frontend/LabelEmitter.h"  // LabelEmitter
 #include "frontend/LexicalScopeEmitter.h"  // LexicalScopeEmitter
 #include "frontend/ModuleSharedContext.h"  // ModuleSharedContext
+#include "frontend/NameAnalysisTypes.h"    // PrivateNameKind
 #include "frontend/NameFunctions.h"        // NameFunctions
 #include "frontend/NameOpEmitter.h"        // NameOpEmitter
 #include "frontend/ObjectEmitter.h"  // PropertyEmitter, ObjectEmitter, ClassEmitter
 #include "frontend/OptionalEmitter.h"  // OptionalEmitter
-#include "frontend/ParseNode.h"      // ParseNodeKind, ParseNode and subclasses
-#include "frontend/Parser.h"         // Parser
-#include "frontend/PropOpEmitter.h"  // PropOpEmitter
-#include "frontend/SourceNotes.h"    // SrcNote, SrcNoteType, SrcNoteWriter
-#include "frontend/SwitchEmitter.h"  // SwitchEmitter
-#include "frontend/TDZCheckCache.h"  // TDZCheckCache
-#include "frontend/TryEmitter.h"     // TryEmitter
-#include "frontend/WhileEmitter.h"   // WhileEmitter
-#include "js/CompileOptions.h"       // TransitiveCompileOptions, CompileOptions
-#include "vm/AsyncFunctionResolveKind.h"  // AsyncFunctionResolveKind
+#include "frontend/ParseNode.h"   // ParseNodeKind, ParseNode and subclasses
+#include "frontend/Parser.h"      // Parser
+#include "frontend/ParserAtom.h"  // ParserAtomsTable, ParserAtom
+#include "frontend/PrivateOpEmitter.h"  // PrivateOpEmitter
+#include "frontend/PropOpEmitter.h"     // PropOpEmitter
+#include "frontend/SourceNotes.h"       // SrcNote, SrcNoteType, SrcNoteWriter
+#include "frontend/SwitchEmitter.h"     // SwitchEmitter
+#include "frontend/TaggedParserAtomIndexHasher.h"  // TaggedParserAtomIndexHasher
+#include "frontend/TDZCheckCache.h"                // TDZCheckCache
+#include "frontend/TryEmitter.h"                   // TryEmitter
+#include "frontend/WhileEmitter.h"                 // WhileEmitter
+#include "js/friend/ErrorMessages.h"               // JSMSG_*
+#include "js/friend/StackLimits.h"                 // AutoCheckRecursionLimit
+#include "util/StringBuffer.h"                     // StringBuffer
+#include "vm/AsyncFunctionResolveKind.h"           // AsyncFunctionResolveKind
 #include "vm/BytecodeUtil.h"  // JOF_*, IsArgOp, IsLocalOp, SET_UINT24, SET_ICINDEX, BytecodeFallsThrough, BytecodeIsJumpTarget
+#include "vm/CompletionKind.h"      // CompletionKind
 #include "vm/FunctionPrefixKind.h"  // FunctionPrefixKind
 #include "vm/GeneratorObject.h"     // AbstractGeneratorObject
-#include "vm/JSAtom.h"              // JSAtom, js_*_str
-#include "vm/JSContext.h"           // JSContext
-#include "vm/JSFunction.h"          // JSFunction,
-#include "vm/JSScript.h"  // JSScript, ScriptSourceObject, FieldInitializers, BaseScript
-#include "vm/Opcodes.h"        // JSOp, JSOpLength_*
-#include "vm/SharedStencil.h"  // ScopeNote
-#include "vm/ThrowMsgKind.h"   // ThrowMsgKind
-#include "wasm/AsmJS.h"        // IsAsmJSModule
-
-#include "vm/JSObject-inl.h"  // JSObject
+#include "vm/Opcodes.h"             // JSOp, JSOpLength_*
+#include "vm/PropMap.h"             // SharedPropMap::MaxPropsForNonDictionary
+#include "vm/Scope.h"               // GetScopeDataTrailingNames
+#include "vm/SharedStencil.h"       // ScopeNote
+#include "vm/ThrowMsgKind.h"        // ThrowMsgKind
+#include "vm/WellKnownAtom.h"       // js_*_str
 
 using namespace js;
 using namespace js::frontend;
 
-using mozilla::ArrayLength;
 using mozilla::AssertedCast;
 using mozilla::AsVariant;
 using mozilla::DebugOnly;
@@ -84,7 +85,6 @@ using mozilla::NumberEqualsInt32;
 using mozilla::NumberIsInt32;
 using mozilla::PodCopy;
 using mozilla::Some;
-using mozilla::Unused;
 
 static bool ParseNodeRequiresSpecialLineNumberNotes(ParseNode* pn) {
   // The few node types listed below are exceptions to the usual
@@ -98,39 +98,68 @@ static bool ParseNodeRequiresSpecialLineNumberNotes(ParseNode* pn) {
          kind == ParseNodeKind::Function;
 }
 
+static bool NeedsFieldInitializer(ParseNode* member, bool inStaticContext) {
+  // For the purposes of bytecode emission, StaticClassBlocks are treated as if
+  // they were static initializers.
+  return (member->is<StaticClassBlock>() && inStaticContext) ||
+         (member->is<ClassField>() &&
+          member->as<ClassField>().isStatic() == inStaticContext);
+}
+
+static bool NeedsAccessorInitializer(ParseNode* member, bool isStatic) {
+  if (isStatic) {
+    return false;
+  }
+  return member->is<ClassMethod>() &&
+         member->as<ClassMethod>().name().isKind(ParseNodeKind::PrivateName) &&
+         !member->as<ClassMethod>().isStatic() &&
+         member->as<ClassMethod>().accessorType() != AccessorType::None;
+}
+
+static bool ShouldSuppressBreakpointsAndSourceNotes(
+    SharedContext* sc, BytecodeEmitter::EmitterMode emitterMode) {
+  // Suppress for all self-hosting code.
+  if (emitterMode == BytecodeEmitter::EmitterMode::SelfHosting) {
+    return true;
+  }
+
+  // Suppress for synthesized class constructors.
+  if (sc->isFunctionBox()) {
+    FunctionBox* funbox = sc->asFunctionBox();
+    return funbox->isSyntheticFunction() && funbox->isClassConstructor();
+  }
+
+  return false;
+}
+
 BytecodeEmitter::BytecodeEmitter(BytecodeEmitter* parent, SharedContext* sc,
-                                 CompilationInfo& compilationInfo,
+                                 CompilationState& compilationState,
                                  EmitterMode emitterMode)
     : sc(sc),
       cx(sc->cx_),
       parent(parent),
-      bytecodeSection_(cx, sc->extent.lineno),
-      perScriptData_(cx, compilationInfo),
-      compilationInfo(compilationInfo),
-      emitterMode(emitterMode) {
-  if (IsTypeInferenceEnabled() && sc->isFunctionBox()) {
-    // Functions have IC entries for type monitoring |this| and arguments.
-    bytecodeSection().setNumICEntries(sc->asFunctionBox()->nargs() + 1);
-  }
-}
+      bytecodeSection_(cx, sc->extent().lineno, sc->extent().column),
+      perScriptData_(cx, compilationState),
+      compilationState(compilationState),
+      suppressBreakpointsAndSourceNotes(
+          ShouldSuppressBreakpointsAndSourceNotes(sc, emitterMode)),
+      emitterMode(emitterMode) {}
 
 BytecodeEmitter::BytecodeEmitter(BytecodeEmitter* parent,
                                  BCEParserHandle* handle, SharedContext* sc,
-                                 CompilationInfo& compilationInfo,
+                                 CompilationState& compilationState,
                                  EmitterMode emitterMode)
-    : BytecodeEmitter(parent, sc, compilationInfo, emitterMode) {
+    : BytecodeEmitter(parent, sc, compilationState, emitterMode) {
   parser = handle;
-  instrumentationKinds = parser->options().instrumentationKinds;
 }
 
 BytecodeEmitter::BytecodeEmitter(BytecodeEmitter* parent,
                                  const EitherParser& parser, SharedContext* sc,
-                                 CompilationInfo& compilationInfo,
+                                 CompilationState& compilationState,
                                  EmitterMode emitterMode)
-    : BytecodeEmitter(parent, sc, compilationInfo, emitterMode) {
+    : BytecodeEmitter(parent, sc, compilationState, emitterMode) {
   ep_.emplace(parser);
   this->parser = ep_.ptr();
-  instrumentationKinds = this->parser->options().instrumentationKinds;
 }
 
 void BytecodeEmitter::initFromBodyPosition(TokenPos bodyPosition) {
@@ -138,7 +167,14 @@ void BytecodeEmitter::initFromBodyPosition(TokenPos bodyPosition) {
   setFunctionBodyEndPos(bodyPosition.end);
 }
 
-bool BytecodeEmitter::init() { return perScriptData_.init(cx); }
+bool BytecodeEmitter::init() {
+  if (!parent) {
+    if (!compilationState.prepareSharedDataStorage(cx)) {
+      return false;
+    }
+  }
+  return perScriptData_.init(cx);
+}
 
 bool BytecodeEmitter::init(TokenPos bodyPosition) {
   initFromBodyPosition(bodyPosition);
@@ -155,31 +191,34 @@ T* BytecodeEmitter::findInnermostNestableControl(Predicate predicate) const {
   return NestableControl::findNearest<T>(innermostNestableControl, predicate);
 }
 
-NameLocation BytecodeEmitter::lookupName(JSAtom* name) {
+NameLocation BytecodeEmitter::lookupName(TaggedParserAtomIndex name) {
   return innermostEmitterScope()->lookup(this, name);
 }
 
+void BytecodeEmitter::lookupPrivate(TaggedParserAtomIndex name,
+                                    NameLocation& loc,
+                                    Maybe<NameLocation>& brandLoc) {
+  innermostEmitterScope()->lookupPrivate(this, name, loc, brandLoc);
+}
+
 Maybe<NameLocation> BytecodeEmitter::locationOfNameBoundInScope(
-    JSAtom* name, EmitterScope* target) {
+    TaggedParserAtomIndex name, EmitterScope* target) {
   return innermostEmitterScope()->locationBoundInScope(name, target);
 }
 
-Maybe<NameLocation> BytecodeEmitter::locationOfNameBoundInFunctionScope(
-    JSAtom* name, EmitterScope* source) {
-  EmitterScope* funScope = source;
-  while (!funScope->scope(this).is<FunctionScope>()) {
-    funScope = funScope->enclosingInFrame();
+template <typename T>
+Maybe<NameLocation> BytecodeEmitter::locationOfNameBoundInScopeType(
+    TaggedParserAtomIndex name, EmitterScope* source) {
+  EmitterScope* aScope = source;
+  while (!aScope->scope(this).is<T>()) {
+    aScope = aScope->enclosingInFrame();
   }
-  return source->locationBoundInScope(name, funScope);
+  return source->locationBoundInScope(name, aScope);
 }
 
 bool BytecodeEmitter::markStepBreakpoint() {
   if (skipBreakpointSrcNotes()) {
     return true;
-  }
-
-  if (!emitInstrumentation(InstrumentationKind::Breakpoint)) {
-    return false;
   }
 
   if (!newSrcNote(SrcNoteType::StepSep)) {
@@ -208,10 +247,6 @@ bool BytecodeEmitter::markSimpleBreakpoint() {
   // having two breakpoints with the same line/column position.
   // Note: This assumes that the position for the call has already been set.
   if (!bytecodeSection().isDuplicateLocation()) {
-    if (!emitInstrumentation(InstrumentationKind::Breakpoint)) {
-      return false;
-    }
-
     if (!newSrcNote(SrcNoteType::Breakpoint)) {
       return false;
     }
@@ -233,10 +268,6 @@ bool BytecodeEmitter::emitCheck(JSOp op, ptrdiff_t delta,
 
   if (!bytecodeSection().code().growByUninitialized(delta)) {
     return false;
-  }
-
-  if (BytecodeOpHasTypeSet(op)) {
-    bytecodeSection().incrementNumTypeSets();
   }
 
   if (BytecodeOpHasIC(op)) {
@@ -345,7 +376,7 @@ bool BytecodeEmitter::emitJumpTargetOp(JSOp op, BytecodeOffset* off) {
   uint32_t numEntries = bytecodeSection().numICEntries();
 
   size_t n = GetOpLength(op) - 1;
-  MOZ_ASSERT(GetOpLength(op) >= 1 + UINT32_INDEX_LEN);
+  MOZ_ASSERT(GetOpLength(op) >= 1 + ICINDEX_LEN);
 
   if (!emitN(op, n, off)) {
     return false;
@@ -509,6 +540,10 @@ bool BytecodeEmitter::emitCheckIsObj(CheckIsObjectKind kind) {
   return emit2(JSOp::CheckIsObj, uint8_t(kind));
 }
 
+bool BytecodeEmitter::emitBuiltinObject(BuiltinObjectKind kind) {
+  return emit2(JSOp::BuiltinObject, uint8_t(kind));
+}
+
 /* Updates line number notes, not column notes. */
 bool BytecodeEmitter::updateLineNumberNotes(uint32_t offset) {
   if (skipLocationSrcNotes()) {
@@ -526,6 +561,11 @@ bool BytecodeEmitter::updateLineNumberNotes(uint32_t offset) {
     unsigned line = er->lineAt(offset);
     unsigned delta = line - bytecodeSection().currentLine();
 
+    // If we use a `SetLine` note below, we want it to be relative to the
+    // scripts initial line number for better chance of sharing.
+    unsigned initialLine = sc->extent().lineno;
+    MOZ_ASSERT(line >= initialLine);
+
     /*
      * Encode any change in the current source line number by using
      * either several SrcNoteType::NewLine notes or just one
@@ -538,9 +578,9 @@ bool BytecodeEmitter::updateLineNumberNotes(uint32_t offset) {
      * SrcNoteType::SetLine.
      */
     bytecodeSection().setCurrentLine(line, offset);
-    if (delta >= SrcNote::SetLine::lengthFor(line)) {
+    if (delta >= SrcNote::SetLine::lengthFor(line, initialLine)) {
       if (!newSrcNote2(SrcNoteType::SetLine,
-                       SrcNote::SetLine::toOperand(line))) {
+                       SrcNote::SetLine::toOperand(line, initialLine))) {
         return false;
       }
     } else {
@@ -567,17 +607,16 @@ bool BytecodeEmitter::updateSourceCoordNotes(uint32_t offset) {
   }
 
   uint32_t columnIndex = parser->errorReporter().columnAt(offset);
+  MOZ_ASSERT(columnIndex <= ColumnLimit);
+
+  // Assert colspan is always representable.
+  static_assert((0 - ptrdiff_t(ColumnLimit)) >= SrcNote::ColSpan::MinColSpan);
+  static_assert((ptrdiff_t(ColumnLimit) - 0) <= SrcNote::ColSpan::MaxColSpan);
+
   ptrdiff_t colspan =
       ptrdiff_t(columnIndex) - ptrdiff_t(bytecodeSection().lastColumn());
+
   if (colspan != 0) {
-    // If the column span is so large that we can't store it, then just
-    // discard this information. This can happen with minimized or otherwise
-    // machine-generated code. Even gigantic column numbers are still
-    // valuable if you have a source map to relate them to something real;
-    // but it's better to fail soft here.
-    if (!SrcNote::ColSpan::isRepresentable(colspan)) {
-      return true;
-    }
     if (!newSrcNote2(SrcNoteType::ColSpan,
                      SrcNote::ColSpan::toOperand(colspan))) {
       return false;
@@ -588,11 +627,7 @@ bool BytecodeEmitter::updateSourceCoordNotes(uint32_t offset) {
   return true;
 }
 
-Maybe<uint32_t> BytecodeEmitter::getOffsetForLoop(ParseNode* nextpn) {
-  if (!nextpn) {
-    return Nothing();
-  }
-
+uint32_t BytecodeEmitter::getOffsetForLoop(ParseNode* nextpn) {
   // Try to give the JSOp::LoopHead the same line number as the next
   // instruction. nextpn is often a block, in which case the next instruction
   // typically comes from the first statement inside.
@@ -605,7 +640,7 @@ Maybe<uint32_t> BytecodeEmitter::getOffsetForLoop(ParseNode* nextpn) {
     }
   }
 
-  return Some(nextpn->pn_pos.begin);
+  return nextpn->pn_pos.begin;
 }
 
 bool BytecodeEmitter::emitUint16Operand(JSOp op, uint32_t operand) {
@@ -625,245 +660,25 @@ bool BytecodeEmitter::emitUint32Operand(JSOp op, uint32_t operand) {
   return true;
 }
 
-namespace {
-
-class NonLocalExitControl {
- public:
-  enum Kind {
-    // IteratorClose is handled especially inside the exception unwinder.
-    Throw,
-
-    // A 'continue' statement does not call IteratorClose for the loop it
-    // is continuing, i.e. excluding the target loop.
-    Continue,
-
-    // A 'break' or 'return' statement does call IteratorClose for the
-    // loop it is breaking out of or returning from, i.e. including the
-    // target loop.
-    Break,
-    Return
-  };
-
- private:
-  BytecodeEmitter* bce_;
-  const uint32_t savedScopeNoteIndex_;
-  const int savedDepth_;
-  uint32_t openScopeNoteIndex_;
-  Kind kind_;
-
-  NonLocalExitControl(const NonLocalExitControl&) = delete;
-
-  MOZ_MUST_USE bool leaveScope(EmitterScope* scope);
-
- public:
-  NonLocalExitControl(BytecodeEmitter* bce, Kind kind)
-      : bce_(bce),
-        savedScopeNoteIndex_(bce->bytecodeSection().scopeNoteList().length()),
-        savedDepth_(bce->bytecodeSection().stackDepth()),
-        openScopeNoteIndex_(bce->innermostEmitterScope()->noteIndex()),
-        kind_(kind) {}
-
-  ~NonLocalExitControl() {
-    for (uint32_t n = savedScopeNoteIndex_;
-         n < bce_->bytecodeSection().scopeNoteList().length(); n++) {
-      bce_->bytecodeSection().scopeNoteList().recordEnd(
-          n, bce_->bytecodeSection().offset());
-    }
-    bce_->bytecodeSection().setStackDepth(savedDepth_);
-  }
-
-  MOZ_MUST_USE bool prepareForNonLocalJump(NestableControl* target);
-
-  MOZ_MUST_USE bool prepareForNonLocalJumpToOutermost() {
-    return prepareForNonLocalJump(nullptr);
-  }
-};
-
-bool NonLocalExitControl::leaveScope(EmitterScope* es) {
-  if (!es->leave(bce_, /* nonLocal = */ true)) {
-    return false;
-  }
-
-  // As we pop each scope due to the non-local jump, emit notes that
-  // record the extent of the enclosing scope. These notes will have
-  // their ends recorded in ~NonLocalExitControl().
-  uint32_t enclosingScopeIndex = ScopeNote::NoScopeIndex;
-  if (es->enclosingInFrame()) {
-    enclosingScopeIndex = es->enclosingInFrame()->index();
-  }
-  if (!bce_->bytecodeSection().scopeNoteList().append(
-          enclosingScopeIndex, bce_->bytecodeSection().offset(),
-          openScopeNoteIndex_)) {
-    return false;
-  }
-  openScopeNoteIndex_ = bce_->bytecodeSection().scopeNoteList().length() - 1;
-
-  return true;
-}
-
-/*
- * Emit additional bytecode(s) for non-local jumps.
- */
-bool NonLocalExitControl::prepareForNonLocalJump(NestableControl* target) {
-  EmitterScope* es = bce_->innermostEmitterScope();
-  int npops = 0;
-
-  AutoCheckUnstableEmitterScope cues(bce_);
-
-  // For 'continue', 'break', and 'return' statements, emit IteratorClose
-  // bytecode inline. 'continue' statements do not call IteratorClose for
-  // the loop they are continuing.
-  bool emitIteratorClose =
-      kind_ == Continue || kind_ == Break || kind_ == Return;
-  bool emitIteratorCloseAtTarget = emitIteratorClose && kind_ != Continue;
-
-  auto flushPops = [&npops](BytecodeEmitter* bce) {
-    if (npops && !bce->emitPopN(npops)) {
-      return false;
-    }
-    npops = 0;
-    return true;
-  };
-
-  // If we are closing multiple for-of loops, the resulting FOR_OF_ITERCLOSE
-  // trynotes must be appropriately nested. Each FOR_OF_ITERCLOSE starts when
-  // we close the corresponding for-of iterator, and continues until the
-  // actual jump.
-  Vector<BytecodeOffset, 4> forOfIterCloseScopeStarts(bce_->cx);
-
-  // Walk the nestable control stack and patch jumps.
-  for (NestableControl* control = bce_->innermostNestableControl;
-       control != target; control = control->enclosing()) {
-    // Walk the scope stack and leave the scopes we entered. Leaving a scope
-    // may emit administrative ops like JSOp::PopLexicalEnv but never anything
-    // that manipulates the stack.
-    for (; es != control->emitterScope(); es = es->enclosingInFrame()) {
-      if (!leaveScope(es)) {
-        return false;
-      }
-    }
-
-    switch (control->kind()) {
-      case StatementKind::Finally: {
-        TryFinallyControl& finallyControl = control->as<TryFinallyControl>();
-        if (finallyControl.emittingSubroutine()) {
-          /*
-           * There's a [exception or hole, retsub pc-index] pair and the
-           * possible return value on the stack that we need to pop.
-           */
-          npops += 3;
-        } else {
-          if (!flushPops(bce_)) {
-            return false;
-          }
-          if (!bce_->emitGoSub(&finallyControl.gosubs)) {
-            //      [stack] ...
-            return false;
-          }
-        }
-        break;
-      }
-
-      case StatementKind::ForOfLoop:
-        if (emitIteratorClose) {
-          if (!flushPops(bce_)) {
-            return false;
-          }
-          BytecodeOffset tryNoteStart;
-          ForOfLoopControl& loopinfo = control->as<ForOfLoopControl>();
-          if (!loopinfo.emitPrepareForNonLocalJumpFromScope(
-                  bce_, *es,
-                  /* isTarget = */ false, &tryNoteStart)) {
-            //      [stack] ...
-            return false;
-          }
-          if (!forOfIterCloseScopeStarts.append(tryNoteStart)) {
-            return false;
-          }
-        } else {
-          // The iterator next method, the iterator, and the current
-          // value are on the stack.
-          npops += 3;
-        }
-        break;
-
-      case StatementKind::ForInLoop:
-        if (!flushPops(bce_)) {
-          return false;
-        }
-
-        // The iterator and the current value are on the stack.
-        if (!bce_->emit1(JSOp::EndIter)) {
-          //        [stack] ...
-          return false;
-        }
-        break;
-
-      default:
-        break;
-    }
-  }
-
-  if (!flushPops(bce_)) {
-    return false;
-  }
-
-  if (target && emitIteratorCloseAtTarget && target->is<ForOfLoopControl>()) {
-    BytecodeOffset tryNoteStart;
-    ForOfLoopControl& loopinfo = target->as<ForOfLoopControl>();
-    if (!loopinfo.emitPrepareForNonLocalJumpFromScope(bce_, *es,
-                                                      /* isTarget = */ true,
-                                                      &tryNoteStart)) {
-      //            [stack] ... UNDEF UNDEF UNDEF
-      return false;
-    }
-    if (!forOfIterCloseScopeStarts.append(tryNoteStart)) {
-      return false;
-    }
-  }
-
-  EmitterScope* targetEmitterScope =
-      target ? target->emitterScope() : bce_->varEmitterScope;
-  for (; es != targetEmitterScope; es = es->enclosingInFrame()) {
-    if (!leaveScope(es)) {
-      return false;
-    }
-  }
-
-  // Close FOR_OF_ITERCLOSE trynotes.
-  BytecodeOffset end = bce_->bytecodeSection().offset();
-  for (BytecodeOffset start : forOfIterCloseScopeStarts) {
-    if (!bce_->addTryNote(TryNoteKind::ForOfIterClose, 0, start, end)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-}  // anonymous namespace
-
-bool BytecodeEmitter::emitGoto(NestableControl* target, JumpList* jumplist,
-                               GotoKind kind) {
+bool BytecodeEmitter::emitGoto(NestableControl* target, GotoKind kind) {
   NonLocalExitControl nle(this, kind == GotoKind::Continue
-                                    ? NonLocalExitControl::Continue
-                                    : NonLocalExitControl::Break);
-
-  if (!nle.prepareForNonLocalJump(target)) {
-    return false;
-  }
-
-  return emitJump(JSOp::Goto, jumplist);
+                                    ? NonLocalExitKind::Continue
+                                    : NonLocalExitKind::Break);
+  return nle.emitNonLocalJump(target);
 }
 
 AbstractScopePtr BytecodeEmitter::innermostScope() const {
   return innermostEmitterScope()->scope(this);
 }
 
-bool BytecodeEmitter::emitIndexOp(JSOp op, uint32_t index) {
+ScopeIndex BytecodeEmitter::innermostScopeIndex() const {
+  return *innermostEmitterScope()->scopeIndex(this);
+}
+
+bool BytecodeEmitter::emitGCIndexOp(JSOp op, GCThingIndex index) {
   MOZ_ASSERT(checkStrictOrSloppy(op));
 
-  constexpr size_t OpLength = 1 + UINT32_INDEX_LEN;
+  constexpr size_t OpLength = 1 + GCTHING_INDEX_LEN;
   MOZ_ASSERT(GetOpLength(op) == OpLength);
 
   BytecodeOffset offset;
@@ -873,13 +688,12 @@ bool BytecodeEmitter::emitIndexOp(JSOp op, uint32_t index) {
 
   jsbytecode* code = bytecodeSection().code(offset);
   code[0] = jsbytecode(op);
-  SET_UINT32_INDEX(code, index);
+  SET_GCTHING_INDEX(code, index);
   bytecodeSection().updateDepth(offset);
   return true;
 }
 
-bool BytecodeEmitter::emitAtomOp(JSOp op, JSAtom* atom,
-                                 ShouldInstrument shouldInstrument) {
+bool BytecodeEmitter::emitAtomOp(JSOp op, TaggedParserAtomIndex atom) {
   MOZ_ASSERT(atom);
 
   // .generator lookups should be emitted as JSOp::GetAliasedVar instead of
@@ -887,53 +701,60 @@ bool BytecodeEmitter::emitAtomOp(JSOp op, JSAtom* atom,
   // It's safe to emit .this lookups though because |with| objects skip
   // those.
   MOZ_ASSERT_IF(op == JSOp::GetName || op == JSOp::GetGName,
-                atom != cx->names().dotGenerator);
+                atom != TaggedParserAtomIndex::WellKnown::dotGenerator());
 
-  if (op == JSOp::GetProp && atom == cx->names().length) {
-    /* Specialize length accesses for the interpreter. */
-    op = JSOp::Length;
-  }
-
-  uint32_t index;
-  if (!makeAtomIndex(atom, &index)) {
+  GCThingIndex index;
+  if (!makeAtomIndex(atom, ParserAtom::Atomize::Yes, &index)) {
     return false;
   }
 
-  return emitAtomOp(op, index, shouldInstrument);
+  return emitAtomOp(op, index);
 }
 
-bool BytecodeEmitter::emitAtomOp(JSOp op, uint32_t atomIndex,
-                                 ShouldInstrument shouldInstrument) {
+bool BytecodeEmitter::emitAtomOp(JSOp op, GCThingIndex atomIndex) {
   MOZ_ASSERT(JOF_OPTYPE(op) == JOF_ATOM);
+#ifdef DEBUG
+  auto atom = perScriptData().gcThingList().getAtom(atomIndex);
+  MOZ_ASSERT(compilationState.parserAtoms.isInstantiatedAsJSAtom(atom));
+#endif
+  return emitGCIndexOp(op, atomIndex);
+}
 
-  if (shouldInstrument != ShouldInstrument::No &&
-      !emitInstrumentationForOpcode(op, atomIndex)) {
+bool BytecodeEmitter::emitStringOp(JSOp op, TaggedParserAtomIndex atom) {
+  MOZ_ASSERT(atom);
+  GCThingIndex index;
+  if (!makeAtomIndex(atom, ParserAtom::Atomize::No, &index)) {
     return false;
   }
 
-  return emitIndexOp(op, atomIndex);
+  return emitStringOp(op, index);
 }
 
-bool BytecodeEmitter::emitInternedScopeOp(uint32_t index, JSOp op) {
+bool BytecodeEmitter::emitStringOp(JSOp op, GCThingIndex atomIndex) {
+  MOZ_ASSERT(JOF_OPTYPE(op) == JOF_STRING);
+  return emitGCIndexOp(op, atomIndex);
+}
+
+bool BytecodeEmitter::emitInternedScopeOp(GCThingIndex index, JSOp op) {
   MOZ_ASSERT(JOF_OPTYPE(op) == JOF_SCOPE);
   MOZ_ASSERT(index < perScriptData().gcThingList().length());
-  return emitIndexOp(op, index);
+  return emitGCIndexOp(op, index);
 }
 
-bool BytecodeEmitter::emitInternedObjectOp(uint32_t index, JSOp op) {
+bool BytecodeEmitter::emitInternedObjectOp(GCThingIndex index, JSOp op) {
   MOZ_ASSERT(JOF_OPTYPE(op) == JOF_OBJECT);
   MOZ_ASSERT(index < perScriptData().gcThingList().length());
-  return emitIndexOp(op, index);
+  return emitGCIndexOp(op, index);
 }
 
-bool BytecodeEmitter::emitObjectPairOp(uint32_t index1, uint32_t index2,
+bool BytecodeEmitter::emitObjectPairOp(GCThingIndex index1, GCThingIndex index2,
                                        JSOp op) {
   MOZ_ASSERT(index1 + 1 == index2, "object pair indices must be adjacent");
   return emitInternedObjectOp(index1, op);
 }
 
-bool BytecodeEmitter::emitRegExp(uint32_t index) {
-  return emitIndexOp(JSOp::RegExp, index);
+bool BytecodeEmitter::emitRegExp(GCThingIndex index) {
+  return emitGCIndexOp(JSOp::RegExp, index);
 }
 
 bool BytecodeEmitter::emitLocalOp(JSOp op, uint32_t slot) {
@@ -961,7 +782,8 @@ bool BytecodeEmitter::emitArgOp(JSOp op, uint16_t slot) {
 }
 
 bool BytecodeEmitter::emitEnvCoordOp(JSOp op, EnvironmentCoordinate ec) {
-  MOZ_ASSERT(JOF_OPTYPE(op) == JOF_ENVCOORD);
+  MOZ_ASSERT(JOF_OPTYPE(op) == JOF_ENVCOORD ||
+             JOF_OPTYPE(op) == JOF_DEBUGCOORD);
 
   constexpr size_t N = ENVCOORD_HOPS_LEN + ENVCOORD_SLOT_LEN;
   MOZ_ASSERT(GetOpLength(op) == 1 + N);
@@ -997,7 +819,8 @@ JSOp BytecodeEmitter::strictifySetNameOp(JSOp op) {
 }
 
 bool BytecodeEmitter::checkSideEffects(ParseNode* pn, bool* answer) {
-  if (!CheckRecursionLimit(cx)) {
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.check(cx)) {
     return false;
   }
 
@@ -1047,8 +870,14 @@ restart:
       *answer = sc->needsThisTDZChecks();
       return true;
 
+    // |new.target| doesn't have any side-effects.
+    case ParseNodeKind::NewTargetExpr: {
+      MOZ_ASSERT(pn->is<NewTargetNode>());
+      *answer = false;
+      return true;
+    }
+
     // Trivial binary nodes with more token pos holders.
-    case ParseNodeKind::NewTargetExpr:
     case ParseNodeKind::ImportMetaExpr: {
       MOZ_ASSERT(pn->as<BinaryNode>().left()->isKind(ParseNodeKind::PosHolder));
       MOZ_ASSERT(
@@ -1223,6 +1052,12 @@ restart:
       }
       return true;
 
+#ifdef ENABLE_RECORD_TUPLE
+    case ParseNodeKind::RecordExpr:
+    case ParseNodeKind::TupleExpr:
+      MOZ_CRASH("Record and Tuple are not supported yet");
+#endif
+
     // Most other binary operations (parsed as lists in SpiderMonkey) may
     // perform conversions triggering side effects.  Math operations perform
     // ToNumber and may fail invoking invalid user-defined toString/valueOf:
@@ -1240,6 +1075,7 @@ restart:
     case ParseNodeKind::GeExpr:
     case ParseNodeKind::InstanceOfExpr:
     case ParseNodeKind::InExpr:
+    case ParseNodeKind::PrivateInExpr:
     case ParseNodeKind::LshExpr:
     case ParseNodeKind::RshExpr:
     case ParseNodeKind::UrshExpr:
@@ -1266,9 +1102,16 @@ restart:
     }
 
     // More getters.
-    case ParseNodeKind::OptionalElemExpr:
     case ParseNodeKind::ElemExpr:
+    case ParseNodeKind::OptionalElemExpr:
       MOZ_ASSERT(pn->is<BinaryNode>());
+      *answer = true;
+      return true;
+
+    // Throws if the operand is not of the right class. Can also call a private
+    // getter.
+    case ParseNodeKind::PrivateMemberExpr:
+    case ParseNodeKind::OptionalPrivateMemberExpr:
       *answer = true;
       return true;
 
@@ -1287,6 +1130,7 @@ restart:
       return true;
 
     case ParseNodeKind::CallImportExpr:
+    case ParseNodeKind::CallImportSpec:
       MOZ_ASSERT(pn->is<BinaryNode>());
       *answer = true;
       return true;
@@ -1352,11 +1196,6 @@ restart:
 
     case ParseNodeKind::OptionalChain:
       MOZ_ASSERT(pn->is<UnaryNode>());
-      *answer = true;
-      return true;
-
-    case ParseNodeKind::PipelineExpr:
-      MOZ_ASSERT(pn->as<ListNode>().count() >= 2);
       *answer = true;
       return true;
 
@@ -1483,15 +1322,23 @@ restart:
     case ParseNodeKind::ForIn:                // by ParseNodeKind::For
     case ParseNodeKind::ForOf:                // by ParseNodeKind::For
     case ParseNodeKind::ForHead:              // by ParseNodeKind::For
+    case ParseNodeKind::DefaultConstructor:   // by ParseNodeKind::ClassDecl
+    case ParseNodeKind::ClassBodyScope:       // by ParseNodeKind::ClassDecl
     case ParseNodeKind::ClassMethod:          // by ParseNodeKind::ClassDecl
     case ParseNodeKind::ClassField:           // by ParseNodeKind::ClassDecl
     case ParseNodeKind::ClassNames:           // by ParseNodeKind::ClassDecl
+    case ParseNodeKind::StaticClassBlock:     // by ParseNodeKind::ClassDecl
     case ParseNodeKind::ClassMemberList:      // by ParseNodeKind::ClassDecl
     case ParseNodeKind::ImportSpecList:       // by ParseNodeKind::Import
     case ParseNodeKind::ImportSpec:           // by ParseNodeKind::Import
+    case ParseNodeKind::ImportNamespaceSpec:  // by ParseNodeKind::Import
+    case ParseNodeKind::ImportAssertion:      // by ParseNodeKind::Import
+    case ParseNodeKind::ImportAssertionList:  // by ParseNodeKind::Import
+    case ParseNodeKind::ImportModuleRequest:  // by ParseNodeKind::Import
     case ParseNodeKind::ExportBatchSpecStmt:  // by ParseNodeKind::Export
     case ParseNodeKind::ExportSpecList:       // by ParseNodeKind::Export
     case ParseNodeKind::ExportSpec:           // by ParseNodeKind::Export
+    case ParseNodeKind::ExportNamespaceSpec:  // by ParseNodeKind::Export
     case ParseNodeKind::CallSiteObj:       // by ParseNodeKind::TaggedTemplate
     case ParseNodeKind::PosHolder:         // by ParseNodeKind::NewTarget
     case ParseNodeKind::SuperBase:         // by ParseNodeKind::Elem and others
@@ -1512,12 +1359,9 @@ bool BytecodeEmitter::isInLoop() {
   return findInnermostNestableControl<LoopControl>();
 }
 
-bool BytecodeEmitter::checkRunOnceContext() {
-  return sc->treatAsRunOnce() && !isInLoop();
-}
-
 bool BytecodeEmitter::checkSingletonContext() {
-  return sc->isTopLevelContext() && checkRunOnceContext();
+  MOZ_ASSERT_IF(sc->treatAsRunOnce(), sc->isTopLevelContext());
+  return sc->treatAsRunOnce() && !isInLoop();
 }
 
 bool BytecodeEmitter::needsImplicitThis() {
@@ -1537,6 +1381,34 @@ bool BytecodeEmitter::needsImplicitThis() {
   return false;
 }
 
+size_t BytecodeEmitter::countThisEnvironmentHops() {
+  unsigned numHops = 0;
+
+  for (BytecodeEmitter* current = this; current; current = current->parent) {
+    for (EmitterScope* es = current->innermostEmitterScope(); es;
+         es = es->enclosingInFrame()) {
+      if (es->scope(current).is<FunctionScope>()) {
+        if (!es->scope(current).isArrow()) {
+          // The Parser is responsible for marking the environment as either
+          // closed-over or used-by-eval which ensure that is must exist.
+          MOZ_ASSERT(es->scope(current).hasEnvironment());
+          return numHops;
+        }
+      }
+      if (es->scope(current).hasEnvironment()) {
+        numHops++;
+      }
+    }
+  }
+
+  // The "this" environment exists outside of the compilation, but the
+  // `ScopeContext` recorded the number of additional hops needed, so add
+  // those in now.
+  MOZ_ASSERT(sc->allowSuperProperty());
+  numHops += compilationState.scopeContext.enclosingThisEnvironmentHops;
+  return numHops;
+}
+
 bool BytecodeEmitter::emitThisEnvironmentCallee() {
   // Get the innermost enclosing function that has a |this| binding.
 
@@ -1546,29 +1418,13 @@ bool BytecodeEmitter::emitThisEnvironmentCallee() {
   }
 
   // We have to load the callee from the environment chain.
-  unsigned numHops = 0;
-  for (AbstractScopePtrIter si(innermostScope()); si; si++) {
-    if (si.hasSyntacticEnvironment() &&
-        si.abstractScopePtr().is<FunctionScope>()) {
-      if (!si.abstractScopePtr().isArrow()) {
-        break;
-      }
-    }
-    if (si.abstractScopePtr().hasEnvironment()) {
-      numHops++;
-    }
-  }
+  size_t numHops = countThisEnvironmentHops();
 
   static_assert(
       ENVCOORD_HOPS_LIMIT - 1 <= UINT8_MAX,
       "JSOp::EnvCallee operand size should match ENVCOORD_HOPS_LIMIT");
 
-  // Note: we need to check numHops here because we don't call
-  // checkEnvironmentChainLength in all cases (like 'eval').
-  if (numHops >= ENVCOORD_HOPS_LIMIT - 1) {
-    reportError(nullptr, JSMSG_TOO_DEEP, js_function_str);
-    return false;
-  }
+  MOZ_ASSERT(numHops < ENVCOORD_HOPS_LIMIT - 1);
 
   return emit2(JSOp::EnvCallee, numHops);
 }
@@ -1581,15 +1437,50 @@ bool BytecodeEmitter::emitSuperBase() {
   return emit1(JSOp::SuperBase);
 }
 
-void BytecodeEmitter::reportNeedMoreArgsError(ParseNode* pn,
-                                              const char* errorName,
-                                              const char* requiredArgs,
-                                              const char* pluralizer,
-                                              const ListNode* argsList) {
+bool BytecodeEmitter::ensureAtLeastArgs(CallNode* callNode,
+                                        uint32_t requiredArgs) {
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+  if (argsList->count() < requiredArgs) {
+    reportNeedMoreArgsError(callNode, requiredArgs);
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::ensureArgs(CallNode* callNode, uint32_t requiredArgs) {
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+  if (argsList->count() != requiredArgs) {
+    reportNeedMoreArgsError(callNode, requiredArgs);
+    return false;
+  }
+  return true;
+}
+
+static const char* SelfHostedCallFunctionName(TaggedParserAtomIndex name) {
+  if (name.isWellKnownAtomId()) {
+    auto atomId = name.toWellKnownAtomId();
+    return GetWellKnownAtomInfo(atomId).content;
+  }
+  MOZ_CRASH("Unknown self-hosted call function name");
+}
+
+void BytecodeEmitter::reportNeedMoreArgsError(CallNode* callNode,
+                                              uint32_t requiredArgs) {
+  NameNode* calleeNode = &callNode->left()->as<NameNode>();
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+
+  const char* errorName = SelfHostedCallFunctionName(calleeNode->name());
+
+  char requiredArgsStr[40];
+  SprintfLiteral(requiredArgsStr, "%u", requiredArgs);
+
+  const char* pluralizer = requiredArgs > 1 ? "s" : "";
+
   char actualArgsStr[40];
   SprintfLiteral(actualArgsStr, "%u", argsList->count());
-  reportError(pn, JSMSG_MORE_ARGS_NEEDED, errorName, requiredArgs, pluralizer,
-              actualArgsStr);
+
+  reportError(callNode, JSMSG_MORE_ARGS_NEEDED, errorName, requiredArgsStr,
+              pluralizer, actualArgsStr);
 }
 
 void BytecodeEmitter::reportError(ParseNode* pn, unsigned errorNumber, ...) {
@@ -1604,10 +1495,7 @@ void BytecodeEmitter::reportError(ParseNode* pn, unsigned errorNumber, ...) {
   va_end(args);
 }
 
-void BytecodeEmitter::reportError(const Maybe<uint32_t>& maybeOffset,
-                                  unsigned errorNumber, ...) {
-  uint32_t offset = maybeOffset ? *maybeOffset : *scriptStartOffset;
-
+void BytecodeEmitter::reportError(uint32_t offset, unsigned errorNumber, ...) {
   va_list args;
   va_start(args, errorNumber);
 
@@ -1617,54 +1505,74 @@ void BytecodeEmitter::reportError(const Maybe<uint32_t>& maybeOffset,
   va_end(args);
 }
 
-bool BytecodeEmitter::iteratorResultShape(uint32_t* shape) {
-  // Use |NoValues| to keep the flags consistent with their usage for normal
-  // object literal creation, where |NoValues| is always used in conjunction
-  // with |NewObject|.
-  ObjLiteralFlags flags{ObjLiteralFlag::NoValues};
-
-  ObjLiteralCreationData data(cx);
-  data.writer().beginObject(flags);
-
-  for (auto name : {&JSAtomState::value, &JSAtomState::done}) {
-    HandlePropertyName propName = cx->names().*name;
-
-    uint32_t propNameIndex = 0;
-    if (!data.addAtom(propName, &propNameIndex)) {
-      return false;
-    }
-    data.writer().setPropName(propNameIndex);
-
-    if (!data.writer().propWithUndefinedValue()) {
-      return false;
-    }
+bool BytecodeEmitter::addObjLiteralData(ObjLiteralWriter& writer,
+                                        GCThingIndex* outIndex) {
+  if (!writer.checkForDuplicatedNames(cx)) {
+    return false;
   }
 
-  return perScriptData().gcThingList().append(std::move(data), shape);
+  size_t len = writer.getCode().size();
+  auto* code = compilationState.alloc.newArrayUninitialized<uint8_t>(len);
+  if (!code) {
+    js::ReportOutOfMemory(cx);
+    return false;
+  }
+  memcpy(code, writer.getCode().data(), len);
+
+  ObjLiteralIndex objIndex(compilationState.objLiteralData.length());
+  if (uint32_t(objIndex) >= TaggedScriptThingIndex::IndexLimit) {
+    ReportAllocationOverflow(cx);
+    return false;
+  }
+  if (!compilationState.objLiteralData.emplaceBack(code, len, writer.getKind(),
+                                                   writer.getFlags(),
+                                                   writer.getPropertyCount())) {
+    js::ReportOutOfMemory(cx);
+    return false;
+  }
+
+  return perScriptData().gcThingList().append(objIndex, outIndex);
 }
 
 bool BytecodeEmitter::emitPrepareIteratorResult() {
-  uint32_t shape;
-  if (!iteratorResultShape(&shape)) {
+  constexpr JSOp op = JSOp::NewObject;
+
+  ObjLiteralWriter writer;
+  writer.beginShape(op);
+
+  writer.setPropNameNoDuplicateCheck(parserAtoms(),
+                                     TaggedParserAtomIndex::WellKnown::value());
+  if (!writer.propWithUndefinedValue(cx)) {
     return false;
   }
-  return emitIndexOp(JSOp::NewObject, shape);
+  writer.setPropNameNoDuplicateCheck(parserAtoms(),
+                                     TaggedParserAtomIndex::WellKnown::done());
+  if (!writer.propWithUndefinedValue(cx)) {
+    return false;
+  }
+
+  GCThingIndex shape;
+  if (!addObjLiteralData(writer, &shape)) {
+    return false;
+  }
+
+  return emitGCIndexOp(op, shape);
 }
 
 bool BytecodeEmitter::emitFinishIteratorResult(bool done) {
-  if (!emitAtomOp(JSOp::InitProp, cx->names().value)) {
+  if (!emitAtomOp(JSOp::InitProp, TaggedParserAtomIndex::WellKnown::value())) {
     return false;
   }
   if (!emit1(done ? JSOp::True : JSOp::False)) {
     return false;
   }
-  if (!emitAtomOp(JSOp::InitProp, cx->names().done)) {
+  if (!emitAtomOp(JSOp::InitProp, TaggedParserAtomIndex::WellKnown::done())) {
     return false;
   }
   return true;
 }
 
-bool BytecodeEmitter::emitGetNameAtLocation(Handle<JSAtom*> name,
+bool BytecodeEmitter::emitGetNameAtLocation(TaggedParserAtomIndex name,
                                             const NameLocation& loc) {
   NameOpEmitter noe(this, name, loc, NameOpEmitter::Kind::Get);
   if (!noe.emitGet()) {
@@ -1675,17 +1583,42 @@ bool BytecodeEmitter::emitGetNameAtLocation(Handle<JSAtom*> name,
 }
 
 bool BytecodeEmitter::emitGetName(NameNode* name) {
-  RootedAtom nameAtom(cx, name->name());
-  return emitGetName(nameAtom);
+  MOZ_ASSERT(name->isKind(ParseNodeKind::Name));
+
+  return emitGetName(name->name());
 }
 
-bool BytecodeEmitter::emitTDZCheckIfNeeded(HandleAtom name,
+bool BytecodeEmitter::emitGetPrivateName(NameNode* name) {
+  MOZ_ASSERT(name->isKind(ParseNodeKind::PrivateName));
+  return emitGetPrivateName(name->name());
+}
+
+bool BytecodeEmitter::emitGetPrivateName(TaggedParserAtomIndex nameAtom) {
+  // The parser ensures the private name is present on the environment chain,
+  // but its location can be Dynamic or Global when emitting debugger
+  // eval-in-frame code.
+  NameLocation location = lookupName(nameAtom);
+  MOZ_ASSERT(location.kind() == NameLocation::Kind::FrameSlot ||
+             location.kind() == NameLocation::Kind::EnvironmentCoordinate ||
+             location.kind() == NameLocation::Kind::Dynamic ||
+             location.kind() == NameLocation::Kind::Global);
+
+  return emitGetNameAtLocation(nameAtom, location);
+}
+
+bool BytecodeEmitter::emitTDZCheckIfNeeded(TaggedParserAtomIndex name,
                                            const NameLocation& loc,
                                            ValueIsOnStack isOnStack) {
   // Dynamic accesses have TDZ checks built into their VM code and should
   // never emit explicit TDZ checks.
   MOZ_ASSERT(loc.hasKnownSlot());
-  MOZ_ASSERT(loc.isLexical());
+  MOZ_ASSERT(loc.isLexical() || loc.isPrivateMethod() || loc.isSynthetic());
+
+  // Private names are implemented as lexical bindings, but it's just an
+  // implementation detail. Per spec there's no TDZ check when using them.
+  if (parserAtoms().isPrivateName(name)) {
+    return true;
+  }
 
   Maybe<MaybeCheckTDZ> check =
       innermostTDZCheckCache->needsTDZCheck(this, name);
@@ -1768,8 +1701,7 @@ bool BytecodeEmitter::emitPropLHS(PropertyAccess* prop) {
 
   while (true) {
     // Walk back up the list, emitting annotated name ops.
-    if (!emitAtomOp(JSOp::GetProp, pndot->key().atom(),
-                    ShouldInstrument::Yes)) {
+    if (!emitAtomOp(JSOp::GetProp, pndot->key().atom())) {
       return false;
     }
 
@@ -1793,11 +1725,11 @@ bool BytecodeEmitter::emitPropIncDec(UnaryNode* incDec) {
       this,
       kind == ParseNodeKind::PostIncrementExpr
           ? PropOpEmitter::Kind::PostIncrement
-          : kind == ParseNodeKind::PreIncrementExpr
-                ? PropOpEmitter::Kind::PreIncrement
-                : kind == ParseNodeKind::PostDecrementExpr
-                      ? PropOpEmitter::Kind::PostDecrement
-                      : PropOpEmitter::Kind::PreDecrement,
+      : kind == ParseNodeKind::PreIncrementExpr
+          ? PropOpEmitter::Kind::PreIncrement
+      : kind == ParseNodeKind::PostDecrementExpr
+          ? PropOpEmitter::Kind::PostDecrement
+          : PropOpEmitter::Kind::PreDecrement,
       isSuper ? PropOpEmitter::ObjKind::Super : PropOpEmitter::ObjKind::Other);
   if (!poe.prepareForObj()) {
     return false;
@@ -1827,15 +1759,14 @@ bool BytecodeEmitter::emitNameIncDec(UnaryNode* incDec) {
 
   ParseNodeKind kind = incDec->getKind();
   NameNode* name = &incDec->kid()->as<NameNode>();
-  RootedAtom nameAtom(cx, name->atom());
-  NameOpEmitter noe(this, nameAtom,
+  NameOpEmitter noe(this, name->atom(),
                     kind == ParseNodeKind::PostIncrementExpr
                         ? NameOpEmitter::Kind::PostIncrement
-                        : kind == ParseNodeKind::PreIncrementExpr
-                              ? NameOpEmitter::Kind::PreIncrement
-                              : kind == ParseNodeKind::PostDecrementExpr
-                                    ? NameOpEmitter::Kind::PostDecrement
-                                    : NameOpEmitter::Kind::PreDecrement);
+                    : kind == ParseNodeKind::PreIncrementExpr
+                        ? NameOpEmitter::Kind::PreIncrement
+                    : kind == ParseNodeKind::PostDecrementExpr
+                        ? NameOpEmitter::Kind::PostDecrement
+                        : NameOpEmitter::Kind::PreDecrement);
   if (!noe.emitIncDec()) {
     return false;
   }
@@ -1843,28 +1774,14 @@ bool BytecodeEmitter::emitNameIncDec(UnaryNode* incDec) {
   return true;
 }
 
-bool BytecodeEmitter::emitElemOpBase(JSOp op,
-                                     ShouldInstrument shouldInstrument) {
-  if (shouldInstrument != ShouldInstrument::No &&
-      !emitInstrumentationForOpcode(op, 0)) {
-    return false;
-  }
-
-  if (!emit1(op)) {
-    return false;
-  }
-
-  return true;
-}
-
-bool BytecodeEmitter::emitElemObjAndKey(PropertyByValue* elem, bool isSuper,
-                                        ElemOpEmitter& eoe) {
-  if (isSuper) {
+bool BytecodeEmitter::emitObjAndKey(ParseNode* exprOrSuper, ParseNode* key,
+                                    ElemOpEmitter& eoe) {
+  if (exprOrSuper->isKind(ParseNodeKind::SuperBase)) {
     if (!eoe.prepareForObj()) {
       //            [stack]
       return false;
     }
-    UnaryNode* base = &elem->expression().as<UnaryNode>();
+    UnaryNode* base = &exprOrSuper->as<UnaryNode>();
     if (!emitGetThisForSuperBase(base)) {
       //            [stack] THIS
       return false;
@@ -1873,7 +1790,7 @@ bool BytecodeEmitter::emitElemObjAndKey(PropertyByValue* elem, bool isSuper,
       //            [stack] THIS
       return false;
     }
-    if (!emitTree(&elem->key())) {
+    if (!emitTree(key)) {
       //            [stack] THIS KEY
       return false;
     }
@@ -1885,7 +1802,7 @@ bool BytecodeEmitter::emitElemObjAndKey(PropertyByValue* elem, bool isSuper,
     //              [stack]
     return false;
   }
-  if (!emitTree(&elem->expression())) {
+  if (!emitTree(exprOrSuper)) {
     //              [stack] OBJ
     return false;
   }
@@ -1893,7 +1810,7 @@ bool BytecodeEmitter::emitElemObjAndKey(PropertyByValue* elem, bool isSuper,
     //              [stack] OBJ? OBJ
     return false;
   }
-  if (!emitTree(&elem->key())) {
+  if (!emitTree(key)) {
     //              [stack] OBJ? OBJ KEY
     return false;
   }
@@ -1901,19 +1818,57 @@ bool BytecodeEmitter::emitElemObjAndKey(PropertyByValue* elem, bool isSuper,
   return true;
 }
 
+bool BytecodeEmitter::emitElemOpBase(JSOp op) {
+  if (!emit1(op)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitElemObjAndKey(PropertyByValue* elem, bool isSuper,
+                                        ElemOpEmitter& eoe) {
+  MOZ_ASSERT(isSuper == elem->expression().isKind(ParseNodeKind::SuperBase));
+  return emitObjAndKey(&elem->expression(), &elem->key(), eoe);
+}
+
+static ElemOpEmitter::Kind ConvertIncDecKind(ParseNodeKind kind) {
+  switch (kind) {
+    case ParseNodeKind::PostIncrementExpr:
+      return ElemOpEmitter::Kind::PostIncrement;
+    case ParseNodeKind::PreIncrementExpr:
+      return ElemOpEmitter::Kind::PreIncrement;
+    case ParseNodeKind::PostDecrementExpr:
+      return ElemOpEmitter::Kind::PostDecrement;
+    case ParseNodeKind::PreDecrementExpr:
+      return ElemOpEmitter::Kind::PreDecrement;
+    default:
+      MOZ_CRASH("unexpected inc/dec node kind");
+  }
+}
+
+static PrivateOpEmitter::Kind PrivateConvertIncDecKind(ParseNodeKind kind) {
+  switch (kind) {
+    case ParseNodeKind::PostIncrementExpr:
+      return PrivateOpEmitter::Kind::PostIncrement;
+    case ParseNodeKind::PreIncrementExpr:
+      return PrivateOpEmitter::Kind::PreIncrement;
+    case ParseNodeKind::PostDecrementExpr:
+      return PrivateOpEmitter::Kind::PostDecrement;
+    case ParseNodeKind::PreDecrementExpr:
+      return PrivateOpEmitter::Kind::PreDecrement;
+    default:
+      MOZ_CRASH("unexpected inc/dec node kind");
+  }
+}
+
 bool BytecodeEmitter::emitElemIncDec(UnaryNode* incDec) {
   PropertyByValue* elemExpr = &incDec->kid()->as<PropertyByValue>();
   bool isSuper = elemExpr->isSuper();
+  MOZ_ASSERT(!elemExpr->key().isKind(ParseNodeKind::PrivateName));
   ParseNodeKind kind = incDec->getKind();
   ElemOpEmitter eoe(
-      this,
-      kind == ParseNodeKind::PostIncrementExpr
-          ? ElemOpEmitter::Kind::PostIncrement
-          : kind == ParseNodeKind::PreIncrementExpr
-                ? ElemOpEmitter::Kind::PreIncrement
-                : kind == ParseNodeKind::PostDecrementExpr
-                      ? ElemOpEmitter::Kind::PostDecrement
-                      : ElemOpEmitter::Kind::PreDecrement,
+      this, ConvertIncDecKind(kind),
       isSuper ? ElemOpEmitter::ObjKind::Super : ElemOpEmitter::ObjKind::Other);
   if (!emitElemObjAndKey(elemExpr, isSuper, eoe)) {
     //              [stack] # if Super
@@ -1950,6 +1905,27 @@ bool BytecodeEmitter::emitCallIncDec(UnaryNode* incDec) {
   // The increment/decrement has no side effects, so proceed to throw for
   // invalid assignment target.
   return emit2(JSOp::ThrowMsg, uint8_t(ThrowMsgKind::AssignToCall));
+}
+
+bool BytecodeEmitter::emitPrivateIncDec(UnaryNode* incDec) {
+  PrivateMemberAccess* privateExpr = &incDec->kid()->as<PrivateMemberAccess>();
+  ParseNodeKind kind = incDec->getKind();
+  PrivateOpEmitter xoe(this, PrivateConvertIncDecKind(kind),
+                       privateExpr->privateName().name());
+  if (!emitTree(&privateExpr->expression())) {
+    //              [stack] OBJ
+    return false;
+  }
+  if (!xoe.emitReference()) {
+    //              [stack] OBJ NAME
+    return false;
+  }
+  if (!xoe.emitIncDec()) {
+    //              [stack] RESULT
+    return false;
+  }
+
+  return true;
 }
 
 bool BytecodeEmitter::emitDouble(double d) {
@@ -2014,7 +1990,7 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitSwitch(SwitchStatement* switchStmt) {
   MOZ_ASSERT(cases->isKind(ParseNodeKind::StatementList));
 
   SwitchEmitter se(this);
-  if (!se.emitDiscriminant(Some(switchStmt->discriminant().pn_pos.begin))) {
+  if (!se.emitDiscriminant(switchStmt->discriminant().pn_pos.begin)) {
     return false;
   }
 
@@ -2207,11 +2183,6 @@ bool BytecodeEmitter::allocateResumeIndexRange(
 }
 
 bool BytecodeEmitter::emitYieldOp(JSOp op) {
-  // All yield operations pop or suspend the current frame.
-  if (!emitInstrumentation(InstrumentationKind::Exit)) {
-    return false;
-  }
-
   if (op == JSOp::FinalYieldRval) {
     return emit1(JSOp::FinalYieldRval);
   }
@@ -2235,10 +2206,6 @@ bool BytecodeEmitter::emitYieldOp(JSOp op) {
 
   SET_RESUMEINDEX(bytecodeSection().code(off), resumeIndex);
 
-  if (!emitInstrumentation(InstrumentationKind::Entry)) {
-    return false;
-  }
-
   BytecodeOffset unusedOffset;
   return emitJumpTargetOp(JSOp::AfterYield, &unusedOffset);
 }
@@ -2254,7 +2221,7 @@ bool BytecodeEmitter::emitSetThis(BinaryNode* setThisNode) {
   MOZ_ASSERT(setThisNode->isKind(ParseNodeKind::SetThis));
   MOZ_ASSERT(setThisNode->left()->isKind(ParseNodeKind::Name));
 
-  RootedAtom name(cx, setThisNode->left()->as<NameNode>().name());
+  auto name = setThisNode->left()->as<NameNode>().name();
 
   // The 'this' binding is not lexical, but due to super() semantics this
   // initialization needs to be treated as a lexical one.
@@ -2304,7 +2271,7 @@ bool BytecodeEmitter::emitSetThis(BinaryNode* setThisNode) {
     return false;
   }
 
-  if (!emitInitializeInstanceFields()) {
+  if (!emitInitializeInstanceMembers(true)) {
     return false;
   }
 
@@ -2328,6 +2295,81 @@ bool BytecodeEmitter::defineHoistedTopLevelFunctions(ParseNode* body) {
   return emitHoistedFunctionsInList(&body->as<ListNode>());
 }
 
+// For Global and sloppy-Eval scripts, this performs most of the steps of the
+// spec's [GlobalDeclarationInstantiation] and [EvalDeclarationInstantiation]
+// operations.
+//
+// Note that while strict-Eval is handled in the same part of the spec, it never
+// fails for global-redeclaration checks so those scripts initialize directly in
+// their bytecode.
+bool BytecodeEmitter::emitDeclarationInstantiation(ParseNode* body) {
+  if (sc->isModuleContext()) {
+    // ES Modules have dedicated variable and lexial environments and therefore
+    // do not have to perform redeclaration checks. We initialize their bindings
+    // elsewhere in bytecode.
+    return true;
+  }
+
+  if (sc->isEvalContext() && sc->strict()) {
+    // Strict Eval has a dedicated variables (and lexical) environment and
+    // therefore does not have to perform redeclaration checks. We initialize
+    // their bindings elsewhere in the bytecode.
+    return true;
+  }
+
+  // If we have no variables bindings, then we are done!
+  if (sc->isGlobalContext()) {
+    if (!sc->asGlobalContext()->bindings) {
+      return true;
+    }
+  } else {
+    MOZ_ASSERT(sc->isEvalContext());
+
+    if (!sc->asEvalContext()->bindings) {
+      return true;
+    }
+  }
+
+#if DEBUG
+  // There should be no emitted functions yet.
+  for (const auto& thing : perScriptData().gcThingList().objects()) {
+    MOZ_ASSERT(thing.isEmptyGlobalScope() || thing.isScope());
+  }
+#endif
+
+  // Emit the hoisted functions to gc-things list. There is no bytecode
+  // generated yet to bind them.
+  if (!defineHoistedTopLevelFunctions(body)) {
+    return false;
+  }
+
+  // Save the last GCThingIndex emitted. The hoisted functions are contained in
+  // the gc-things list up until this point. This set of gc-things also contain
+  // initial scopes (of which there must be at least one).
+  MOZ_ASSERT(perScriptData().gcThingList().length() > 0);
+  GCThingIndex lastFun =
+      GCThingIndex(perScriptData().gcThingList().length() - 1);
+
+#if DEBUG
+  for (const auto& thing : perScriptData().gcThingList().objects()) {
+    MOZ_ASSERT(thing.isEmptyGlobalScope() || thing.isScope() ||
+               thing.isFunction());
+  }
+#endif
+
+  // Check for declaration conflicts and initialize the bindings.
+  // NOTE: The self-hosting top-level script should not populate the builtins
+  //       directly on the GlobalObject (and instead uses JSOp::GetIntrinsic for
+  //       lookups).
+  if (emitterMode == BytecodeEmitter::EmitterMode::Normal) {
+    if (!emitGCIndexOp(JSOp::GlobalOrEvalDeclInstantiation, lastFun)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 bool BytecodeEmitter::emitScript(ParseNode* body) {
   AutoFrontendTraceLog traceLog(cx, TraceLogger_BytecodeEmission,
                                 parser->errorReporter(), body);
@@ -2338,6 +2380,7 @@ bool BytecodeEmitter::emitScript(ParseNode* body) {
 
   TDZCheckCache tdzCache(this);
   EmitterScope emitterScope(this);
+  Maybe<AsyncEmitter> topLevelAwait;
   if (sc->isGlobalContext()) {
     if (!emitterScope.enterGlobal(this, sc->asGlobalContext())) {
       return false;
@@ -2351,6 +2394,9 @@ bool BytecodeEmitter::emitScript(ParseNode* body) {
     if (!emitterScope.enterModule(this, sc->asModuleContext())) {
       return false;
     }
+    if (sc->asModuleContext()->isAsync()) {
+      topLevelAwait.emplace(this);
+    }
   }
 
   setFunctionBodyEndPos(body->pn_pos.end);
@@ -2358,10 +2404,14 @@ bool BytecodeEmitter::emitScript(ParseNode* body) {
   bool isSloppyEval = sc->isEvalContext() && !sc->strict();
   if (isSloppyEval && body->is<LexicalScopeNode>() &&
       !body->as<LexicalScopeNode>().isEmptyScope()) {
-    // Sloppy eval scripts may need to emit DEFFUNs in the prologue. If there is
-    // an immediately enclosed lexical scope, we need to enter the lexical
-    // scope in the prologue for the DEFFUNs to pick up the right
-    // environment chain.
+    // Sloppy eval scripts may emit hoisted functions bindings with a
+    // `JSOp::GlobalOrEvalDeclInstantiation` opcode below. If this eval needs a
+    // top-level lexical environment, we must ensure that environment is created
+    // before those functions are created and bound.
+    //
+    // This differs from the global-script case below because the global-lexical
+    // environment exists outside the script itself. In the case of strict eval
+    // scripts, the `emitterScope` above is already sufficient.
     EmitterScope lexicalEmitterScope(this);
     LexicalScopeNode* scope = &body->as<LexicalScopeNode>();
 
@@ -2370,13 +2420,11 @@ bool BytecodeEmitter::emitScript(ParseNode* body) {
       return false;
     }
 
-    if (!defineHoistedTopLevelFunctions(scope->scopeBody())) {
+    if (!emitDeclarationInstantiation(scope->scopeBody())) {
       return false;
     }
 
-    if (!switchToMain()) {
-      return false;
-    }
+    switchToMain();
 
     ParseNode* scopeBody = scope->scopeBody();
     if (!emitLexicalScopeBody(scopeBody, EMIT_LINENOTE)) {
@@ -2391,17 +2439,25 @@ bool BytecodeEmitter::emitScript(ParseNode* body) {
       return false;
     }
   } else {
-    if (sc->isGlobalContext() || isSloppyEval) {
-      if (!defineHoistedTopLevelFunctions(body)) {
+    if (!emitDeclarationInstantiation(body)) {
+      return false;
+    }
+    if (topLevelAwait) {
+      if (!topLevelAwait->prepareForModule()) {
         return false;
       }
     }
 
-    if (!switchToMain()) {
-      return false;
+    switchToMain();
+
+    if (topLevelAwait) {
+      if (!topLevelAwait->prepareForBody()) {
+        return false;
+      }
     }
 
     if (!emitTree(body)) {
+      //            [stack]
       return false;
     }
 
@@ -2409,6 +2465,13 @@ bool BytecodeEmitter::emitScript(ParseNode* body) {
       return false;
     }
   }
+
+  if (topLevelAwait) {
+    if (!topLevelAwait->emitEnd()) {
+      return false;
+    }
+  }
+
   if (!markSimpleBreakpoint()) {
     return false;
   }
@@ -2421,13 +2484,12 @@ bool BytecodeEmitter::emitScript(ParseNode* body) {
     return false;
   }
 
-  if (!NameFunctions(cx, body)) {
+  if (!NameFunctions(cx, parserAtoms(), body)) {
     return false;
   }
 
   // Create a Stencil and convert it into a JSScript.
-  compilationInfo.topLevelExtent = sc->extent;
-  return intoScriptStencil(compilationInfo.topLevel.address());
+  return intoScriptStencil(CompilationStencil::TopLevelIndex);
 }
 
 js::UniquePtr<ImmutableScriptData> BytecodeEmitter::createImmutableScriptData(
@@ -2438,13 +2500,13 @@ js::UniquePtr<ImmutableScriptData> BytecodeEmitter::createImmutableScriptData(
   }
 
   bool isFunction = sc->isFunctionBox();
-  uint16_t funLength = isFunction ? sc->asFunctionBox()->length : 0;
+  uint16_t funLength = isFunction ? sc->asFunctionBox()->length() : 0;
 
   return ImmutableScriptData::new_(
       cx, mainOffset(), maxFixedSlots, nslots, bodyScopeIndex,
-      bytecodeSection().numICEntries(), bytecodeSection().numTypeSets(),
-      isFunction, funLength, bytecodeSection().code(),
-      bytecodeSection().notes(), bytecodeSection().resumeOffsetList().span(),
+      bytecodeSection().numICEntries(), isFunction, funLength,
+      bytecodeSection().code(), bytecodeSection().notes(),
+      bytecodeSection().resumeOffsetList().span(),
       bytecodeSection().scopeNoteList().span(),
       bytecodeSection().tryNoteList().span());
 }
@@ -2460,8 +2522,7 @@ bool BytecodeEmitter::getNslots(uint32_t* nslots) {
   return true;
 }
 
-bool BytecodeEmitter::emitFunctionScript(FunctionNode* funNode,
-                                         TopLevelFunction isTopLevel) {
+bool BytecodeEmitter::emitFunctionScript(FunctionNode* funNode) {
   MOZ_ASSERT(inPrologue());
   ListNode* paramsBody = &funNode->body()->as<ListNode>();
   MOZ_ASSERT(paramsBody->isKind(ParseNodeKind::ParamsBody));
@@ -2500,13 +2561,13 @@ bool BytecodeEmitter::emitFunctionScript(FunctionNode* funNode,
     return false;
   }
 
-  if (isTopLevel == TopLevelFunction::Yes) {
-    if (!NameFunctions(cx, funNode)) {
+  if (funbox->index() == CompilationStencil::TopLevelIndex) {
+    if (!NameFunctions(cx, parserAtoms(), funNode)) {
       return false;
     }
   }
 
-  return fse.intoStencil(isTopLevel);
+  return fse.intoStencil();
 }
 
 bool BytecodeEmitter::emitDestructuringLHSRef(ParseNode* target,
@@ -2571,6 +2632,7 @@ bool BytecodeEmitter::emitDestructuringLHSRef(ParseNode* target,
     case ParseNodeKind::ElemExpr: {
       PropertyByValue* elem = &target->as<PropertyByValue>();
       bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
       ElemOpEmitter eoe(this, ElemOpEmitter::Kind::SimpleAssignment,
                         isSuper ? ElemOpEmitter::ObjKind::Super
                                 : ElemOpEmitter::ObjKind::Other);
@@ -2594,6 +2656,22 @@ bool BytecodeEmitter::emitDestructuringLHSRef(ParseNode* target,
         //          [stack] OBJ KEY
         return false;
       }
+      break;
+    }
+
+    case ParseNodeKind::PrivateMemberExpr: {
+      PrivateMemberAccess* privateExpr = &target->as<PrivateMemberAccess>();
+      PrivateOpEmitter xoe(this, PrivateOpEmitter::Kind::SimpleAssignment,
+                           privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        //          [stack] OBJ
+        return false;
+      }
+      if (!xoe.emitReference()) {
+        //          [stack] OBJ NAME
+        return false;
+      }
+      *emitted = xoe.numReferenceSlots();
       break;
     }
 
@@ -2624,125 +2702,140 @@ bool BytecodeEmitter::emitSetOrInitializeDestructuring(
   } else if (target->isKind(ParseNodeKind::AssignExpr)) {
     target = target->as<AssignmentNode>().left();
   }
-  if (target->isKind(ParseNodeKind::ArrayExpr) ||
-      target->isKind(ParseNodeKind::ObjectExpr)) {
-    if (!emitDestructuringOps(&target->as<ListNode>(), flav)) {
-      return false;
-    }
-    // Per its post-condition, emitDestructuringOps has left the
-    // to-be-destructured value on top of the stack.
-    if (!emit1(JSOp::Pop)) {
-      return false;
-    }
-  } else {
-    switch (target->getKind()) {
-      case ParseNodeKind::Name: {
-        RootedAtom name(cx, target->as<NameNode>().name());
-        NameLocation loc = lookupName(name);
-        NameOpEmitter::Kind kind;
-        switch (flav) {
-          case DestructuringFlavor::Declaration:
-            kind = NameOpEmitter::Kind::Initialize;
-            break;
 
-          case DestructuringFlavor::Assignment:
-            kind = NameOpEmitter::Kind::SimpleAssignment;
-            break;
-        }
+  switch (target->getKind()) {
+    case ParseNodeKind::ArrayExpr:
+    case ParseNodeKind::ObjectExpr:
+      if (!emitDestructuringOps(&target->as<ListNode>(), flav)) {
+        return false;
+      }
+      // emitDestructuringOps leaves the assigned (to-be-destructured) value on
+      // top of the stack.
+      break;
 
-        NameOpEmitter noe(this, name, loc, kind);
-        if (!noe.prepareForRhs()) {
-          //        [stack] V ENV?
-          return false;
-        }
-        if (noe.emittedBindOp()) {
-          // This is like ordinary assignment, but with one difference.
-          //
-          // In `a = b`, we first determine a binding for `a` (using
-          // JSOp::BindName or JSOp::BindGName), then we evaluate `b`, then
-          // a JSOp::SetName instruction.
-          //
-          // In `[a] = [b]`, per spec, `b` is evaluated first, then we
-          // determine a binding for `a`. Then we need to do assignment--
-          // but the operands are on the stack in the wrong order for
-          // JSOp::SetProp, so we have to add a JSOp::Swap.
-          //
-          // In the cases where we are emitting a name op, emit a swap
-          // because of this.
-          if (!emit1(JSOp::Swap)) {
-            //      [stack] ENV V
-            return false;
-          }
-        } else {
-          // In cases of emitting a frame slot or environment slot,
-          // nothing needs be done.
-        }
-        if (!noe.emitAssignment()) {
-          //        [stack] V
-          return false;
-        }
+    case ParseNodeKind::Name: {
+      auto name = target->as<NameNode>().name();
+      NameLocation loc = lookupName(name);
+      NameOpEmitter::Kind kind;
+      switch (flav) {
+        case DestructuringFlavor::Declaration:
+          kind = NameOpEmitter::Kind::Initialize;
+          break;
 
-        break;
+        case DestructuringFlavor::Assignment:
+          kind = NameOpEmitter::Kind::SimpleAssignment;
+          break;
       }
 
-      case ParseNodeKind::DotExpr: {
-        // The reference is already pushed by emitDestructuringLHSRef.
-        //          [stack] # if Super
-        //          [stack] THIS SUPERBASE VAL
-        //          [stack] # otherwise
-        //          [stack] OBJ VAL
-        PropertyAccess* prop = &target->as<PropertyAccess>();
-        bool isSuper = prop->isSuper();
-        PropOpEmitter poe(this, PropOpEmitter::Kind::SimpleAssignment,
-                          isSuper ? PropOpEmitter::ObjKind::Super
-                                  : PropOpEmitter::ObjKind::Other);
-        if (!poe.skipObjAndRhs()) {
+      NameOpEmitter noe(this, name, loc, kind);
+      if (!noe.prepareForRhs()) {
+        //          [stack] V ENV?
+        return false;
+      }
+      if (noe.emittedBindOp()) {
+        // This is like ordinary assignment, but with one difference.
+        //
+        // In `a = b`, we first determine a binding for `a` (using
+        // JSOp::BindName or JSOp::BindGName), then we evaluate `b`, then
+        // a JSOp::SetName instruction.
+        //
+        // In `[a] = [b]`, per spec, `b` is evaluated first, then we
+        // determine a binding for `a`. Then we need to do assignment--
+        // but the operands are on the stack in the wrong order for
+        // JSOp::SetProp, so we have to add a JSOp::Swap.
+        //
+        // In the cases where we are emitting a name op, emit a swap
+        // because of this.
+        if (!emit1(JSOp::Swap)) {
+          //        [stack] ENV V
           return false;
         }
-        //          [stack] # VAL
-        if (!poe.emitAssignment(prop->key().atom())) {
-          return false;
-        }
-        break;
+      } else {
+        // In cases of emitting a frame slot or environment slot,
+        // nothing needs be done.
+      }
+      if (!noe.emitAssignment()) {
+        //          [stack] V
+        return false;
       }
 
-      case ParseNodeKind::ElemExpr: {
-        // The reference is already pushed by emitDestructuringLHSRef.
-        //          [stack] # if Super
-        //          [stack] THIS KEY SUPERBASE VAL
-        //          [stack] # otherwise
-        //          [stack] OBJ KEY VAL
-        PropertyByValue* elem = &target->as<PropertyByValue>();
-        bool isSuper = elem->isSuper();
-        ElemOpEmitter eoe(this, ElemOpEmitter::Kind::SimpleAssignment,
-                          isSuper ? ElemOpEmitter::ObjKind::Super
-                                  : ElemOpEmitter::ObjKind::Other);
-        if (!eoe.skipObjAndKeyAndRhs()) {
-          return false;
-        }
-        if (!eoe.emitAssignment()) {
-          //        [stack] VAL
-          return false;
-        }
-        break;
+      break;
+    }
+
+    case ParseNodeKind::DotExpr: {
+      // The reference is already pushed by emitDestructuringLHSRef.
+      //            [stack] # if Super
+      //            [stack] THIS SUPERBASE VAL
+      //            [stack] # otherwise
+      //            [stack] OBJ VAL
+      PropertyAccess* prop = &target->as<PropertyAccess>();
+      bool isSuper = prop->isSuper();
+      PropOpEmitter poe(this, PropOpEmitter::Kind::SimpleAssignment,
+                        isSuper ? PropOpEmitter::ObjKind::Super
+                                : PropOpEmitter::ObjKind::Other);
+      if (!poe.skipObjAndRhs()) {
+        return false;
       }
-
-      case ParseNodeKind::CallExpr:
-        MOZ_ASSERT_UNREACHABLE(
-            "Parser::reportIfNotValidSimpleAssignmentTarget "
-            "rejects function calls as assignment "
-            "targets in destructuring assignments");
-        break;
-
-      default:
-        MOZ_CRASH("emitSetOrInitializeDestructuring: bad lhs kind");
+      //            [stack] # VAL
+      if (!poe.emitAssignment(prop->key().atom())) {
+        return false;
+      }
+      break;
     }
 
-    // Pop the assigned value.
-    if (!emit1(JSOp::Pop)) {
-      //            [stack] # empty
-      return false;
+    case ParseNodeKind::ElemExpr: {
+      // The reference is already pushed by emitDestructuringLHSRef.
+      //            [stack] # if Super
+      //            [stack] THIS KEY SUPERBASE VAL
+      //            [stack] # otherwise
+      //            [stack] OBJ KEY VAL
+      PropertyByValue* elem = &target->as<PropertyByValue>();
+      bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
+      ElemOpEmitter eoe(this, ElemOpEmitter::Kind::SimpleAssignment,
+                        isSuper ? ElemOpEmitter::ObjKind::Super
+                                : ElemOpEmitter::ObjKind::Other);
+      if (!eoe.skipObjAndKeyAndRhs()) {
+        return false;
+      }
+      if (!eoe.emitAssignment()) {
+        //          [stack] VAL
+        return false;
+      }
+      break;
     }
+
+    case ParseNodeKind::PrivateMemberExpr: {
+      // The reference is already pushed by emitDestructuringLHSRef.
+      //            [stack] OBJ NAME VAL
+      PrivateMemberAccess* privateExpr = &target->as<PrivateMemberAccess>();
+      PrivateOpEmitter xoe(this, PrivateOpEmitter::Kind::SimpleAssignment,
+                           privateExpr->privateName().name());
+      if (!xoe.skipReference()) {
+        return false;
+      }
+      if (!xoe.emitAssignment()) {
+        //          [stack] VAL
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::CallExpr:
+      MOZ_ASSERT_UNREACHABLE(
+          "Parser::reportIfNotValidSimpleAssignmentTarget "
+          "rejects function calls as assignment "
+          "targets in destructuring assignments");
+      break;
+
+    default:
+      MOZ_CRASH("emitSetOrInitializeDestructuring: bad lhs kind");
+  }
+
+  // Pop the assigned value.
+  if (!emit1(JSOp::Pop)) {
+    //              [stack] # empty
+    return false;
   }
 
   return true;
@@ -2752,8 +2845,11 @@ bool BytecodeEmitter::emitIteratorNext(
     const Maybe<uint32_t>& callSourceCoordOffset,
     IteratorKind iterKind /* = IteratorKind::Sync */,
     bool allowSelfHosted /* = false */) {
-  MOZ_ASSERT(allowSelfHosted || emitterMode != BytecodeEmitter::SelfHosting,
-             ".next() iteration is prohibited in self-hosted code because it "
+  // TODO: migrate Module code to cpp, to avoid having the extra check here.
+  MOZ_ASSERT(allowSelfHosted || emitterMode != BytecodeEmitter::SelfHosting ||
+                 (sc->isModuleContext() && sc->asModuleContext()->isAsync()),
+             ".next() iteration is prohibited in non-module self-hosted code "
+             "because it"
              "can run user-modifiable iteration code");
 
   //                [stack] ... NEXT ITER
@@ -2775,54 +2871,6 @@ bool BytecodeEmitter::emitIteratorNext(
     //              [stack] ... RESULT
     return false;
   }
-  return true;
-}
-
-bool BytecodeEmitter::emitPushNotUndefinedOrNull() {
-  //                [stack] V
-  MOZ_ASSERT(bytecodeSection().stackDepth() > 0);
-
-  if (!emit1(JSOp::Dup)) {
-    //              [stack] V V
-    return false;
-  }
-  if (!emit1(JSOp::Undefined)) {
-    //              [stack] V V UNDEFINED
-    return false;
-  }
-  if (!emit1(JSOp::StrictNe)) {
-    //              [stack] V NEQ
-    return false;
-  }
-
-  JumpList undefinedOrNullJump;
-  if (!emitJump(JSOp::And, &undefinedOrNullJump)) {
-    //              [stack] V NEQ
-    return false;
-  }
-
-  if (!emit1(JSOp::Pop)) {
-    //              [stack] V
-    return false;
-  }
-  if (!emit1(JSOp::Dup)) {
-    //              [stack] V V
-    return false;
-  }
-  if (!emit1(JSOp::Null)) {
-    //              [stack] V V NULL
-    return false;
-  }
-  if (!emit1(JSOp::StrictNe)) {
-    //              [stack] V NEQ
-    return false;
-  }
-
-  if (!emitJumpTargetAndPatch(undefinedOrNullJump)) {
-    //              [stack] V NOT-UNDEF-OR-NULL
-    return false;
-  }
-
   return true;
 }
 
@@ -2881,7 +2929,7 @@ bool BytecodeEmitter::emitIteratorCloseInScope(
   // Step 4.
   //
   // Get the "return" method.
-  if (!emitAtomOp(JSOp::CallProp, cx->names().return_)) {
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::return_())) {
     //              [stack] ... ITER RET
     return false;
   }
@@ -2890,12 +2938,13 @@ bool BytecodeEmitter::emitIteratorCloseInScope(
   //
   // Do nothing if "return" is undefined or null.
   InternalIfEmitter ifReturnMethodIsDefined(this);
-  if (!emitPushNotUndefinedOrNull()) {
-    //              [stack] ... ITER RET NOT-UNDEF-OR-NULL
+  if (!emit1(JSOp::IsNullOrUndefined)) {
+    //              [stack] ... ITER RET NULL-OR-UNDEF
     return false;
   }
 
-  if (!ifReturnMethodIsDefined.emitThenElse()) {
+  if (!ifReturnMethodIsDefined.emitThenElse(
+          IfEmitter::ConditionKind::Negative)) {
     //              [stack] ... ITER RET
     return false;
   }
@@ -3037,8 +3086,8 @@ bool BytecodeEmitter::emitDefault(ParseNode* defaultExpr, ParseNode* pattern) {
   return true;
 }
 
-bool BytecodeEmitter::emitAnonymousFunctionWithName(ParseNode* node,
-                                                    HandleAtom name) {
+bool BytecodeEmitter::emitAnonymousFunctionWithName(
+    ParseNode* node, TaggedParserAtomIndex name) {
   MOZ_ASSERT(node->isDirectRHSAnonFunction());
 
   if (node->is<FunctionNode>()) {
@@ -3082,7 +3131,8 @@ bool BytecodeEmitter::emitAnonymousFunctionWithComputedName(
   return emitClass(&node->as<ClassNode>(), ClassNameKind::ComputedName);
 }
 
-bool BytecodeEmitter::setFunName(FunctionBox* funbox, JSAtom* name) {
+bool BytecodeEmitter::setFunName(FunctionBox* funbox,
+                                 TaggedParserAtomIndex name) {
   // The inferred name may already be set if this function is an interpreted
   // lazy function and we OOM'ed after we set the inferred name the first
   // time.
@@ -3101,7 +3151,7 @@ bool BytecodeEmitter::emitInitializer(ParseNode* initializer,
                                       ParseNode* pattern) {
   if (initializer->isDirectRHSAnonFunction()) {
     MOZ_ASSERT(!pattern->isInParens());
-    RootedAtom name(cx, pattern->as<NameNode>().name());
+    auto name = pattern->as<NameNode>().name();
     if (!emitAnonymousFunctionWithName(initializer, name)) {
       return false;
     }
@@ -3413,7 +3463,7 @@ bool BytecodeEmitter::emitDestructuringOpsArray(ListNode* pattern,
       //            [stack] ... OBJ NEXT ITER LREF* RESULT RESULT
       return false;
     }
-    if (!emitAtomOp(JSOp::GetProp, cx->names().done)) {
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::done())) {
       //            [stack] ... OBJ NEXT ITER LREF* RESULT DONE
       return false;
     }
@@ -3451,7 +3501,7 @@ bool BytecodeEmitter::emitDestructuringOpsArray(ListNode* pattern,
       return false;
     }
 
-    if (!emitAtomOp(JSOp::GetProp, cx->names().value)) {
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
       //            [stack] ... OBJ NEXT ITER DONE LREF* VALUE
       return false;
     }
@@ -3534,7 +3584,7 @@ bool BytecodeEmitter::emitDestructuringOpsArray(ListNode* pattern,
 
 bool BytecodeEmitter::emitComputedPropertyName(UnaryNode* computedPropName) {
   MOZ_ASSERT(computedPropName->isKind(ParseNodeKind::ComputedName));
-  return emitTree(computedPropName->kid()) && emit1(JSOp::ToId);
+  return emitTree(computedPropName->kid()) && emit1(JSOp::ToPropertyKey);
 }
 
 bool BytecodeEmitter::emitDestructuringOpsObject(ListNode* pattern,
@@ -3641,7 +3691,8 @@ bool BytecodeEmitter::emitDestructuringOpsObject(ListNode* pattern,
     bool needsGetElem = true;
 
     if (member->isKind(ParseNodeKind::MutateProto)) {
-      if (!emitAtomOp(JSOp::GetProp, cx->names().proto)) {
+      if (!emitAtomOp(JSOp::GetProp,
+                      TaggedParserAtomIndex::WellKnown::proto())) {
         //          [stack] ... SET? RHS LREF* PROP
         return false;
       }
@@ -3663,8 +3714,7 @@ bool BytecodeEmitter::emitDestructuringOpsObject(ListNode* pattern,
         }
       } else if (key->isKind(ParseNodeKind::ObjectPropertyName) ||
                  key->isKind(ParseNodeKind::StringExpr)) {
-        if (!emitAtomOp(JSOp::GetProp, key->as<NameNode>().atom(),
-                        ShouldInstrument::Yes)) {
+        if (!emitAtomOp(JSOp::GetProp, key->as<NameNode>().atom())) {
           //        [stack] ... SET? RHS LREF* PROP
           return false;
         }
@@ -3726,7 +3776,7 @@ bool BytecodeEmitter::emitDestructuringOpsObject(ListNode* pattern,
 
 static bool IsDestructuringRestExclusionSetObjLiteralCompatible(
     ListNode* pattern) {
-  int32_t propCount = 0;
+  uint32_t propCount = 0;
   for (ParseNode* member : pattern->contents()) {
     if (member->isKind(ParseNodeKind::Spread)) {
       MOZ_ASSERT(!member->pn_next, "unexpected trailing element after spread");
@@ -3753,7 +3803,7 @@ static bool IsDestructuringRestExclusionSetObjLiteralCompatible(
     return false;
   }
 
-  if (propCount >= PropertyTree::MAX_HEIGHT) {
+  if (propCount > SharedPropMap::MaxPropsForNonDictionary) {
     // JSOp::NewObject cannot accept dictionary-mode objects.
     return false;
   }
@@ -3779,7 +3829,7 @@ bool BytecodeEmitter::emitDestructuringObjRestExclusionSet(ListNode* pattern) {
     }
   }
 
-  RootedAtom pnatom(cx);
+  TaggedParserAtomIndex pnatom;
   for (ParseNode* member : pattern->contents()) {
     if (member->isKind(ParseNodeKind::Spread)) {
       MOZ_ASSERT(!member->pn_next, "unexpected trailing element after spread");
@@ -3788,7 +3838,7 @@ bool BytecodeEmitter::emitDestructuringObjRestExclusionSet(ListNode* pattern) {
 
     bool isIndex = false;
     if (member->isKind(ParseNodeKind::MutateProto)) {
-      pnatom.set(cx->names().proto);
+      pnatom = TaggedParserAtomIndex::WellKnown::proto();
     } else {
       ParseNode* key = member->as<BinaryNode>().left();
       if (key->isKind(ParseNodeKind::NumberExpr)) {
@@ -3803,7 +3853,7 @@ bool BytecodeEmitter::emitDestructuringObjRestExclusionSet(ListNode* pattern) {
         isIndex = true;
       } else if (key->isKind(ParseNodeKind::ObjectPropertyName) ||
                  key->isKind(ParseNodeKind::StringExpr)) {
-        pnatom.set(key->as<NameNode>().atom());
+        pnatom = key->as<NameNode>().atom();
       } else {
         // Otherwise this is a computed property name which needs to
         // be added dynamically.
@@ -3849,7 +3899,8 @@ bool BytecodeEmitter::emitTemplateString(ListNode* templateString) {
     // Skip empty strings. These are very common: a template string like
     // `${a}${b}` has three empty strings and without this optimization
     // we'd emit four JSOp::Add operations instead of just one.
-    if (isString && item->as<NameNode>().atom()->empty()) {
+    if (isString && item->as<NameNode>().atom() ==
+                        TaggedParserAtomIndex::WellKnown::empty()) {
       continue;
     }
 
@@ -3885,7 +3936,8 @@ bool BytecodeEmitter::emitTemplateString(ListNode* templateString) {
   if (!pushedString) {
     // All strings were empty, this can happen for something like `${""}`.
     // Just push an empty string.
-    if (!emitAtomOp(JSOp::String, cx->names().empty)) {
+    if (!emitStringOp(JSOp::String,
+                      TaggedParserAtomIndex::WellKnown::empty())) {
       return false;
     }
   }
@@ -3949,7 +4001,7 @@ bool BytecodeEmitter::emitSingleDeclaration(ListNode* declList, NameNode* decl,
     return true;
   }
 
-  RootedAtom nameAtom(cx, decl->name());
+  auto nameAtom = decl->name();
   NameOpEmitter noe(this, nameAtom, NameOpEmitter::Kind::Initialize);
   if (!noe.prepareForRhs()) {
     //              [stack] ENV?
@@ -3991,8 +4043,8 @@ bool BytecodeEmitter::emitSingleDeclaration(ListNode* declList, NameNode* decl,
   return true;
 }
 
-bool BytecodeEmitter::emitAssignmentRhs(ParseNode* rhs,
-                                        HandleAtom anonFunctionName) {
+bool BytecodeEmitter::emitAssignmentRhs(
+    ParseNode* rhs, TaggedParserAtomIndex anonFunctionName) {
   if (rhs->isDirectRHSAnonFunction()) {
     if (anonFunctionName) {
       return emitAnonymousFunctionWithName(rhs, anonFunctionName);
@@ -4061,14 +4113,16 @@ bool BytecodeEmitter::emitAssignmentOrInit(ParseNodeKind kind, ParseNode* lhs,
   bool isInit = kind == ParseNodeKind::InitExpr;
 
   MOZ_ASSERT_IF(isInit, lhs->isKind(ParseNodeKind::DotExpr) ||
-                            lhs->isKind(ParseNodeKind::ElemExpr));
+                            lhs->isKind(ParseNodeKind::ElemExpr) ||
+                            lhs->isKind(ParseNodeKind::PrivateMemberExpr));
 
   // |name| is used within NameOpEmitter, so its lifetime must surpass |noe|.
-  RootedAtom name(cx);
+  TaggedParserAtomIndex name;
 
   Maybe<NameOpEmitter> noe;
   Maybe<PropOpEmitter> poe;
   Maybe<ElemOpEmitter> eoe;
+  Maybe<PrivateOpEmitter> xoe;
 
   // Deal with non-name assignments.
   uint8_t offset = 1;
@@ -4085,7 +4139,7 @@ bool BytecodeEmitter::emitAssignmentOrInit(ParseNodeKind kind, ParseNode* lhs,
   // implemented via a property or elem assignment (where we are now), and
   // rhs->isDirectRHSAnonFunction() is set - so we'll assign the name of the
   // function.
-  RootedAtom anonFunctionName(cx);
+  TaggedParserAtomIndex anonFunctionName;
 
   switch (lhs->getKind()) {
     case ParseNodeKind::Name: {
@@ -4101,14 +4155,14 @@ bool BytecodeEmitter::emitAssignmentOrInit(ParseNodeKind kind, ParseNode* lhs,
       bool isSuper = prop->isSuper();
       poe.emplace(this,
                   isCompound ? PropOpEmitter::Kind::CompoundAssignment
-                             : isInit ? PropOpEmitter::Kind::PropInit
-                                      : PropOpEmitter::Kind::SimpleAssignment,
+                  : isInit   ? PropOpEmitter::Kind::PropInit
+                             : PropOpEmitter::Kind::SimpleAssignment,
                   isSuper ? PropOpEmitter::ObjKind::Super
                           : PropOpEmitter::ObjKind::Other);
       if (!poe->prepareForObj()) {
         return false;
       }
-      anonFunctionName = &prop->name();
+      anonFunctionName = prop->name();
       if (isSuper) {
         UnaryNode* base = &prop->expression().as<UnaryNode>();
         if (!emitGetThisForSuperBase(base)) {
@@ -4129,10 +4183,11 @@ bool BytecodeEmitter::emitAssignmentOrInit(ParseNodeKind kind, ParseNode* lhs,
     case ParseNodeKind::ElemExpr: {
       PropertyByValue* elem = &lhs->as<PropertyByValue>();
       bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
       eoe.emplace(this,
                   isCompound ? ElemOpEmitter::Kind::CompoundAssignment
-                             : isInit ? ElemOpEmitter::Kind::PropInit
-                                      : ElemOpEmitter::Kind::SimpleAssignment,
+                  : isInit   ? ElemOpEmitter::Kind::PropInit
+                             : ElemOpEmitter::Kind::SimpleAssignment,
                   isSuper ? ElemOpEmitter::ObjKind::Super
                           : ElemOpEmitter::ObjKind::Other);
       if (!emitElemObjAndKey(elem, isSuper, *eoe)) {
@@ -4148,6 +4203,24 @@ bool BytecodeEmitter::emitAssignmentOrInit(ParseNodeKind kind, ParseNode* lhs,
       } else {
         offset += 2;
       }
+      break;
+    }
+    case ParseNodeKind::PrivateMemberExpr: {
+      PrivateMemberAccess* privateExpr = &lhs->as<PrivateMemberAccess>();
+      xoe.emplace(this,
+                  isCompound ? PrivateOpEmitter::Kind::CompoundAssignment
+                  : isInit   ? PrivateOpEmitter::Kind::PropInit
+                             : PrivateOpEmitter::Kind::SimpleAssignment,
+                  privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        //          [stack] OBJ
+        return false;
+      }
+      if (!xoe->emitReference()) {
+        //          [stack] OBJ KEY
+        return false;
+      }
+      offset += xoe->numReferenceSlots();
       break;
     }
     case ParseNodeKind::ArrayExpr:
@@ -4190,6 +4263,13 @@ bool BytecodeEmitter::emitAssignmentOrInit(ParseNodeKind kind, ParseNode* lhs,
       case ParseNodeKind::ElemExpr: {
         if (!eoe->emitGet()) {
           //        [stack] KEY THIS OBJ ELEM
+          return false;
+        }
+        break;
+      }
+      case ParseNodeKind::PrivateMemberExpr: {
+        if (!xoe->emitGet()) {
+          //        [stack] OBJ KEY VALUE
           return false;
         }
         break;
@@ -4240,6 +4320,9 @@ bool BytecodeEmitter::emitAssignmentOrInit(ParseNodeKind kind, ParseNode* lhs,
         //          [stack] OBJ KEY ELEM
         return false;
       }
+      break;
+    case ParseNodeKind::PrivateMemberExpr:
+      // no stack adjustment needed
       break;
     default:
       break;
@@ -4296,6 +4379,12 @@ bool BytecodeEmitter::emitAssignmentOrInit(ParseNodeKind kind, ParseNode* lhs,
       }
       break;
     }
+    case ParseNodeKind::PrivateMemberExpr:
+      if (!xoe->emitAssignment()) {
+        //          [stack] VAL
+        return false;
+      }
+      break;
     case ParseNodeKind::ArrayExpr:
     case ParseNodeKind::ObjectExpr:
       if (!emitDestructuringOps(&lhs->as<ListNode>(),
@@ -4331,12 +4420,13 @@ bool BytecodeEmitter::emitShortCircuitAssignment(AssignmentNode* node) {
   ParseNode* rhs = node->right();
 
   // |name| is used within NameOpEmitter, so its lifetime must surpass |noe|.
-  RootedAtom name(cx);
+  TaggedParserAtomIndex name;
 
   // Select the appropriate emitter based on the left-hand side.
   Maybe<NameOpEmitter> noe;
   Maybe<PropOpEmitter> poe;
   Maybe<ElemOpEmitter> eoe;
+  Maybe<PrivateOpEmitter> xoe;
 
   int32_t depth = bytecodeSection().stackDepth();
 
@@ -4407,7 +4497,7 @@ bool BytecodeEmitter::emitShortCircuitAssignment(AssignmentNode* node) {
     case ParseNodeKind::ElemExpr: {
       PropertyByValue* elem = &lhs->as<PropertyByValue>();
       bool isSuper = elem->isSuper();
-
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
       eoe.emplace(this, ElemOpEmitter::Kind::CompoundAssignment,
                   isSuper ? ElemOpEmitter::ObjKind::Super
                           : ElemOpEmitter::ObjKind::Other);
@@ -4440,6 +4530,26 @@ bool BytecodeEmitter::emitShortCircuitAssignment(AssignmentNode* node) {
       break;
     }
 
+    case ParseNodeKind::PrivateMemberExpr: {
+      PrivateMemberAccess* privateExpr = &lhs->as<PrivateMemberAccess>();
+      xoe.emplace(this, PrivateOpEmitter::Kind::CompoundAssignment,
+                  privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        //          [stack] OBJ
+        return false;
+      }
+      if (!xoe->emitReference()) {
+        //          [stack] OBJ NAME
+        return false;
+      }
+      if (!xoe->emitGet()) {
+        //          [stack] OBJ NAME LHS
+        return false;
+      }
+      numPushed = xoe->numReferenceSlots();
+      break;
+    }
+
     default:
       MOZ_CRASH();
   }
@@ -4460,9 +4570,7 @@ bool BytecodeEmitter::emitShortCircuitAssignment(AssignmentNode* node) {
     return false;
   }
 
-  // TODO: Open spec issue about setting inferred function names.
-  // <https://github.com/tc39/proposal-logical-assignment/issues/23>
-  if (!emitTree(rhs)) {
+  if (!emitAssignmentRhs(rhs, name)) {
     //              [stack] ... RHS
     return false;
   }
@@ -4494,6 +4602,13 @@ bool BytecodeEmitter::emitShortCircuitAssignment(AssignmentNode* node) {
       }
       break;
     }
+
+    case ParseNodeKind::PrivateMemberExpr:
+      if (!xoe->emitAssignment()) {
+        //          [stack] RHS
+        return false;
+      }
+      break;
 
     default:
       MOZ_CRASH();
@@ -4543,9 +4658,9 @@ bool BytecodeEmitter::emitShortCircuitAssignment(AssignmentNode* node) {
   return true;
 }
 
-bool BytecodeEmitter::emitCallSiteObjectArray(ListNode* cookedOrRaw,
-                                              uint32_t* arrayIndex) {
-  uint32_t count = cookedOrRaw->count();
+bool BytecodeEmitter::emitCallSiteObjectArray(JSOp op, ListNode* cookedOrRaw,
+                                              GCThingIndex* outArrayIndex) {
+  DebugOnly<uint32_t> count = cookedOrRaw->count();
   ParseNode* pn = cookedOrRaw->head();
 
   // The first element of a call-site node is the raw-values list. Skip over it.
@@ -4557,39 +4672,41 @@ bool BytecodeEmitter::emitCallSiteObjectArray(ListNode* cookedOrRaw,
     MOZ_ASSERT(cookedOrRaw->isKind(ParseNodeKind::ArrayExpr));
   }
 
-  ObjLiteralCreationData data(cx);
-  ObjLiteralFlags flags(ObjLiteralFlag::Array);
-  data.writer().beginObject(flags);
-  data.writer().beginDenseArrayElements();
+  ObjLiteralWriter writer;
 
-  size_t idx;
+  writer.beginArray(op);
+  writer.beginDenseArrayElements();
+
+  DebugOnly<size_t> idx;
   for (idx = 0; pn; idx++, pn = pn->pn_next) {
     MOZ_ASSERT(pn->isKind(ParseNodeKind::TemplateStringExpr) ||
                pn->isKind(ParseNodeKind::RawUndefinedExpr));
 
-    if (!emitObjLiteralValue(&data, pn)) {
+    if (!emitObjLiteralValue(writer, pn)) {
       return false;
     }
   }
   MOZ_ASSERT(idx == count);
 
-  return perScriptData().gcThingList().append(std::move(data), arrayIndex);
+  return addObjLiteralData(writer, outArrayIndex);
 }
 
 bool BytecodeEmitter::emitCallSiteObject(CallSiteNode* callSiteObj) {
-  uint32_t cookedIndex;
-  if (!emitCallSiteObjectArray(callSiteObj, &cookedIndex)) {
+  constexpr JSOp op = JSOp::CallSiteObj;
+
+  GCThingIndex cookedIndex;
+  if (!emitCallSiteObjectArray(op, callSiteObj, &cookedIndex)) {
     return false;
   }
 
-  uint32_t rawIndex;
-  if (!emitCallSiteObjectArray(callSiteObj->rawNodes(), &rawIndex)) {
+  GCThingIndex rawIndex;
+  if (!emitCallSiteObjectArray(op, callSiteObj->rawNodes(), &rawIndex)) {
     return false;
   }
 
   MOZ_ASSERT(sc->hasCallSiteObj());
 
-  return emitObjectPairOp(cookedIndex, rawIndex, JSOp::CallSiteObj);
+  return emitObjectPairOp(cookedIndex, rawIndex, op);
 }
 
 bool BytecodeEmitter::emitCatch(BinaryNode* catchClause) {
@@ -4671,7 +4788,8 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitTry(TryNode* tryNode) {
     // debugleaveblock
     // [poplexicalenv]              only if any local aliased
     // if there is a finally block:
-    //   gosub <finally>
+    //   goto <finally>
+    //   [jump target for returning from finally]
     //   goto <after finally>
     if (!tryCatch.emitCatch()) {
       return false;
@@ -4701,40 +4819,24 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitTry(TryNode* tryNode) {
   return true;
 }
 
-MOZ_MUST_USE bool BytecodeEmitter::emitGoSub(JumpList* jump) {
-  // Emit the following:
-  //
-  //     False
-  //     ResumeIndex <resumeIndex>
-  //     Gosub <target>
-  //   resumeOffset:
-  //     JumpTarget
-  //
-  // The order is important: the Baseline Interpreter relies on JSOp::JumpTarget
-  // setting the frame's ICEntry when resuming at resumeOffset.
+[[nodiscard]] bool BytecodeEmitter::emitJumpToFinally(JumpList* jump,
+                                                      uint32_t idx) {
+  // Push the continuation index.
+  if (!emitNumberOp(idx)) {
+    return false;
+  }
 
+  // Push |throwing|.
   if (!emit1(JSOp::False)) {
     return false;
   }
 
-  BytecodeOffset off;
-  if (!emitN(JSOp::ResumeIndex, 3, &off)) {
+  // Jump to the finally block.
+  if (!emitJumpNoFallthrough(JSOp::Goto, jump)) {
     return false;
   }
 
-  if (!emitJumpNoFallthrough(JSOp::Gosub, jump)) {
-    return false;
-  }
-
-  uint32_t resumeIndex;
-  if (!allocateResumeIndex(bytecodeSection().offset(), &resumeIndex)) {
-    return false;
-  }
-
-  SET_RESUMEINDEX(bytecodeSection().code(off), resumeIndex);
-
-  JumpTarget target;
-  return emitJumpTarget(&target);
+  return true;
 }
 
 bool BytecodeEmitter::emitIf(TernaryNode* ifNode) {
@@ -4745,22 +4847,31 @@ bool BytecodeEmitter::emitIf(TernaryNode* ifNode) {
   }
 
 if_again:
+  ParseNode* testNode = ifNode->kid1();
+  auto conditionKind = IfEmitter::ConditionKind::Positive;
+  if (testNode->isKind(ParseNodeKind::NotExpr)) {
+    testNode = testNode->as<UnaryNode>().kid();
+    conditionKind = IfEmitter::ConditionKind::Negative;
+  }
+
   if (!markStepBreakpoint()) {
     return false;
   }
 
-  /* Emit code for the condition before pushing stmtInfo. */
-  if (!emitTree(ifNode->kid1())) {
+  // Emit code for the condition before pushing stmtInfo.
+  // NOTE: NotExpr of testNode may be unwrapped, and in that case the negation
+  //       is handled by conditionKind.
+  if (!emitTree(testNode)) {
     return false;
   }
 
   ParseNode* elseNode = ifNode->kid3();
   if (elseNode) {
-    if (!ifThenElse.emitThenElse()) {
+    if (!ifThenElse.emitThenElse(conditionKind)) {
       return false;
     }
   } else {
-    if (!ifThenElse.emitThen()) {
+    if (!ifThenElse.emitThen(conditionKind)) {
       return false;
     }
   }
@@ -4946,7 +5057,8 @@ bool BytecodeEmitter::emitCopyDataProperties(CopyOption option) {
     //              [stack] TARGET SOURCE SET
     argc = 3;
 
-    if (!emitAtomOp(JSOp::GetIntrinsic, cx->names().CopyDataProperties)) {
+    if (!emitAtomOp(JSOp::GetIntrinsic,
+                    TaggedParserAtomIndex::WellKnown::CopyDataProperties())) {
       //            [stack] TARGET SOURCE SET COPYDATAPROPERTIES
       return false;
     }
@@ -4955,8 +5067,9 @@ bool BytecodeEmitter::emitCopyDataProperties(CopyOption option) {
     //              [stack] TARGET SOURCE
     argc = 2;
 
-    if (!emitAtomOp(JSOp::GetIntrinsic,
-                    cx->names().CopyDataPropertiesUnfiltered)) {
+    if (!emitAtomOp(
+            JSOp::GetIntrinsic,
+            TaggedParserAtomIndex::WellKnown::CopyDataPropertiesUnfiltered())) {
       //            [stack] TARGET SOURCE COPYDATAPROPERTIES
       return false;
     }
@@ -4998,11 +5111,11 @@ bool BytecodeEmitter::emitCopyDataProperties(CopyOption option) {
 }
 
 bool BytecodeEmitter::emitBigIntOp(BigIntLiteral* bigint) {
-  uint32_t index;
+  GCThingIndex index;
   if (!perScriptData().gcThingList().append(bigint, &index)) {
     return false;
   }
-  return emitIndexOp(JSOp::BigInt, index);
+  return emitGCIndexOp(JSOp::BigInt, index);
 }
 
 bool BytecodeEmitter::emitIterator() {
@@ -5015,7 +5128,7 @@ bool BytecodeEmitter::emitIterator() {
     //              [stack] OBJ OBJ @@ITERATOR
     return false;
   }
-  if (!emitElemOpBase(JSOp::CallElem)) {
+  if (!emitElemOpBase(JSOp::GetElem)) {
     //              [stack] OBJ ITERFN
     return false;
   }
@@ -5035,7 +5148,7 @@ bool BytecodeEmitter::emitIterator() {
     //              [stack] ITER ITER
     return false;
   }
-  if (!emitAtomOp(JSOp::GetProp, cx->names().next)) {
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::next())) {
     //              [stack] ITER NEXT
     return false;
   }
@@ -5056,18 +5169,14 @@ bool BytecodeEmitter::emitAsyncIterator() {
     //              [stack] OBJ OBJ @@ASYNCITERATOR
     return false;
   }
-  if (!emitElemOpBase(JSOp::CallElem)) {
+  if (!emitElemOpBase(JSOp::GetElem)) {
     //              [stack] OBJ ITERFN
     return false;
   }
 
   InternalIfEmitter ifAsyncIterIsUndefined(this);
-  if (!emitPushNotUndefinedOrNull()) {
-    //              [stack] OBJ ITERFN !UNDEF-OR-NULL
-    return false;
-  }
-  if (!emit1(JSOp::Not)) {
-    //              [stack] OBJ ITERFN UNDEF-OR-NULL
+  if (!emit1(JSOp::IsNullOrUndefined)) {
+    //              [stack] OBJ ITERFN NULL-OR-UNDEF
     return false;
   }
   if (!ifAsyncIterIsUndefined.emitThenElse()) {
@@ -5087,7 +5196,7 @@ bool BytecodeEmitter::emitAsyncIterator() {
     //              [stack] OBJ OBJ @@ITERATOR
     return false;
   }
-  if (!emitElemOpBase(JSOp::CallElem)) {
+  if (!emitElemOpBase(JSOp::GetElem)) {
     //              [stack] OBJ ITERFN
     return false;
   }
@@ -5108,7 +5217,7 @@ bool BytecodeEmitter::emitAsyncIterator() {
     //              [stack] ITER ITER
     return false;
   }
-  if (!emitAtomOp(JSOp::GetProp, cx->names().next)) {
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::next())) {
     //              [stack] ITER SYNCNEXT
     return false;
   }
@@ -5145,7 +5254,7 @@ bool BytecodeEmitter::emitAsyncIterator() {
     //              [stack] ITER ITER
     return false;
   }
-  if (!emitAtomOp(JSOp::GetProp, cx->names().next)) {
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::next())) {
     //              [stack] ITER NEXT
     return false;
   }
@@ -5158,10 +5267,20 @@ bool BytecodeEmitter::emitAsyncIterator() {
 }
 
 bool BytecodeEmitter::emitSpread(bool allowSelfHosted) {
+  // [stack] NEXT ITER ARR I
+  return emitSpread(allowSelfHosted, 2, JSOp::InitElemInc);
+  // [stack] ARR FINAL_INDEX
+}
+
+bool BytecodeEmitter::emitSpread(bool allowSelfHosted, int spreadeeStackItems,
+                                 JSOp storeElementOp) {
   LoopControl loopInfo(this, StatementKind::Spread);
+  // In the [stack] annotations, (spreadee) can be "ARR I" (when spreading
+  // into an array or into call parameters, or "TUPLE" (when spreading into a
+  // tuple)
 
   if (!loopInfo.emitLoopHead(this, Nothing())) {
-    //              [stack] NEXT ITER ARR I
+    //              [stack] NEXT ITER (spreadee)
     return false;
   }
 
@@ -5173,39 +5292,39 @@ bool BytecodeEmitter::emitSpread(bool allowSelfHosted) {
     // Spread operations can't contain |continue|, so don't bother setting loop
     // and enclosing "update" offsets, as we do with for-loops.
 
-    if (!emitDupAt(3, 2)) {
-      //            [stack] NEXT ITER ARR I NEXT
+    if (!emitDupAt(spreadeeStackItems + 1, 2)) {
+      //            [stack] NEXT ITER (spreadee) NEXT ITER
       return false;
     }
     if (!emitIteratorNext(Nothing(), IteratorKind::Sync, allowSelfHosted)) {
-      //            [stack] NEXT ITER ARR I RESULT
+      //            [stack] NEXT ITER (spreadee) RESULT
       return false;
     }
     if (!emit1(JSOp::Dup)) {
-      //            [stack] NEXT ITER ARR I RESULT RESULT
+      //            [stack] NEXT ITER (spreadee) RESULT RESULT
       return false;
     }
-    if (!emitAtomOp(JSOp::GetProp, cx->names().done)) {
-      //            [stack] NEXT ITER ARR I RESULT DONE
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::done())) {
+      //            [stack] NEXT ITER (spreadee) RESULT DONE
       return false;
     }
-    if (!emitJump(JSOp::IfNe, &loopInfo.breaks)) {
-      //            [stack] NEXT ITER ARR I RESULT
+    if (!emitJump(JSOp::JumpIfTrue, &loopInfo.breaks)) {
+      //            [stack] NEXT ITER (spreadee) RESULT
       return false;
     }
 
     // Emit code to assign result.value to the iteration variable.
-    if (!emitAtomOp(JSOp::GetProp, cx->names().value)) {
-      //            [stack] NEXT ITER ARR I VALUE
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
+      //            [stack] NEXT ITER (spreadee) VALUE
       return false;
     }
-    if (!emit1(JSOp::InitElemInc)) {
-      //            [stack] NEXT ITER ARR (I+1)
+    if (!emit1(storeElementOp)) {
+      //            [stack] NEXT ITER (spreadee)
       return false;
     }
 
     if (!loopInfo.emitLoopEnd(this, JSOp::Goto, TryNoteKind::ForOf)) {
-      //            [stack] NEXT ITER ARR (I+1)
+      //            [stack] NEXT ITER (spreadee)
       return false;
     }
 
@@ -5220,17 +5339,17 @@ bool BytecodeEmitter::emitSpread(bool allowSelfHosted) {
   // No continues should occur in spreads.
   MOZ_ASSERT(!loopInfo.continues.offset.valid());
 
-  if (!emit2(JSOp::Pick, 4)) {
-    //              [stack] ITER ARR FINAL_INDEX RESULT NEXT
+  if (!emit2(JSOp::Pick, spreadeeStackItems + 2)) {
+    //              [stack] ITER (spreadee) RESULT NEXT
     return false;
   }
-  if (!emit2(JSOp::Pick, 4)) {
-    //              [stack] ARR FINAL_INDEX RESULT NEXT ITER
+  if (!emit2(JSOp::Pick, spreadeeStackItems + 2)) {
+    //              [stack] (spreadee) RESULT NEXT ITER
     return false;
   }
 
   return emitPopN(3);
-  //                [stack] ARR FINAL_INDEX
+  //                [stack] (spreadee)
 }
 
 bool BytecodeEmitter::emitInitializeForInOrOfTarget(TernaryNode* forHead) {
@@ -5277,7 +5396,7 @@ bool BytecodeEmitter::emitInitializeForInOrOfTarget(TernaryNode* forHead) {
   }
 
   if (nameNode) {
-    RootedAtom nameAtom(cx, nameNode->name());
+    auto nameAtom = nameNode->name();
     NameOpEmitter noe(this, nameAtom, NameOpEmitter::Kind::Initialize);
     if (!noe.prepareForRhs()) {
       return false;
@@ -5325,24 +5444,16 @@ bool BytecodeEmitter::emitForOf(ForNode* forOfLoop,
   unsigned iflags = forOfLoop->iflags();
   IteratorKind iterKind =
       (iflags & JSITER_FORAWAITOF) ? IteratorKind::Async : IteratorKind::Sync;
-  MOZ_ASSERT_IF(iterKind == IteratorKind::Async, sc->asFunctionBox());
+  MOZ_ASSERT_IF(iterKind == IteratorKind::Async, sc->isSuspendableContext());
   MOZ_ASSERT_IF(iterKind == IteratorKind::Async,
-                sc->asFunctionBox()->isAsync());
+                sc->asSuspendableContext()->isAsync());
 
   ParseNode* forHeadExpr = forOfHead->kid3();
 
   // Certain builtins (e.g. Array.from) are implemented in self-hosting
   // as for-of loops.
-  bool allowSelfHostedIter = false;
-  if (emitterMode == BytecodeEmitter::SelfHosting &&
-      forHeadExpr->isKind(ParseNodeKind::CallExpr) &&
-      forHeadExpr->as<BinaryNode>().left()->isName(
-          cx->names().allowContentIter)) {
-    allowSelfHostedIter = true;
-  }
-
-  ForOfEmitter forOf(this, headLexicalEmitterScope, allowSelfHostedIter,
-                     iterKind);
+  ForOfEmitter forOf(this, headLexicalEmitterScope,
+                     allowSelfHostedIter(forHeadExpr), iterKind);
 
   if (!forOf.emitIterated()) {
     //              [stack]
@@ -5366,7 +5477,7 @@ bool BytecodeEmitter::emitForOf(ForNode* forOfLoop,
                forOfTarget->isKind(ParseNodeKind::ConstDecl));
   }
 
-  if (!forOf.emitInitialize(Some(forOfHead->pn_pos.begin))) {
+  if (!forOf.emitInitialize(forOfHead->pn_pos.begin)) {
     //              [stack] NEXT ITER VALUE
     return false;
   }
@@ -5388,7 +5499,7 @@ bool BytecodeEmitter::emitForOf(ForNode* forOfLoop,
     return false;
   }
 
-  if (!forOf.emitEnd(Some(forHeadExpr->pn_pos.begin))) {
+  if (!forOf.emitEnd(forHeadExpr->pn_pos.begin)) {
     //              [stack]
     return false;
   }
@@ -5423,7 +5534,7 @@ bool BytecodeEmitter::emitForIn(ForNode* forInLoop,
           return false;
         }
 
-        RootedAtom nameAtom(cx, nameNode->name());
+        auto nameAtom = nameNode->name();
         NameOpEmitter noe(this, nameAtom, NameOpEmitter::Kind::Initialize);
         if (!noe.prepareForRhs()) {
           return false;
@@ -5490,7 +5601,7 @@ bool BytecodeEmitter::emitForIn(ForNode* forInLoop,
     return false;
   }
 
-  if (!forIn.emitEnd(Some(forInHead->pn_pos.begin))) {
+  if (!forIn.emitEnd(forInHead->pn_pos.begin)) {
     //              [stack]
     return false;
   }
@@ -5599,7 +5710,7 @@ bool BytecodeEmitter::emitCStyleFor(
     }
   }
 
-  if (!cfor.emitEnd(Some(forNode->pn_pos.begin))) {
+  if (!cfor.emitEnd(forNode->pn_pos.begin)) {
     //              [stack]
     return false;
   }
@@ -5626,12 +5737,8 @@ bool BytecodeEmitter::emitFor(ForNode* forNode,
 }
 
 MOZ_NEVER_INLINE bool BytecodeEmitter::emitFunction(
-    FunctionNode* funNode, bool needsProto /* = false */,
-    ListNode* classContentsIfConstructor /* = nullptr */) {
+    FunctionNode* funNode, bool needsProto /* = false */) {
   FunctionBox* funbox = funNode->funbox();
-
-  MOZ_ASSERT((classContentsIfConstructor != nullptr) ==
-             funbox->isClassConstructor());
 
   //                [stack]
 
@@ -5640,59 +5747,16 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitFunction(
                          ? FunctionEmitter::IsHoisted::Yes
                          : FunctionEmitter::IsHoisted::No);
 
-  // Set the |wasEmitted| flag in the funbox once the function has been
-  // emitted. Function definitions that need hoisting to the top of the
+  // |wasEmittedByEnclosingScript| flag is set to true once the function has
+  // been emitted. Function definitions that need hoisting to the top of the
   // function will be seen by emitFunction in two places.
-  if (funbox->wasEmitted) {
+  if (funbox->wasEmittedByEnclosingScript()) {
     if (!fe.emitAgain()) {
       //            [stack]
       return false;
     }
     MOZ_ASSERT(funNode->functionIsHoisted());
-    return true;
-  }
-
-  if (funbox->isInterpreted()) {
-    // Compute the field initializers data and update the funbox.
-    //
-    // NOTE: For a lazy function, this will be applied to any existing function
-    //       in FunctionBox::finish().
-    if (classContentsIfConstructor) {
-      funbox->fieldInitializers = setupFieldInitializers(
-          classContentsIfConstructor, FieldPlacement::Instance);
-      if (!funbox->fieldInitializers) {
-        ReportAllocationOverflow(cx);
-        return false;
-      }
-    }
-
-    // A function is a run-once lambda if the following all hold:
-    //  - Enclosing script must be run-once lambda or run-once top-level.
-    //        `SharedContext::treatAsRunOnce()`
-    //  - Function definition must not be in a loop.
-    //        `BytecodeEmitter::isInLoop() == false`
-    //  - Function must be an IIFE like "(function(){ })()".
-    //        `CallOrNewEmitter::state == State::FunctionCallee`
-    //  - Function must not match `shouldSuppressRunOnce` conditions.
-    //
-    // NOTE: This is a heuristic and through trick such as `fun.caller` it may
-    //       still be run more than once. The VM must accomodate this.
-    // NOTE: For a lazy function, this will be applied to any existing function
-    //       in FunctionBox::finish().
-    bool isRunOnceLambda =
-        emittingRunOnceLambda && !funbox->shouldSuppressRunOnce();
-    funbox->setTreatAsRunOnce(isRunOnceLambda);
-
-    // Mark functions which are expected to only have one instance as singletons
-    // functions. These function instances will then always have a unique script
-    // of which they are the canonical function. This improves type-inferrence
-    // precision. CloneFunctionObject will make a deep clone of the function and
-    // script as needed if our prediction is wrong.
-    //
-    // NOTE: This heuristic is arbitrary, but some debugger tests rely on the
-    //       current behaviour and need to be updated if the condiditons change.
-    funbox->isSingleton = checkRunOnceContext();
-
+  } else if (funbox->isInterpreted()) {
     if (!funbox->emitBytecode) {
       return fe.emitLazy();
       //            [stack] FUN?
@@ -5703,19 +5767,13 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitFunction(
       return false;
     }
 
-    EmitterMode nestedMode = emitterMode;
-    if (nestedMode == BytecodeEmitter::LazyFunction) {
-      MOZ_ASSERT(compilationInfo.sourceObject->source()->hasBinASTSource());
-      nestedMode = BytecodeEmitter::Normal;
-    }
-
-    BytecodeEmitter bce2(this, parser, funbox, compilationInfo, nestedMode);
+    BytecodeEmitter bce2(this, parser, funbox, compilationState, emitterMode);
     if (!bce2.init(funNode->pn_pos)) {
       return false;
     }
 
     /* We measured the max scope depth when we parsed the function. */
-    if (!bce2.emitFunctionScript(funNode, TopLevelFunction::No)) {
+    if (!bce2.emitFunctionScript(funNode)) {
       return false;
     }
 
@@ -5723,13 +5781,25 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitFunction(
       //            [stack] FUN?
       return false;
     }
-
-    return true;
+  } else {
+    if (!fe.emitAsmJSModule()) {
+      //            [stack]
+      return false;
+    }
   }
 
-  if (!fe.emitAsmJSModule()) {
-    //              [stack]
-    return false;
+  // Track the last emitted top-level self-hosted function, so that intrinsics
+  // can adjust attributes at parse time.
+  //
+  // NOTE: We also disallow lambda functions in the top-level body. This is done
+  // to simplify handling of the self-hosted stencil. Within normal function
+  // declarations there are no such restrictions.
+  if (emitterMode == EmitterMode::SelfHosting) {
+    if (sc->isTopLevelContext()) {
+      MOZ_ASSERT(!funbox->isLambda());
+      MOZ_ASSERT(funbox->explicitName());
+      prevSelfHostedTopLevelFunction = funbox;
+    }
   }
 
   return true;
@@ -5739,8 +5809,7 @@ bool BytecodeEmitter::emitDo(BinaryNode* doNode) {
   ParseNode* bodyNode = doNode->left();
 
   DoWhileEmitter doWhile(this);
-  if (!doWhile.emitBody(Some(doNode->pn_pos.begin),
-                        getOffsetForLoop(bodyNode))) {
+  if (!doWhile.emitBody(doNode->pn_pos.begin, getOffsetForLoop(bodyNode))) {
     return false;
   }
 
@@ -5776,8 +5845,8 @@ bool BytecodeEmitter::emitWhile(BinaryNode* whileNode) {
   WhileEmitter wh(this);
 
   ParseNode* condNode = whileNode->left();
-  if (!wh.emitCond(Some(whileNode->pn_pos.begin), getOffsetForLoop(condNode),
-                   Some(whileNode->pn_pos.end))) {
+  if (!wh.emitCond(whileNode->pn_pos.begin, getOffsetForLoop(condNode),
+                   whileNode->pn_pos.end)) {
     return false;
   }
 
@@ -5805,7 +5874,7 @@ bool BytecodeEmitter::emitWhile(BinaryNode* whileNode) {
   return true;
 }
 
-bool BytecodeEmitter::emitBreak(PropertyName* label) {
+bool BytecodeEmitter::emitBreak(TaggedParserAtomIndex label) {
   BreakableControl* target;
   if (label) {
     // Any statement with the matching label may be the break target.
@@ -5820,10 +5889,10 @@ bool BytecodeEmitter::emitBreak(PropertyName* label) {
     target = findInnermostNestableControl<BreakableControl>(isNotLabel);
   }
 
-  return emitGoto(target, &target->breaks, GotoKind::Break);
+  return emitGoto(target, GotoKind::Break);
 }
 
-bool BytecodeEmitter::emitContinue(PropertyName* label) {
+bool BytecodeEmitter::emitContinue(TaggedParserAtomIndex label) {
   LoopControl* target = nullptr;
   if (label) {
     // Find the loop statement enclosed by the matching label.
@@ -5838,25 +5907,18 @@ bool BytecodeEmitter::emitContinue(PropertyName* label) {
   } else {
     target = findInnermostNestableControl<LoopControl>();
   }
-  return emitGoto(target, &target->continues, GotoKind::Continue);
+  return emitGoto(target, GotoKind::Continue);
 }
 
 bool BytecodeEmitter::emitGetFunctionThis(NameNode* thisName) {
   MOZ_ASSERT(sc->hasFunctionThisBinding());
-  MOZ_ASSERT(thisName->isName(cx->names().dotThis));
+  MOZ_ASSERT(thisName->isName(TaggedParserAtomIndex::WellKnown::dotThis()));
 
-  return emitGetFunctionThis(Some(thisName->pn_pos.begin));
-}
-
-bool BytecodeEmitter::emitGetFunctionThis(
-    const mozilla::Maybe<uint32_t>& offset) {
-  if (offset) {
-    if (!updateLineNumberNotes(*offset)) {
-      return false;
-    }
+  if (!updateLineNumberNotes(thisName->pn_pos.begin)) {
+    return false;
   }
 
-  if (!emitGetName(cx->names().dotThis)) {
+  if (!emitGetName(TaggedParserAtomIndex::WellKnown::dotThis())) {
     //              [stack] THIS
     return false;
   }
@@ -5890,19 +5952,57 @@ bool BytecodeEmitter::emitThisLiteral(ThisLiteral* pn) {
   }
 
   MOZ_ASSERT(sc->thisBinding() == ThisBinding::Global);
+
+  MOZ_ASSERT(outermostScope().hasNonSyntacticScopeOnChain() ==
+             sc->hasNonSyntacticScope());
+  if (sc->hasNonSyntacticScope()) {
+    return emit1(JSOp::NonSyntacticGlobalThis);
+    //                [stack] THIS
+  }
+
   return emit1(JSOp::GlobalThis);
   //                [stack] THIS
 }
 
 bool BytecodeEmitter::emitCheckDerivedClassConstructorReturn() {
-  MOZ_ASSERT(lookupName(cx->names().dotThis).hasKnownSlot());
-  if (!emitGetName(cx->names().dotThis)) {
+  MOZ_ASSERT(
+      lookupName(TaggedParserAtomIndex::WellKnown::dotThis()).hasKnownSlot());
+  if (!emitGetName(TaggedParserAtomIndex::WellKnown::dotThis())) {
     return false;
   }
   if (!emit1(JSOp::CheckReturn)) {
     return false;
   }
+  if (!emit1(JSOp::SetRval)) {
+    return false;
+  }
   return true;
+}
+
+bool BytecodeEmitter::emitNewTarget() {
+  MOZ_ASSERT(sc->allowNewTarget());
+
+  if (!emitGetName(TaggedParserAtomIndex::WellKnown::dotNewTarget())) {
+    //              [stack] NEW.TARGET
+    return false;
+  }
+  return true;
+}
+
+bool BytecodeEmitter::emitNewTarget(NewTargetNode* pn) {
+  MOZ_ASSERT(pn->newTargetName()->isName(
+      TaggedParserAtomIndex::WellKnown::dotNewTarget()));
+
+  return emitNewTarget();
+}
+
+bool BytecodeEmitter::emitNewTarget(CallNode* pn) {
+  MOZ_ASSERT(pn->callOp() == JSOp::SuperCall ||
+             pn->callOp() == JSOp::SpreadSuperCall);
+
+  // The parser is responsible for marking the "new.target" binding as being
+  // implicitly used in super() calls.
+  return emitNewTarget();
 }
 
 bool BytecodeEmitter::emitReturn(UnaryNode* returnNode) {
@@ -5931,7 +6031,8 @@ bool BytecodeEmitter::emitReturn(UnaryNode* returnNode) {
       return false;
     }
 
-    if (sc->asFunctionBox()->isAsync() && sc->asFunctionBox()->isGenerator()) {
+    if (sc->asSuspendableContext()->isAsync() &&
+        sc->asSuspendableContext()->isGenerator()) {
       if (!emitAwaitInInnermostScope()) {
         return false;
       }
@@ -5957,48 +6058,39 @@ bool BytecodeEmitter::emitReturn(UnaryNode* returnNode) {
   }
 
   /*
-   * EmitNonLocalJumpFixup may add fixup bytecode to close open try
-   * blocks having finally clauses and to exit intermingled let blocks.
-   * We can't simply transfer control flow to our caller in that case,
-   * because we must gosub to those finally clauses from inner to outer,
-   * with the correct stack pointer (i.e., after popping any with,
-   * for/in, etc., slots nested inside the finally's try).
+   * The return value is currently on the stack. We would like to
+   * generate JSOp::Return, but if we have work to do before returning,
+   * we will instead generate JSOp::SetRval / JSOp::RetRval.
    *
-   * In this case we mutate JSOp::Return into JSOp::SetRval and add an
-   * extra JSOp::RetRval after the fixups.
+   * We don't know whether we will need fixup code until after calling
+   * prepareForNonLocalJumpToOutermost, so we start by generating
+   * JSOp::SetRval, then mutate it to JSOp::Return in finishReturn if it
+   * wasn't needed.
    */
-  BytecodeOffset top = bytecodeSection().offset();
+  BytecodeOffset setRvalOffset = bytecodeSection().offset();
+  if (!emit1(JSOp::SetRval)) {
+    return false;
+  }
 
+  NonLocalExitControl nle(this, NonLocalExitKind::Return);
+  return nle.emitReturn(setRvalOffset);
+}
+
+bool BytecodeEmitter::finishReturn(BytecodeOffset setRvalOffset) {
   bool needsFinalYield =
       sc->isFunctionBox() && sc->asFunctionBox()->needsFinalYield();
   bool isDerivedClassConstructor =
       sc->isFunctionBox() && sc->asFunctionBox()->isDerivedClassConstructor();
-
-  if (!emit1((needsFinalYield || isDerivedClassConstructor) ? JSOp::SetRval
-                                                            : JSOp::Return)) {
-    return false;
-  }
-
-  // Make sure that we emit this before popping the blocks in
-  // prepareForNonLocalJump, to ensure that the error is thrown while the
-  // scope-chain is still intact.
-  if (isDerivedClassConstructor) {
-    if (!emitCheckDerivedClassConstructorReturn()) {
-      return false;
-    }
-  }
-
-  NonLocalExitControl nle(this, NonLocalExitControl::Return);
-
-  if (!nle.prepareForNonLocalJumpToOutermost()) {
-    return false;
-  }
+  bool isSimpleReturn =
+      setRvalOffset.valid() &&
+      setRvalOffset + BytecodeOffsetDiff(JSOpLength_SetRval) ==
+          bytecodeSection().offset();
 
   if (needsFinalYield) {
     // We know that .generator is on the function scope, as we just exited
     // all nested scopes.
-    NameLocation loc = *locationOfNameBoundInFunctionScope(
-        cx->names().dotGenerator, varEmitterScope);
+    NameLocation loc = *locationOfNameBoundInScopeType<FunctionScope>(
+        TaggedParserAtomIndex::WellKnown::dotGenerator(), varEmitterScope);
 
     // Resolve the return value before emitting the final yield.
     if (sc->asFunctionBox()->needsPromiseResult()) {
@@ -6006,7 +6098,8 @@ bool BytecodeEmitter::emitReturn(UnaryNode* returnNode) {
         //          [stack] RVAL
         return false;
       }
-      if (!emitGetNameAtLocation(cx->names().dotGenerator, loc)) {
+      if (!emitGetNameAtLocation(
+              TaggedParserAtomIndex::WellKnown::dotGenerator(), loc)) {
         //          [stack] RVAL GEN
         return false;
       }
@@ -6021,23 +6114,24 @@ bool BytecodeEmitter::emitReturn(UnaryNode* returnNode) {
       }
     }
 
-    if (!emitGetNameAtLocation(cx->names().dotGenerator, loc)) {
+    if (!emitGetNameAtLocation(TaggedParserAtomIndex::WellKnown::dotGenerator(),
+                               loc)) {
       return false;
     }
     if (!emitYieldOp(JSOp::FinalYieldRval)) {
       return false;
     }
   } else if (isDerivedClassConstructor) {
-    MOZ_ASSERT(JSOp(bytecodeSection().code()[top.value()]) == JSOp::SetRval);
-    if (!emitReturnRval()) {
+    if (!emitJump(JSOp::Goto, &endOfDerivedClassConstructorBody)) {
       return false;
     }
-  } else if (top + BytecodeOffsetDiff(JSOpLength_Return) !=
-                 bytecodeSection().offset() ||
-             // If we are instrumenting, make sure we use RetRval and add any
-             // instrumentation for the frame exit.
-             instrumentationKinds) {
-    bytecodeSection().code()[top.value()] = jsbytecode(JSOp::SetRval);
+  } else if (isSimpleReturn) {
+    // We haven't generated any code since the JSOp::SetRval, so we can replace
+    // it with a JSOp::Return. See |emitReturn| above.
+    MOZ_ASSERT(JSOp(bytecodeSection().code()[setRvalOffset.value()]) ==
+               JSOp::SetRval);
+    bytecodeSection().code()[setRvalOffset.value()] = jsbytecode(JSOp::Return);
+  } else {
     if (!emitReturnRval()) {
       return false;
     }
@@ -6047,9 +6141,17 @@ bool BytecodeEmitter::emitReturn(UnaryNode* returnNode) {
 }
 
 bool BytecodeEmitter::emitGetDotGeneratorInScope(EmitterScope& currentScope) {
-  NameLocation loc = *locationOfNameBoundInFunctionScope(
-      cx->names().dotGenerator, &currentScope);
-  return emitGetNameAtLocation(cx->names().dotGenerator, loc);
+  if (!sc->isFunction() && sc->isModuleContext() &&
+      sc->asModuleContext()->isAsync()) {
+    NameLocation loc = *locationOfNameBoundInScopeType<ModuleScope>(
+        TaggedParserAtomIndex::WellKnown::dotGenerator(), &currentScope);
+    return emitGetNameAtLocation(
+        TaggedParserAtomIndex::WellKnown::dotGenerator(), loc);
+  }
+  NameLocation loc = *locationOfNameBoundInScopeType<FunctionScope>(
+      TaggedParserAtomIndex::WellKnown::dotGenerator(), &currentScope);
+  return emitGetNameAtLocation(TaggedParserAtomIndex::WellKnown::dotGenerator(),
+                               loc);
 }
 
 bool BytecodeEmitter::emitInitialYield(UnaryNode* yieldNode) {
@@ -6098,7 +6200,7 @@ bool BytecodeEmitter::emitYield(UnaryNode* yieldNode) {
   }
 
   // 25.5.3.7 AsyncGeneratorYield step 5.
-  if (sc->asFunctionBox()->isAsync()) {
+  if (sc->asSuspendableContext()->isAsync()) {
     MOZ_ASSERT(!needsIteratorResult);
     if (!emitAwaitInInnermostScope()) {
       //            [stack] RESULT
@@ -6135,7 +6237,7 @@ bool BytecodeEmitter::emitYield(UnaryNode* yieldNode) {
 }
 
 bool BytecodeEmitter::emitAwaitInInnermostScope(UnaryNode* awaitNode) {
-  MOZ_ASSERT(sc->isFunctionBox());
+  MOZ_ASSERT(sc->isSuspendableContext());
   MOZ_ASSERT(awaitNode->isKind(ParseNodeKind::AwaitExpr));
 
   if (!emitTree(awaitNode->kid())) {
@@ -6145,23 +6247,23 @@ bool BytecodeEmitter::emitAwaitInInnermostScope(UnaryNode* awaitNode) {
 }
 
 bool BytecodeEmitter::emitAwaitInScope(EmitterScope& currentScope) {
-  if (!emit1(JSOp::TrySkipAwait)) {
+  if (!emit1(JSOp::CanSkipAwait)) {
+    //              [stack] VALUE CANSKIP
+    return false;
+  }
+
+  if (!emit1(JSOp::MaybeExtractAwaitValue)) {
     //              [stack] VALUE_OR_RESOLVED CANSKIP
     return false;
   }
 
-  if (!emit1(JSOp::Not)) {
-    //              [stack] VALUE_OR_RESOLVED !CANSKIP
-    return false;
-  }
-
   InternalIfEmitter ifCanSkip(this);
-  if (!ifCanSkip.emitThen()) {
+  if (!ifCanSkip.emitThen(IfEmitter::ConditionKind::Negative)) {
     //              [stack] VALUE_OR_RESOLVED
     return false;
   }
 
-  if (sc->asFunctionBox()->needsPromiseResult()) {
+  if (sc->asSuspendableContext()->needsPromiseResult()) {
     if (!emitGetDotGeneratorInScope(currentScope)) {
       //            [stack] VALUE GENERATOR
       return false;
@@ -6198,13 +6300,14 @@ bool BytecodeEmitter::emitAwaitInScope(EmitterScope& currentScope) {
 // 14.4.14 Runtime Semantics: Evaluation
 // YieldExpression : yield* AssignmentExpression
 bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
-  MOZ_ASSERT(sc->isFunctionBox());
-  MOZ_ASSERT(sc->asFunctionBox()->isGenerator());
+  MOZ_ASSERT(sc->isSuspendableContext());
+  MOZ_ASSERT(sc->asSuspendableContext()->isGenerator());
 
   // Step 1.
-  IteratorKind iterKind =
-      sc->asFunctionBox()->isAsync() ? IteratorKind::Async : IteratorKind::Sync;
-  bool needsIteratorResult = sc->asFunctionBox()->needsIteratorResult();
+  IteratorKind iterKind = sc->asSuspendableContext()->isAsync()
+                              ? IteratorKind::Async
+                              : IteratorKind::Sync;
+  bool needsIteratorResult = sc->asSuspendableContext()->needsIteratorResult();
 
   // Steps 2-5.
   if (!emitTree(iter)) {
@@ -6341,20 +6444,21 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
       //            [stack] NEXT ITER RECEIVED ITER ITER
       return false;
     }
-    if (!emitAtomOp(JSOp::CallProp, cx->names().throw_)) {
+    if (!emitAtomOp(JSOp::GetProp,
+                    TaggedParserAtomIndex::WellKnown::throw_())) {
       //            [stack] NEXT ITER RECEIVED ITER THROW
       return false;
     }
 
     // Step 7.b.ii.
     InternalIfEmitter ifThrowMethodIsNotDefined(this);
-    if (!emitPushNotUndefinedOrNull()) {
-      //            [stack] NEXT ITER RECEIVED ITER THROW
-      //            [stack]   NOT-UNDEF-OR_NULL
+    if (!emit1(JSOp::IsNullOrUndefined)) {
+      //            [stack] NEXT ITER RECEIVED ITER THROW NULL-OR-UNDEF
       return false;
     }
 
-    if (!ifThrowMethodIsNotDefined.emitThenElse()) {
+    if (!ifThrowMethodIsNotDefined.emitThenElse(
+            IfEmitter::ConditionKind::Negative)) {
       //            [stack] NEXT ITER RECEIVED ITER THROW
       return false;
     }
@@ -6405,7 +6509,8 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
     //
     // If the iterator does not have a "throw" method, it calls IteratorClose
     // and then throws a TypeError.
-    if (!emitIteratorCloseInInnermostScope(iterKind)) {
+    if (!emitIteratorCloseInInnermostScope(iterKind, CompletionKind::Normal,
+                                           allowSelfHostedIter(iter))) {
       //            [stack] NEXT ITER RECEIVED ITER
       return false;
     }
@@ -6448,7 +6553,8 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
       //            [stack] NEXT ITER RECEIVED ITER ITER
       return false;
     }
-    if (!emitAtomOp(JSOp::CallProp, cx->names().return_)) {
+    if (!emitAtomOp(JSOp::GetProp,
+                    TaggedParserAtomIndex::WellKnown::return_())) {
       //            [stack] NEXT ITER RECEIVED ITER RET
       return false;
     }
@@ -6457,15 +6563,16 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
     //
     // Do nothing if "return" is undefined or null.
     InternalIfEmitter ifReturnMethodIsDefined(this);
-    if (!emitPushNotUndefinedOrNull()) {
-      //            [stack] NEXT ITER RECEIVED ITER RET NOT-UNDEF-OR_NULL
+    if (!emit1(JSOp::IsNullOrUndefined)) {
+      //            [stack] NEXT ITER RECEIVED ITER RET NULL-OR-UNDEF
       return false;
     }
 
     // Step 7.c.iv.
     //
     // Call "return" with the argument passed to Generator.prototype.return.
-    if (!ifReturnMethodIsDefined.emitThenElse()) {
+    if (!ifReturnMethodIsDefined.emitThenElse(
+            IfEmitter::ConditionKind::Negative)) {
       //            [stack] NEXT ITER RECEIVED ITER RET
       return false;
     }
@@ -6478,7 +6585,8 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
       return false;
     }
     if (needsIteratorResult) {
-      if (!emitAtomOp(JSOp::GetProp, cx->names().value)) {
+      if (!emitAtomOp(JSOp::GetProp,
+                      TaggedParserAtomIndex::WellKnown::value())) {
         //          [stack] NEXT ITER RET ITER VAL
         return false;
       }
@@ -6511,7 +6619,7 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
       //            [stack] NEXT ITER RESULT RESULT
       return false;
     }
-    if (!emitAtomOp(JSOp::GetProp, cx->names().done)) {
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::done())) {
       //            [stack] NEXT ITER RESULT DONE
       return false;
     }
@@ -6521,7 +6629,7 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
     }
 
     // Step 7.c.viii.1.
-    if (!emitAtomOp(JSOp::GetProp, cx->names().value)) {
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
       //            [stack] NEXT ITER VALUE
       return false;
     }
@@ -6612,11 +6720,11 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
     //              [stack] NEXT ITER RESULT RESULT
     return false;
   }
-  if (!emitAtomOp(JSOp::GetProp, cx->names().done)) {
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::done())) {
     //              [stack] NEXT ITER RESULT DONE
     return false;
   }
-  if (!emitJump(JSOp::IfNe, &loopInfo.breaks)) {
+  if (!emitJump(JSOp::JumpIfTrue, &loopInfo.breaks)) {
     //              [stack] NEXT ITER RESULT
     return false;
   }
@@ -6629,7 +6737,7 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
     return false;
   }
   if (iterKind == IteratorKind::Async) {
-    if (!emitAtomOp(JSOp::GetProp, cx->names().value)) {
+    if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
       //            [stack] NEXT ITER RESULT
       return false;
     }
@@ -6677,7 +6785,7 @@ bool BytecodeEmitter::emitYieldStar(ParseNode* iter) {
     //              [stack] RESULT
     return false;
   }
-  if (!emitAtomOp(JSOp::GetProp, cx->names().value)) {
+  if (!emitAtomOp(JSOp::GetProp, TaggedParserAtomIndex::WellKnown::value())) {
     //              [stack] VALUE
     return false;
   }
@@ -6738,7 +6846,7 @@ bool BytecodeEmitter::emitExpressionStatement(UnaryNode* exprStmt) {
     ValueUsage valueUsage =
         wantval ? ValueUsage::WantValue : ValueUsage::IgnoreValue;
     ExpressionStatementEmitter ese(this, valueUsage);
-    if (!ese.prepareForExpr(Some(exprStmt->pn_pos.begin))) {
+    if (!ese.prepareForExpr(exprStmt->pn_pos.begin)) {
       return false;
     }
     if (!markStepBreakpoint()) {
@@ -6808,6 +6916,9 @@ bool BytecodeEmitter::emitDeleteElement(UnaryNode* deleteNode) {
 
   PropertyByValue* elemExpr = &deleteNode->kid()->as<PropertyByValue>();
   bool isSuper = elemExpr->isSuper();
+  DebugOnly<bool> isPrivate =
+      elemExpr->key().isKind(ParseNodeKind::PrivateName);
+  MOZ_ASSERT(!isPrivate);
   ElemOpEmitter eoe(
       this, ElemOpEmitter::Kind::Delete,
       isSuper ? ElemOpEmitter::ObjKind::Super : ElemOpEmitter::ObjKind::Other);
@@ -6988,7 +7099,7 @@ bool BytecodeEmitter::emitDeleteElementInOptChain(PropertyByValueBase* elemExpr,
     return false;
   }
 
-  if (!emitOptionalTree(&elemExpr->key(), oe)) {
+  if (!emitTree(&elemExpr->key())) {
     //              [stack] OBJ KEY
     return false;
   }
@@ -6999,20 +7110,6 @@ bool BytecodeEmitter::emitDeleteElementInOptChain(PropertyByValueBase* elemExpr,
   }
 
   return true;
-}
-
-static const char* SelfHostedCallFunctionName(JSAtom* name, JSContext* cx) {
-  if (name == cx->names().callFunction) {
-    return "callFunction";
-  }
-  if (name == cx->names().callContentFunction) {
-    return "callContentFunction";
-  }
-  if (name == cx->names().constructContentFunction) {
-    return "constructContentFunction";
-  }
-
-  MOZ_CRASH("Unknown self-hosted call function name");
 }
 
 bool BytecodeEmitter::emitSelfHostedCallFunction(CallNode* callNode) {
@@ -7028,26 +7125,19 @@ bool BytecodeEmitter::emitSelfHostedCallFunction(CallNode* callNode) {
   NameNode* calleeNode = &callNode->left()->as<NameNode>();
   ListNode* argsList = &callNode->right()->as<ListNode>();
 
-  const char* errorName = SelfHostedCallFunctionName(calleeNode->name(), cx);
-
-  if (argsList->count() < 2) {
-    reportNeedMoreArgsError(calleeNode, errorName, "2", "s", argsList);
+  if (!ensureAtLeastArgs(callNode, 2)) {
     return false;
   }
 
   JSOp callOp = callNode->callOp();
-  if (callOp != JSOp::Call) {
-    reportError(callNode, JSMSG_NOT_CONSTRUCTOR, errorName);
-    return false;
-  }
+  MOZ_ASSERT(callOp == JSOp::Call);
 
   bool constructing =
-      calleeNode->name() == cx->names().constructContentFunction;
+      calleeNode->name() ==
+      TaggedParserAtomIndex::WellKnown::constructContentFunction();
   ParseNode* funNode = argsList->head();
   if (constructing) {
     callOp = JSOp::New;
-  } else if (funNode->isName(cx->names().std_Function_apply)) {
-    callOp = JSOp::FunApply;
   }
 
   if (!emitTree(funNode)) {
@@ -7056,7 +7146,7 @@ bool BytecodeEmitter::emitSelfHostedCallFunction(CallNode* callNode) {
 
 #ifdef DEBUG
   if (emitterMode == BytecodeEmitter::SelfHosting &&
-      calleeNode->name() == cx->names().callFunction) {
+      calleeNode->name() == TaggedParserAtomIndex::WellKnown::callFunction()) {
     if (!emit1(JSOp::DebugCheckSelfHosted)) {
       return false;
     }
@@ -7098,12 +7188,11 @@ bool BytecodeEmitter::emitSelfHostedCallFunction(CallNode* callNode) {
   return true;
 }
 
-bool BytecodeEmitter::emitSelfHostedResumeGenerator(BinaryNode* callNode) {
+bool BytecodeEmitter::emitSelfHostedResumeGenerator(CallNode* callNode) {
   ListNode* argsList = &callNode->right()->as<ListNode>();
 
   // Syntax: resumeGenerator(gen, value, 'next'|'throw'|'return')
-  if (argsList->count() != 3) {
-    reportNeedMoreArgsError(callNode, "resumeGenerator", "3", "s", argsList);
+  if (!ensureArgs(callNode, 3)) {
     return false;
   }
 
@@ -7122,7 +7211,7 @@ bool BytecodeEmitter::emitSelfHostedResumeGenerator(BinaryNode* callNode) {
   ParseNode* kindNode = valNode->pn_next;
   MOZ_ASSERT(kindNode->isKind(ParseNodeKind::StringExpr));
   GeneratorResumeKind kind =
-      AtomToResumeKind(cx, kindNode->as<NameNode>().atom());
+      ParserAtomToResumeKind(cx, kindNode->as<NameNode>().atom());
   MOZ_ASSERT(!kindNode->pn_next);
 
   if (!emitPushResumeKind(kind)) {
@@ -7153,11 +7242,10 @@ bool BytecodeEmitter::emitSelfHostedForceInterpreter() {
   return true;
 }
 
-bool BytecodeEmitter::emitSelfHostedAllowContentIter(BinaryNode* callNode) {
+bool BytecodeEmitter::emitSelfHostedAllowContentIter(CallNode* callNode) {
   ListNode* argsList = &callNode->right()->as<ListNode>();
 
-  if (argsList->count() != 1) {
-    reportNeedMoreArgsError(callNode, "allowContentIter", "1", "", argsList);
+  if (!ensureArgs(callNode, 1)) {
     return false;
   }
 
@@ -7165,7 +7253,7 @@ bool BytecodeEmitter::emitSelfHostedAllowContentIter(BinaryNode* callNode) {
   return emitTree(argsList->head());
 }
 
-bool BytecodeEmitter::emitSelfHostedDefineDataProperty(BinaryNode* callNode) {
+bool BytecodeEmitter::emitSelfHostedDefineDataProperty(CallNode* callNode) {
   ListNode* argsList = &callNode->right()->as<ListNode>();
 
   // Only optimize when 3 arguments are passed.
@@ -7192,11 +7280,10 @@ bool BytecodeEmitter::emitSelfHostedDefineDataProperty(BinaryNode* callNode) {
   return emit1(JSOp::InitElem);
 }
 
-bool BytecodeEmitter::emitSelfHostedHasOwn(BinaryNode* callNode) {
+bool BytecodeEmitter::emitSelfHostedHasOwn(CallNode* callNode) {
   ListNode* argsList = &callNode->right()->as<ListNode>();
 
-  if (argsList->count() != 2) {
-    reportNeedMoreArgsError(callNode, "hasOwn", "2", "s", argsList);
+  if (!ensureArgs(callNode, 2)) {
     return false;
   }
 
@@ -7213,11 +7300,10 @@ bool BytecodeEmitter::emitSelfHostedHasOwn(BinaryNode* callNode) {
   return emit1(JSOp::HasOwn);
 }
 
-bool BytecodeEmitter::emitSelfHostedGetPropertySuper(BinaryNode* callNode) {
+bool BytecodeEmitter::emitSelfHostedGetPropertySuper(CallNode* callNode) {
   ListNode* argsList = &callNode->right()->as<ListNode>();
 
-  if (argsList->count() != 3) {
-    reportNeedMoreArgsError(callNode, "getPropertySuper", "3", "s", argsList);
+  if (!ensureArgs(callNode, 3)) {
     return false;
   }
 
@@ -7240,11 +7326,10 @@ bool BytecodeEmitter::emitSelfHostedGetPropertySuper(BinaryNode* callNode) {
   return emitElemOpBase(JSOp::GetElemSuper);
 }
 
-bool BytecodeEmitter::emitSelfHostedToNumeric(BinaryNode* callNode) {
+bool BytecodeEmitter::emitSelfHostedToNumeric(CallNode* callNode) {
   ListNode* argsList = &callNode->right()->as<ListNode>();
 
-  if (argsList->count() != 1) {
-    reportNeedMoreArgsError(callNode, "ToNumeric", "1", "", argsList);
+  if (!ensureArgs(callNode, 1)) {
     return false;
   }
 
@@ -7257,50 +7342,229 @@ bool BytecodeEmitter::emitSelfHostedToNumeric(BinaryNode* callNode) {
   return emit1(JSOp::ToNumeric);
 }
 
-bool BytecodeEmitter::isRestParameter(ParseNode* expr) {
-  if (!sc->isFunctionBox()) {
+bool BytecodeEmitter::emitSelfHostedToString(CallNode* callNode) {
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+
+  if (!ensureArgs(callNode, 1)) {
     return false;
   }
 
-  FunctionBox* funbox = sc->asFunctionBox();
-  if (!funbox->hasRest()) {
+  ParseNode* argNode = argsList->head();
+
+  if (!emitTree(argNode)) {
     return false;
   }
 
-  if (!expr->isKind(ParseNodeKind::Name)) {
-    if (emitterMode == BytecodeEmitter::SelfHosting &&
-        expr->isKind(ParseNodeKind::CallExpr)) {
-      BinaryNode* callNode = &expr->as<BinaryNode>();
-      ParseNode* calleeNode = callNode->left();
-      if (calleeNode->isName(cx->names().allowContentIter)) {
-        return isRestParameter(callNode->right()->as<ListNode>().head());
-      }
-    }
-    return false;
-  }
-
-  JSAtom* name = expr->as<NameNode>().name();
-  Maybe<NameLocation> paramLoc = locationOfNameBoundInFunctionScope(name);
-  if (paramLoc && lookupName(name) == *paramLoc) {
-    FunctionScope::Data* bindings = funbox->functionScopeBindings();
-    if (bindings->nonPositionalFormalStart > 0) {
-      // |paramName| can be nullptr when the rest destructuring syntax is
-      // used: `function f(...[]) {}`.
-      JSAtom* paramName =
-          bindings->trailingNames[bindings->nonPositionalFormalStart - 1]
-              .name();
-      return paramName && name == paramName;
-    }
-  }
-
-  return false;
+  return emit1(JSOp::ToString);
 }
+
+bool BytecodeEmitter::emitSelfHostedGetBuiltinConstructorOrPrototype(
+    CallNode* callNode, bool isConstructor) {
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+
+  if (!ensureArgs(callNode, 1)) {
+    return false;
+  }
+
+  ParseNode* argNode = argsList->head();
+
+  if (!argNode->isKind(ParseNodeKind::StringExpr)) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "built-in name",
+                "not a string constant");
+    return false;
+  }
+
+  auto name = argNode->as<NameNode>().atom();
+
+  BuiltinObjectKind kind;
+  if (isConstructor) {
+    kind = BuiltinConstructorForName(name);
+  } else {
+    kind = BuiltinPrototypeForName(name);
+  }
+
+  if (kind == BuiltinObjectKind::None) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "built-in name",
+                "not a valid built-in");
+    return false;
+  }
+
+  return emitBuiltinObject(kind);
+}
+
+bool BytecodeEmitter::emitSelfHostedGetBuiltinConstructor(CallNode* callNode) {
+  return emitSelfHostedGetBuiltinConstructorOrPrototype(
+      callNode, /* isConstructor = */ true);
+}
+
+bool BytecodeEmitter::emitSelfHostedGetBuiltinPrototype(CallNode* callNode) {
+  return emitSelfHostedGetBuiltinConstructorOrPrototype(
+      callNode, /* isConstructor = */ false);
+}
+
+JS::SymbolCode ParserAtomToSymbolCode(TaggedParserAtomIndex atom) {
+  // NOTE: This is a linear search, but the set of entries is quite small and
+  // this is only used for initial self-hosted parse.
+#define MATCH_WELL_KNOWN_SYMBOL(NAME)                     \
+  if (atom == TaggedParserAtomIndex::WellKnown::NAME()) { \
+    return JS::SymbolCode::NAME;                          \
+  }
+  JS_FOR_EACH_WELL_KNOWN_SYMBOL(MATCH_WELL_KNOWN_SYMBOL)
+#undef MATCH_WELL_KNOWN_SYMBOL
+
+  return JS::SymbolCode::Limit;
+}
+
+bool BytecodeEmitter::emitSelfHostedGetBuiltinSymbol(CallNode* callNode) {
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+
+  if (!ensureArgs(callNode, 1)) {
+    return false;
+  }
+
+  ParseNode* argNode = argsList->head();
+
+  if (!argNode->isKind(ParseNodeKind::StringExpr)) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "built-in name",
+                "not a string constant");
+    return false;
+  }
+
+  auto name = argNode->as<NameNode>().atom();
+
+  JS::SymbolCode code = ParserAtomToSymbolCode(name);
+  if (code == JS::SymbolCode::Limit) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "built-in name",
+                "not a valid built-in");
+    return false;
+  }
+
+  return emit2(JSOp::Symbol, uint8_t(code));
+}
+
+#ifdef DEBUG
+bool BytecodeEmitter::checkSelfHostedExpectedTopLevel(CallNode* callNode,
+                                                      ParseNode* node) {
+  // The function argument is expected to be a simple binding/function name.
+  // Eg. `function foo() { }; SpecialIntrinsic(foo)`
+  if (!node->isKind(ParseNodeKind::Name)) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "function argument",
+                "not a binding name");
+    return false;
+  }
+  TaggedParserAtomIndex targetName = node->as<NameNode>().name();
+
+  // The special intrinsics must follow the target functions definition. A
+  // simple assert is fine here since any hoisted function will cause a non-null
+  // value to be set here.
+  MOZ_ASSERT(prevSelfHostedTopLevelFunction);
+
+  // The target function must match the most recently defined top-level
+  // self-hosted function.
+  if (prevSelfHostedTopLevelFunction->explicitName() != targetName) {
+    reportError(callNode, JSMSG_SELFHOST_DECORATOR_MUST_FOLLOW);
+    return false;
+  }
+
+  return true;
+}
+#endif
+
+bool BytecodeEmitter::emitSelfHostedSetIsInlinableLargeFunction(
+    CallNode* callNode) {
+  if (!ensureArgs(callNode, 1)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+  if (!checkSelfHostedExpectedTopLevel(callNode, argsList->head())) {
+    return false;
+  }
+#endif
+
+  MOZ_ASSERT(prevSelfHostedTopLevelFunction->isInitialCompilation);
+  prevSelfHostedTopLevelFunction->setIsInlinableLargeFunction();
+
+  // This is still a call node, so we must generate a stack value.
+  return emit1(JSOp::Undefined);
+}
+
+bool BytecodeEmitter::emitSelfHostedSetCanonicalName(CallNode* callNode) {
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+
+  if (!ensureArgs(callNode, 2)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  if (!checkSelfHostedExpectedTopLevel(callNode, argsList->head())) {
+    return false;
+  }
+#endif
+
+  ParseNode* nameNode = argsList->last();
+  MOZ_ASSERT(nameNode->isKind(ParseNodeKind::StringExpr));
+  TaggedParserAtomIndex specName = nameNode->as<NameNode>().atom();
+  // Canonical name must be atomized.
+  compilationState.parserAtoms.markUsedByStencil(specName,
+                                                 ParserAtom::Atomize::Yes);
+
+  // Store the canonical name for instantiation.
+  prevSelfHostedTopLevelFunction->functionStencil().setSelfHostedCanonicalName(
+      specName);
+
+  return emit1(JSOp::Undefined);
+}
+
+#ifdef DEBUG
+bool BytecodeEmitter::checkSelfHostedUnsafeGetReservedSlot(CallNode* callNode) {
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+
+  if (!ensureArgs(callNode, 2)) {
+    return false;
+  }
+
+  ParseNode* objNode = argsList->head();
+  ParseNode* slotNode = objNode->pn_next;
+
+  // Ensure that the slot argument is fixed, this is required by the JITs.
+  if (!slotNode->isKind(ParseNodeKind::NumberExpr)) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "slot argument",
+                "not a constant");
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::checkSelfHostedUnsafeSetReservedSlot(CallNode* callNode) {
+  ListNode* argsList = &callNode->right()->as<ListNode>();
+
+  if (!ensureArgs(callNode, 3)) {
+    return false;
+  }
+
+  ParseNode* objNode = argsList->head();
+  ParseNode* slotNode = objNode->pn_next;
+
+  // Ensure that the slot argument is fixed, this is required by the JITs.
+  if (!slotNode->isKind(ParseNodeKind::NumberExpr)) {
+    reportError(callNode, JSMSG_UNEXPECTED_TYPE, "slot argument",
+                "not a constant");
+    return false;
+  }
+
+  return true;
+}
+#endif
 
 /* A version of emitCalleeAndThis for the optional cases:
  *   * a?.()
  *   * a?.b()
  *   * a?.["b"]()
  *   * (a?.b)()
+ *   * a?.#b()
  *
  * See emitCallOrNew and emitOptionalCall for more context.
  */
@@ -7308,14 +7572,15 @@ bool BytecodeEmitter::emitOptionalCalleeAndThis(ParseNode* callee,
                                                 CallNode* call,
                                                 CallOrNewEmitter& cone,
                                                 OptionalEmitter& oe) {
-  if (!CheckRecursionLimit(cx)) {
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.check(cx)) {
     return false;
   }
 
   switch (ParseNodeKind kind = callee->getKind()) {
     case ParseNodeKind::Name: {
-      RootedAtom nameAtom(cx, callee->as<NameNode>().name());
-      if (!cone.emitNameCallee(nameAtom)) {
+      auto name = callee->as<NameNode>().name();
+      if (!cone.emitNameCallee(name)) {
         //          [stack] CALLEE THIS
         return false;
       }
@@ -7350,7 +7615,7 @@ bool BytecodeEmitter::emitOptionalCalleeAndThis(ParseNode* callee,
     case ParseNodeKind::OptionalElemExpr: {
       OptionalPropertyByValue* elem = &callee->as<OptionalPropertyByValue>();
       bool isSuper = false;
-
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
       ElemOpEmitter& eoe = cone.prepareForElemCallee(isSuper);
       if (!emitOptionalElemExpression(elem, eoe, isSuper, oe)) {
         //          [stack] CALLEE THIS
@@ -7361,9 +7626,22 @@ bool BytecodeEmitter::emitOptionalCalleeAndThis(ParseNode* callee,
     case ParseNodeKind::ElemExpr: {
       PropertyByValue* elem = &callee->as<PropertyByValue>();
       bool isSuper = elem->isSuper();
-
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
       ElemOpEmitter& eoe = cone.prepareForElemCallee(isSuper);
       if (!emitOptionalElemExpression(elem, eoe, isSuper, oe)) {
+        //          [stack] CALLEE THIS
+        return false;
+      }
+      break;
+    }
+
+    case ParseNodeKind::PrivateMemberExpr:
+    case ParseNodeKind::OptionalPrivateMemberExpr: {
+      PrivateMemberAccessBase* privateExpr =
+          &callee->as<PrivateMemberAccessBase>();
+      PrivateOpEmitter& xoe =
+          cone.prepareForPrivateCallee(privateExpr->privateName().name());
+      if (!emitOptionalPrivateExpression(privateExpr, xoe, oe)) {
         //          [stack] CALLEE THIS
         return false;
       }
@@ -7410,9 +7688,9 @@ bool BytecodeEmitter::emitCalleeAndThis(ParseNode* callee, ParseNode* call,
                                         CallOrNewEmitter& cone) {
   switch (callee->getKind()) {
     case ParseNodeKind::Name: {
-      RootedAtom nameAtom(cx, callee->as<NameNode>().name());
-      if (!cone.emitNameCallee(nameAtom)) {
-        //          [stack] CALLEE THIS
+      auto name = callee->as<NameNode>().name();
+      if (!cone.emitNameCallee(name)) {
+        //          [stack] CALLEE THIS?
         return false;
       }
       break;
@@ -7449,7 +7727,7 @@ bool BytecodeEmitter::emitCalleeAndThis(ParseNode* callee, ParseNode* call,
       MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
       PropertyByValue* elem = &callee->as<PropertyByValue>();
       bool isSuper = elem->isSuper();
-
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
       ElemOpEmitter& eoe = cone.prepareForElemCallee(isSuper);
       if (!emitElemObjAndKey(elem, isSuper, eoe)) {
         //          [stack] # if Super
@@ -7459,7 +7737,28 @@ bool BytecodeEmitter::emitCalleeAndThis(ParseNode* callee, ParseNode* call,
         return false;
       }
       if (!eoe.emitGet()) {
-        //          [stack] CALLEE? THIS
+        //          [stack] CALLEE THIS?
+        return false;
+      }
+
+      break;
+    }
+    case ParseNodeKind::PrivateMemberExpr: {
+      MOZ_ASSERT(emitterMode != BytecodeEmitter::SelfHosting);
+      PrivateMemberAccessBase* privateExpr =
+          &callee->as<PrivateMemberAccessBase>();
+      PrivateOpEmitter& xoe =
+          cone.prepareForPrivateCallee(privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        //          [stack] OBJ
+        return false;
+      }
+      if (!xoe.emitReference()) {
+        //          [stack] OBJ NAME
+        return false;
+      }
+      if (!xoe.emitGetForCallOrNew()) {
+        //          [stack] CALLEE THIS
         return false;
       }
 
@@ -7478,7 +7777,7 @@ bool BytecodeEmitter::emitCalleeAndThis(ParseNode* callee, ParseNode* call,
       MOZ_ASSERT(call->isKind(ParseNodeKind::SuperCallExpr));
       MOZ_ASSERT(parser->astGenerator().isSuperBase(callee));
       if (!cone.emitSuperCallee()) {
-        //          [stack] CALLEE THIS
+        //          [stack] CALLEE IsConstructing
         return false;
       }
       break;
@@ -7504,44 +7803,11 @@ bool BytecodeEmitter::emitCalleeAndThis(ParseNode* callee, ParseNode* call,
   return true;
 }
 
-bool BytecodeEmitter::emitPipeline(ListNode* node) {
-  MOZ_ASSERT(node->count() >= 2);
-
-  if (!emitTree(node->head())) {
-    //              [stack] ARG
-    return false;
-  }
-
-  ParseNode* callee = node->head()->pn_next;
-  CallOrNewEmitter cone(this, JSOp::Call,
-                        CallOrNewEmitter::ArgumentsKind::Other,
-                        ValueUsage::WantValue);
-  do {
-    if (!emitCalleeAndThis(callee, node, cone)) {
-      //            [stack] ARG CALLEE THIS
-      return false;
-    }
-    if (!emit2(JSOp::Pick, 2)) {
-      //            [stack] CALLEE THIS ARG
-      return false;
-    }
-    if (!cone.emitEnd(1, Some(node->pn_pos.begin))) {
-      //            [stack] RVAL
-      return false;
-    }
-
-    cone.reset();
-  } while ((callee = callee->pn_next));
-
-  return true;
-}
-
 ParseNode* BytecodeEmitter::getCoordNode(ParseNode* callNode,
                                          ParseNode* calleeNode, JSOp op,
                                          ListNode* argsList) {
   ParseNode* coordNode = callNode;
-  if (op == JSOp::Call || op == JSOp::SpreadCall || op == JSOp::FunCall ||
-      op == JSOp::FunApply) {
+  if (op == JSOp::Call || op == JSOp::SpreadCall) {
     // Default to using the location of the `(` itself.
     // obj[expr]() // expression
     //          ^  // column coord
@@ -7602,15 +7868,31 @@ bool BytecodeEmitter::emitArguments(ListNode* argsList, bool isCall,
         return false;
       }
     }
-  } else {
-    if (cone.wantSpreadOperand()) {
-      UnaryNode* spreadNode = &argsList->head()->as<UnaryNode>();
-      if (!emitTree(spreadNode->kid())) {
-        //          [stack] CALLEE THIS ARG0
+  } else if (cone.wantSpreadOperand()) {
+    auto* spreadNode = &argsList->head()->as<UnaryNode>();
+    if (!emitTree(spreadNode->kid())) {
+      //            [stack] CALLEE THIS ARG0
+      return false;
+    }
+
+    if (!cone.emitSpreadArgumentsTest()) {
+      //            [stack] CALLEE THIS ARG0
+      return false;
+    }
+
+    if (cone.wantSpreadIteration()) {
+      if (!emitSpreadIntoArray(spreadNode)) {
+        //          [stack] CALLEE THIS ARR
         return false;
       }
     }
-    if (!cone.emitSpreadArgumentsTest()) {
+
+    if (!cone.emitSpreadArgumentsTestEnd()) {
+      //            [stack] CALLEE THIS ARR
+      return false;
+    }
+  } else {
+    if (!cone.prepareForSpreadArguments()) {
       //            [stack] CALLEE THIS
       return false;
     }
@@ -7638,17 +7920,16 @@ bool BytecodeEmitter::emitOptionalCall(CallNode* callNode, OptionalEmitter& oe,
    */
   ParseNode* calleeNode = callNode->left();
   ListNode* argsList = &callNode->right()->as<ListNode>();
-  bool isSpread = JOF_OPTYPE(callNode->callOp()) == JOF_BYTE;
+  bool isSpread = IsSpreadOp(callNode->callOp());
   JSOp op = callNode->callOp();
   uint32_t argc = argsList->count();
+  bool isOptimizableSpread = isSpread && argc == 1;
 
-  CallOrNewEmitter cone(
-      this, op,
-      isSpread && (argc == 1) &&
-              isRestParameter(argsList->head()->as<UnaryNode>().kid())
-          ? CallOrNewEmitter::ArgumentsKind::SingleSpreadRest
-          : CallOrNewEmitter::ArgumentsKind::Other,
-      valueUsage);
+  CallOrNewEmitter cone(this, op,
+                        isOptimizableSpread
+                            ? CallOrNewEmitter::ArgumentsKind::SingleSpread
+                            : CallOrNewEmitter::ArgumentsKind::Other,
+                        valueUsage);
 
   ParseNode* coordNode = getCoordNode(callNode, calleeNode, op, argsList);
 
@@ -7669,7 +7950,7 @@ bool BytecodeEmitter::emitOptionalCall(CallNode* callNode, OptionalEmitter& oe,
     return false;
   }
 
-  if (!cone.emitEnd(argc, Some(coordNode->pn_pos.begin))) {
+  if (!cone.emitEnd(argc, coordNode->pn_pos.begin)) {
     //              [stack] RVAL
     return false;
   }
@@ -7684,11 +7965,6 @@ bool BytecodeEmitter::emitCallOrNew(
    * First, emit code for the left operand to evaluate the callable or
    * constructable object expression.
    *
-   * For operator new, we emit JSOp::GetProp instead of JSOp::CallProp, etc.
-   * This is necessary to interpose the lambda-initialized method read
-   * barrier -- see the code in jsinterp.cpp for JSOp::Lambda followed by
-   * JSOp::{Set,Init}Prop.
-   *
    * Then (or in a call case that has no explicit reference-base
    * object) we emit JSOp::Undefined to produce the undefined |this|
    * value required for calls (which non-strict mode functions
@@ -7698,51 +7974,103 @@ bool BytecodeEmitter::emitCallOrNew(
                 callNode->isKind(ParseNodeKind::TaggedTemplateExpr);
   ParseNode* calleeNode = callNode->left();
   ListNode* argsList = &callNode->right()->as<ListNode>();
-  bool isSpread = JOF_OPTYPE(callNode->callOp()) == JOF_BYTE;
+  JSOp op = callNode->callOp();
 
   if (calleeNode->isKind(ParseNodeKind::Name) &&
-      emitterMode == BytecodeEmitter::SelfHosting && !isSpread) {
+      emitterMode == BytecodeEmitter::SelfHosting && op == JSOp::Call) {
     // Calls to "forceInterpreter", "callFunction",
     // "callContentFunction", or "resumeGenerator" in self-hosted
     // code generate inline bytecode.
-    PropertyName* calleeName = calleeNode->as<NameNode>().name();
-    if (calleeName == cx->names().callFunction ||
-        calleeName == cx->names().callContentFunction ||
-        calleeName == cx->names().constructContentFunction) {
+    auto calleeName = calleeNode->as<NameNode>().name();
+    if (calleeName == TaggedParserAtomIndex::WellKnown::callFunction() ||
+        calleeName == TaggedParserAtomIndex::WellKnown::callContentFunction() ||
+        calleeName ==
+            TaggedParserAtomIndex::WellKnown::constructContentFunction()) {
       return emitSelfHostedCallFunction(callNode);
     }
-    if (calleeName == cx->names().resumeGenerator) {
+    if (calleeName == TaggedParserAtomIndex::WellKnown::resumeGenerator()) {
       return emitSelfHostedResumeGenerator(callNode);
     }
-    if (calleeName == cx->names().forceInterpreter) {
+    if (calleeName == TaggedParserAtomIndex::WellKnown::forceInterpreter()) {
       return emitSelfHostedForceInterpreter();
     }
-    if (calleeName == cx->names().allowContentIter) {
+    if (calleeName == TaggedParserAtomIndex::WellKnown::allowContentIter()) {
       return emitSelfHostedAllowContentIter(callNode);
     }
-    if (calleeName == cx->names().defineDataPropertyIntrinsic &&
+    if (calleeName ==
+            TaggedParserAtomIndex::WellKnown::defineDataPropertyIntrinsic() &&
         argsList->count() == 3) {
       return emitSelfHostedDefineDataProperty(callNode);
     }
-    if (calleeName == cx->names().hasOwn) {
+    if (calleeName == TaggedParserAtomIndex::WellKnown::hasOwn()) {
       return emitSelfHostedHasOwn(callNode);
     }
-    if (calleeName == cx->names().getPropertySuper) {
+    if (calleeName == TaggedParserAtomIndex::WellKnown::getPropertySuper()) {
       return emitSelfHostedGetPropertySuper(callNode);
     }
-    if (calleeName == cx->names().ToNumeric) {
+    if (calleeName == TaggedParserAtomIndex::WellKnown::ToNumeric()) {
       return emitSelfHostedToNumeric(callNode);
     }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::ToString()) {
+      return emitSelfHostedToString(callNode);
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::GetBuiltinConstructor()) {
+      return emitSelfHostedGetBuiltinConstructor(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::GetBuiltinPrototype()) {
+      return emitSelfHostedGetBuiltinPrototype(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::GetBuiltinSymbol()) {
+      return emitSelfHostedGetBuiltinSymbol(callNode);
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::SetIsInlinableLargeFunction()) {
+      return emitSelfHostedSetIsInlinableLargeFunction(callNode);
+    }
+    if (calleeName == TaggedParserAtomIndex::WellKnown::SetCanonicalName()) {
+      return emitSelfHostedSetCanonicalName(callNode);
+    }
+#ifdef DEBUG
+    if (calleeName ==
+            TaggedParserAtomIndex::WellKnown::UnsafeGetReservedSlot() ||
+        calleeName == TaggedParserAtomIndex::WellKnown::
+                          UnsafeGetObjectFromReservedSlot() ||
+        calleeName == TaggedParserAtomIndex::WellKnown::
+                          UnsafeGetInt32FromReservedSlot() ||
+        calleeName == TaggedParserAtomIndex::WellKnown::
+                          UnsafeGetStringFromReservedSlot() ||
+        calleeName == TaggedParserAtomIndex::WellKnown::
+                          UnsafeGetBooleanFromReservedSlot()) {
+      // Make sure that this call is correct, but don't emit any special code.
+      if (!checkSelfHostedUnsafeGetReservedSlot(callNode)) {
+        return false;
+      }
+    }
+    if (calleeName ==
+        TaggedParserAtomIndex::WellKnown::UnsafeSetReservedSlot()) {
+      // Make sure that this call is correct, but don't emit any special code.
+      if (!checkSelfHostedUnsafeSetReservedSlot(callNode)) {
+        return false;
+      }
+    }
+#endif
     // Fall through
   }
 
-  JSOp op = callNode->callOp();
   uint32_t argc = argsList->count();
+  bool isSpread = IsSpreadOp(op);
+  bool isOptimizableSpread = isSpread && argc == 1;
+  bool isDefaultDerivedClassConstructor =
+      sc->isFunctionBox() && sc->asFunctionBox()->isDerivedClassConstructor() &&
+      sc->asFunctionBox()->isSyntheticFunction();
+  MOZ_ASSERT_IF(isDefaultDerivedClassConstructor, isOptimizableSpread);
   CallOrNewEmitter cone(
       this, op,
-      isSpread && (argc == 1) &&
-              isRestParameter(argsList->head()->as<UnaryNode>().kid())
-          ? CallOrNewEmitter::ArgumentsKind::SingleSpreadRest
+      isOptimizableSpread
+          ? isDefaultDerivedClassConstructor
+                ? CallOrNewEmitter::ArgumentsKind::PassthroughRest
+                : CallOrNewEmitter::ArgumentsKind::SingleSpread
           : CallOrNewEmitter::ArgumentsKind::Other,
       valueUsage);
 
@@ -7755,9 +8083,26 @@ bool BytecodeEmitter::emitCallOrNew(
     return false;
   }
 
+  // Push new.target for construct calls.
+  if (IsConstructOp(op)) {
+    if (op == JSOp::SuperCall || op == JSOp::SpreadSuperCall) {
+      if (!emitNewTarget(callNode)) {
+        //          [stack] CALLEE THIS ARGS.. NEW.TARGET
+        return false;
+      }
+    } else {
+      // Repush the callee as new.target
+      uint32_t effectiveArgc = isSpread ? 1 : argc;
+      if (!emitDupAt(effectiveArgc + 1)) {
+        //          [stack] CALLEE THIS ARGS.. CALLEE
+        return false;
+      }
+    }
+  }
+
   ParseNode* coordNode = getCoordNode(callNode, calleeNode, op, argsList);
 
-  if (!cone.emitEnd(argc, Some(coordNode->pn_pos.begin))) {
+  if (!cone.emitEnd(argc, coordNode->pn_pos.begin)) {
     //              [stack] RVAL
     return false;
   }
@@ -7770,13 +8115,14 @@ bool BytecodeEmitter::emitCallOrNew(
 //   - the binary operators in TokenKind.h
 //   - the precedence list in Parser.cpp
 static const JSOp ParseNodeKindToJSOp[] = {
-    // JSOp::Nop is for pipeline operator which does not emit its own JSOp
-    // but has highest precedence in binary operators
-    JSOp::Nop,        JSOp::Coalesce, JSOp::Or,       JSOp::And, JSOp::BitOr,
-    JSOp::BitXor,     JSOp::BitAnd,   JSOp::StrictEq, JSOp::Eq,  JSOp::StrictNe,
-    JSOp::Ne,         JSOp::Lt,       JSOp::Le,       JSOp::Gt,  JSOp::Ge,
-    JSOp::Instanceof, JSOp::In,       JSOp::Lsh,      JSOp::Rsh, JSOp::Ursh,
-    JSOp::Add,        JSOp::Sub,      JSOp::Mul,      JSOp::Div, JSOp::Mod,
+    // Some binary ops require special code generation (PrivateIn);
+    // these should not use BinaryOpParseNodeKindToJSOp. This table fills those
+    // slots with Nops to make the rest of the table lookup work.
+    JSOp::Coalesce, JSOp::Or,       JSOp::And, JSOp::BitOr,    JSOp::BitXor,
+    JSOp::BitAnd,   JSOp::StrictEq, JSOp::Eq,  JSOp::StrictNe, JSOp::Ne,
+    JSOp::Lt,       JSOp::Le,       JSOp::Gt,  JSOp::Ge,       JSOp::Instanceof,
+    JSOp::In,       JSOp::Nop,      JSOp::Lsh, JSOp::Rsh,      JSOp::Ursh,
+    JSOp::Add,      JSOp::Sub,      JSOp::Mul, JSOp::Div,      JSOp::Mod,
     JSOp::Pow};
 
 static inline JSOp BinaryOpParseNodeKindToJSOp(ParseNodeKind pnk) {
@@ -7784,10 +8130,13 @@ static inline JSOp BinaryOpParseNodeKindToJSOp(ParseNodeKind pnk) {
   MOZ_ASSERT(pnk <= ParseNodeKind::BinOpLast);
   int parseNodeFirst = size_t(ParseNodeKind::BinOpFirst);
 #ifdef DEBUG
-  int jsopArraySize = ArrayLength(ParseNodeKindToJSOp);
+  int jsopArraySize = std::size(ParseNodeKindToJSOp);
   int parseNodeKindListSize =
       size_t(ParseNodeKind::BinOpLast) - parseNodeFirst + 1;
   MOZ_ASSERT(jsopArraySize == parseNodeKindListSize);
+  // Ensure we don't use this to find an op for a parse node
+  // requiring special emission rules.
+  MOZ_ASSERT(ParseNodeKindToJSOp[size_t(pnk) - parseNodeFirst] != JSOp::Nop);
 #endif
   return ParseNodeKindToJSOp[size_t(pnk) - parseNodeFirst];
 }
@@ -7828,6 +8177,49 @@ bool BytecodeEmitter::emitLeftAssociative(ListNode* node) {
   return true;
 }
 
+bool BytecodeEmitter::emitPrivateInExpr(ListNode* node) {
+  MOZ_ASSERT(node->head()->isKind(ParseNodeKind::PrivateName));
+
+  NameNode& privateNameNode = node->head()->as<NameNode>();
+  TaggedParserAtomIndex privateName = privateNameNode.name();
+
+  PrivateOpEmitter xoe(this, PrivateOpEmitter::Kind::ErgonomicBrandCheck,
+                       privateName);
+
+  ParseNode* valueNode = node->head()->pn_next;
+  MOZ_ASSERT(valueNode->pn_next == nullptr);
+
+  if (!emitTree(valueNode)) {
+    //              [stack] OBJ
+    return false;
+  }
+
+  if (!xoe.emitReference()) {
+    //              [stack] OBJ BRAND  if private method
+    //              [stack] OBJ NAME   if private field or accessor.
+    return false;
+  }
+
+  if (!xoe.emitBrandCheck()) {
+    //              [stack] OBJ BRAND BOOL if private method
+    //              [stack] OBJ NAME  BOOL if private field or accessor.
+    return false;
+  }
+
+  if (!emitUnpickN(2)) {
+    //              [stack] BOOL OBJ BRAND if private method
+    //              [stack] BOOL OBJ NAME   if private field or accessor.
+    return false;
+  }
+
+  if (!emitPopN(2)) {
+    //              [stack] BOOL
+    return false;
+  }
+
+  return true;
+}
+
 /*
  * Special `emitTree` for Optional Chaining case.
  * Examples of this are `emitOptionalChain`, `emitDeleteOptionalChain` and
@@ -7836,7 +8228,8 @@ bool BytecodeEmitter::emitLeftAssociative(ListNode* node) {
 bool BytecodeEmitter::emitOptionalTree(
     ParseNode* pn, OptionalEmitter& oe,
     ValueUsage valueUsage /* = ValueUsage::WantValue */) {
-  if (!CheckRecursionLimit(cx)) {
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.check(cx)) {
     return false;
   }
   ParseNodeKind kind = pn->getKind();
@@ -7866,6 +8259,7 @@ bool BytecodeEmitter::emitOptionalTree(
     case ParseNodeKind::OptionalElemExpr: {
       OptionalPropertyByValue* elem = &pn->as<OptionalPropertyByValue>();
       bool isSuper = false;
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
       ElemOpEmitter eoe(this, ElemOpEmitter::Kind::Get,
                         ElemOpEmitter::ObjKind::Other);
 
@@ -7877,11 +8271,22 @@ bool BytecodeEmitter::emitOptionalTree(
     case ParseNodeKind::ElemExpr: {
       PropertyByValue* elem = &pn->as<PropertyByValue>();
       bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
       ElemOpEmitter eoe(this, ElemOpEmitter::Kind::Get,
                         isSuper ? ElemOpEmitter::ObjKind::Super
                                 : ElemOpEmitter::ObjKind::Other);
 
       if (!emitOptionalElemExpression(elem, eoe, isSuper, oe)) {
+        return false;
+      }
+      break;
+    }
+    case ParseNodeKind::PrivateMemberExpr:
+    case ParseNodeKind::OptionalPrivateMemberExpr: {
+      PrivateMemberAccessBase* privateExpr = &pn->as<PrivateMemberAccessBase>();
+      PrivateOpEmitter xoe(this, PrivateOpEmitter::Kind::Get,
+                           privateExpr->privateName().name());
+      if (!emitOptionalPrivateExpression(privateExpr, xoe, oe)) {
         return false;
       }
       break;
@@ -7901,6 +8306,7 @@ bool BytecodeEmitter::emitOptionalTree(
       // https://tc39.es/ecma262/#sec-primary-expression
       bool isPrimaryExpression =
           kind == ParseNodeKind::ThisExpr || kind == ParseNodeKind::Name ||
+          kind == ParseNodeKind::PrivateName ||
           kind == ParseNodeKind::NullExpr || kind == ParseNodeKind::TrueExpr ||
           kind == ParseNodeKind::FalseExpr ||
           kind == ParseNodeKind::NumberExpr ||
@@ -7924,12 +8330,7 @@ bool BytecodeEmitter::emitOptionalTree(
       bool isCallExpression = kind == ParseNodeKind::SetThis ||
                               kind == ParseNodeKind::CallImportExpr;
 
-      // These should be handled through the main parse tree
-      bool isOptionalExpression =
-          kind == ParseNodeKind::OptionalChain ||
-          kind == ParseNodeKind::DeleteOptionalChainExpr;
-
-      MOZ_ASSERT(isMemberExpression || isCallExpression || isOptionalExpression,
+      MOZ_ASSERT(isMemberExpression || isCallExpression,
                  "Unknown ParseNodeKind for OptionalChain");
 #endif
       return emitTree(pn);
@@ -8081,6 +8482,37 @@ bool BytecodeEmitter::emitOptionalElemExpression(PropertyByValueBase* elem,
   return true;
 }
 
+bool BytecodeEmitter::emitOptionalPrivateExpression(
+    PrivateMemberAccessBase* privateExpr, PrivateOpEmitter& xoe,
+    OptionalEmitter& oe) {
+  if (!emitOptionalTree(&privateExpr->expression(), oe)) {
+    //              [stack] OBJ
+    return false;
+  }
+
+  if (privateExpr->isKind(ParseNodeKind::OptionalPrivateMemberExpr)) {
+    if (!oe.emitJumpShortCircuit()) {
+      //            [stack] # if Jump
+      //            [stack] UNDEFINED-OR-NULL
+      //            [stack] # otherwise
+      //            [stack] OBJ
+      return false;
+    }
+  }
+
+  if (!xoe.emitReference()) {
+    //              [stack] OBJ NAME
+    return false;
+  }
+  if (!xoe.emitGet()) {
+    //              [stack] CALLEE THIS  # if call
+    //              [stack] VALUE        # otherwise
+    return false;
+  }
+
+  return true;
+}
+
 bool BytecodeEmitter::emitShortCircuit(ListNode* node) {
   MOZ_ASSERT(node->isKind(ParseNodeKind::OrExpr) ||
              node->isKind(ParseNodeKind::CoalesceExpr) ||
@@ -8178,6 +8610,8 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitIncOrDec(UnaryNode* incDec) {
       return emitPropIncDec(incDec);
     case ParseNodeKind::ElemExpr:
       return emitElemIncDec(incDec);
+    case ParseNodeKind::PrivateMemberExpr:
+      return emitPrivateIncDec(incDec);
     case ParseNodeKind::CallExpr:
       return emitCallIncDec(incDec);
     default:
@@ -8189,7 +8623,7 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitIncOrDec(UnaryNode* incDec) {
 // the comment on emitSwitch.
 MOZ_NEVER_INLINE bool BytecodeEmitter::emitLabeledStatement(
     const LabeledStatement* labeledStmt) {
-  RootedAtom name(cx, labeledStmt->label());
+  auto name = labeledStmt->label();
   LabelEmitter label(this);
 
   label.emitLabel(name);
@@ -8212,11 +8646,20 @@ bool BytecodeEmitter::emitConditionalExpression(
     return false;
   }
 
-  if (!emitTree(&conditional.condition())) {
+  ParseNode* conditionNode = &conditional.condition();
+  auto conditionKind = IfEmitter::ConditionKind::Positive;
+  if (conditionNode->isKind(ParseNodeKind::NotExpr)) {
+    conditionNode = conditionNode->as<UnaryNode>().kid();
+    conditionKind = IfEmitter::ConditionKind::Negative;
+  }
+
+  // NOTE: NotExpr of conditionNode may be unwrapped, and in that case the
+  //       negation is handled by conditionKind.
+  if (!emitTree(conditionNode)) {
     return false;
   }
 
-  if (!cond.emitThenElse()) {
+  if (!cond.emitThenElse(conditionKind)) {
     return false;
   }
 
@@ -8250,7 +8693,7 @@ void BytecodeEmitter::isPropertyListObjLiteralCompatible(ListNode* obj,
                                                          bool* withoutValues) {
   bool keysOK = true;
   bool valuesOK = true;
-  int propCount = 0;
+  uint32_t propCount = 0;
 
   for (ParseNode* propdef : obj->contents()) {
     if (!propdef->is<BinaryNode>()) {
@@ -8268,6 +8711,11 @@ void BytecodeEmitter::isPropertyListObjLiteralCompatible(ListNode* obj,
       keysOK = false;
       break;
     }
+
+    // BigIntExprs should have been lowered to computed names at parse
+    // time, and so should be excluded above.
+    MOZ_ASSERT(!key->isKind(ParseNodeKind::BigIntExpr));
+
     // Numeric keys OK as long as they are integers and in range.
     if (key->isKind(ParseNodeKind::NumberExpr)) {
       double numValue = key->as<NumericLiteral>().value();
@@ -8280,11 +8728,6 @@ void BytecodeEmitter::isPropertyListObjLiteralCompatible(ListNode* obj,
         keysOK = false;
         break;
       }
-    }
-    // BigInt keys aren't yet supported.
-    if (key->isKind(ParseNodeKind::BigIntExpr)) {
-      keysOK = false;
-      break;
     }
 
     MOZ_ASSERT(key->isKind(ParseNodeKind::ObjectPropertyName) ||
@@ -8305,7 +8748,7 @@ void BytecodeEmitter::isPropertyListObjLiteralCompatible(ListNode* obj,
     }
   }
 
-  if (propCount >= PropertyTree::MAX_HEIGHT) {
+  if (propCount > SharedPropMap::MaxPropsForNonDictionary) {
     // JSOp::NewObject cannot accept dictionary-mode objects.
     keysOK = false;
   }
@@ -8327,7 +8770,7 @@ bool BytecodeEmitter::isArrayObjLiteralCompatible(ParseNode* arrayHead) {
 }
 
 bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
-                                       PropListType type, bool isInner) {
+                                       PropListType type) {
   //                [stack] CTOR? OBJ
 
   size_t curFieldKeyIndex = 0;
@@ -8339,25 +8782,24 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
       // is created elsewhere.
       ClassField* field = &propdef->as<ClassField>();
       if (field->name().getKind() == ParseNodeKind::ComputedName) {
-        auto fieldKeysName = field->isStatic()
-                                 ? &JSAtomState::dotStaticFieldKeys
-                                 : &JSAtomState::dotFieldKeys;
-        HandlePropertyName fieldKeys = cx->names().*fieldKeysName;
+        auto fieldKeys =
+            field->isStatic()
+                ? TaggedParserAtomIndex::WellKnown::dotStaticFieldKeys()
+                : TaggedParserAtomIndex::WellKnown::dotFieldKeys();
         if (!emitGetName(fieldKeys)) {
-          //        [stack] CTOR? OBJ ARRAY
+          //        [stack] CTOR OBJ ARRAY
           return false;
         }
 
         ParseNode* nameExpr = field->name().as<UnaryNode>().kid();
 
-        if (!emitTree(nameExpr, ValueUsage::WantValue, EMIT_LINENOTE,
-                      /* isInner = */ isInner)) {
-          //        [stack] CTOR? OBJ ARRAY KEY
+        if (!emitTree(nameExpr, ValueUsage::WantValue, EMIT_LINENOTE)) {
+          //        [stack] CTOR OBJ ARRAY KEY
           return false;
         }
 
-        if (!emit1(JSOp::ToId)) {
-          //        [stack] CTOR? OBJ ARRAY KEY
+        if (!emit1(JSOp::ToPropertyKey)) {
+          //        [stack] CTOR OBJ ARRAY KEY
           return false;
         }
 
@@ -8369,23 +8811,29 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
         }
 
         if (!emitUint32Operand(JSOp::InitElemArray, fieldKeysIndex)) {
-          //        [stack] CTOR? OBJ ARRAY
+          //        [stack] CTOR OBJ ARRAY
           return false;
         }
 
         if (!emit1(JSOp::Pop)) {
-          //        [stack] CTOR? OBJ
+          //        [stack] CTOR OBJ
           return false;
         }
       }
       continue;
     }
 
+    if (propdef->isKind(ParseNodeKind::StaticClassBlock)) {
+      // Static class blocks are emitted as part of
+      // emitCreateMemberInitializers.
+      continue;
+    }
+
     if (propdef->is<LexicalScopeNode>()) {
       // Constructors are sometimes wrapped in LexicalScopeNodes. As we
       // already handled emitting the constructor, skip it.
-      MOZ_ASSERT(propdef->as<LexicalScopeNode>().scopeBody()->isKind(
-          ParseNodeKind::ClassMethod));
+      MOZ_ASSERT(
+          propdef->as<LexicalScopeNode>().scopeBody()->is<ClassMethod>());
       continue;
     }
 
@@ -8394,7 +8842,7 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
     if (propdef->isKind(ParseNodeKind::MutateProto)) {
       //            [stack] OBJ
       MOZ_ASSERT(type == ObjectLiteral);
-      if (!pe.prepareForProtoValue(Some(propdef->pn_pos.begin))) {
+      if (!pe.prepareForProtoValue(propdef->pn_pos.begin)) {
         //          [stack] OBJ
         return false;
       }
@@ -8412,7 +8860,7 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
     if (propdef->isKind(ParseNodeKind::Spread)) {
       MOZ_ASSERT(type == ObjectLiteral);
       //            [stack] OBJ
-      if (!pe.prepareForSpreadOperand(Some(propdef->pn_pos.begin))) {
+      if (!pe.prepareForSpreadOperand(propdef->pn_pos.begin)) {
         //          [stack] OBJ OBJ
         return false;
       }
@@ -8433,7 +8881,15 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
     ParseNode* propVal = prop->right();
     AccessorType accessorType;
     if (prop->is<ClassMethod>()) {
-      accessorType = prop->as<ClassMethod>().accessorType();
+      ClassMethod& method = prop->as<ClassMethod>();
+      accessorType = method.accessorType();
+
+      if (!method.isStatic() && key->isKind(ParseNodeKind::PrivateName) &&
+          accessorType != AccessorType::None) {
+        // Private non-static accessors are stamped onto instances from
+        // initializers; see emitCreateMemberInitializers.
+        continue;
+      }
     } else if (prop->is<PropertyDefinition>()) {
       accessorType = prop->as<PropertyDefinition>().accessorType();
     } else {
@@ -8447,18 +8903,7 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
         if (key->isKind(ParseNodeKind::NumberExpr)) {
           MOZ_ASSERT(accessorType == AccessorType::None);
 
-          RootedAtom keyAtom(cx, key->as<NumericLiteral>().toAtom(cx));
-          if (!keyAtom) {
-            return false;
-          }
-          if (!emitAnonymousFunctionWithName(propVal, keyAtom)) {
-            //      [stack] CTOR? OBJ CTOR? KEY VAL
-            return false;
-          }
-        } else if (key->isKind(ParseNodeKind::BigIntExpr)) {
-          MOZ_ASSERT(accessorType == AccessorType::None);
-
-          RootedAtom keyAtom(cx, key->as<BigIntLiteral>().toAtom(cx));
+          auto keyAtom = key->as<NumericLiteral>().toAtom(cx, parserAtoms());
           if (!keyAtom) {
             return false;
           }
@@ -8470,19 +8915,28 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
                    key->isKind(ParseNodeKind::StringExpr)) {
           MOZ_ASSERT(accessorType == AccessorType::None);
 
-          RootedAtom keyAtom(cx, key->as<NameNode>().atom());
+          auto keyAtom = key->as<NameNode>().atom();
           if (!emitAnonymousFunctionWithName(propVal, keyAtom)) {
             //      [stack] CTOR? OBJ CTOR? VAL
             return false;
           }
         } else {
-          MOZ_ASSERT(key->isKind(ParseNodeKind::ComputedName));
+          MOZ_ASSERT(key->isKind(ParseNodeKind::ComputedName) ||
+                     key->isKind(ParseNodeKind::BigIntExpr));
 
-          FunctionPrefixKind prefix = accessorType == AccessorType::None
-                                          ? FunctionPrefixKind::None
-                                          : accessorType == AccessorType::Getter
-                                                ? FunctionPrefixKind::Get
-                                                : FunctionPrefixKind::Set;
+          // If a function name is a BigInt, then treat it as a computed name
+          // equivalent to `[ToString(B)]` for some big-int value `B`.
+          if (key->isKind(ParseNodeKind::BigIntExpr)) {
+            MOZ_ASSERT(accessorType == AccessorType::None);
+            if (!emit1(JSOp::ToString)) {
+              return false;
+            }
+          }
+
+          FunctionPrefixKind prefix =
+              accessorType == AccessorType::None     ? FunctionPrefixKind::None
+              : accessorType == AccessorType::Getter ? FunctionPrefixKind::Get
+                                                     : FunctionPrefixKind::Set;
 
           if (!emitAnonymousFunctionWithComputedName(propVal, prefix)) {
             //      [stack] CTOR? OBJ CTOR? KEY VAL
@@ -8513,7 +8967,7 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
     if (key->isKind(ParseNodeKind::NumberExpr) ||
         key->isKind(ParseNodeKind::BigIntExpr)) {
       //            [stack] CTOR? OBJ
-      if (!pe.prepareForIndexPropKey(Some(propdef->pn_pos.begin), kind)) {
+      if (!pe.prepareForIndexPropKey(propdef->pn_pos.begin, kind)) {
         //          [stack] CTOR? OBJ CTOR?
         return false;
       }
@@ -8537,27 +8991,9 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
         return false;
       }
 
-      switch (accessorType) {
-        case AccessorType::None:
-          if (!pe.emitInitIndexProp()) {
-            //      [stack] CTOR? OBJ
-            return false;
-          }
-          break;
-        case AccessorType::Getter:
-          if (!pe.emitInitIndexGetter()) {
-            //      [stack] CTOR? OBJ
-            return false;
-          }
-          break;
-        case AccessorType::Setter:
-          if (!pe.emitInitIndexSetter()) {
-            //      [stack] CTOR? OBJ
-            return false;
-          }
-          break;
-        default:
-          MOZ_CRASH("Invalid op");
+      if (!pe.emitInitIndexOrComputed(accessorType)) {
+        //          [stack] CTOR? OBJ
+        return false;
       }
 
       continue;
@@ -8567,114 +9003,197 @@ bool BytecodeEmitter::emitPropertyList(ListNode* obj, PropertyEmitter& pe,
         key->isKind(ParseNodeKind::StringExpr)) {
       //            [stack] CTOR? OBJ
 
+      auto keyAtom = key->as<NameNode>().atom();
+
       // emitClass took care of constructor already.
       if (type == ClassBody &&
-          key->as<NameNode>().atom() == cx->names().constructor &&
+          keyAtom == TaggedParserAtomIndex::WellKnown::constructor() &&
           !propdef->as<ClassMethod>().isStatic()) {
         continue;
       }
 
-      if (!pe.prepareForPropValue(Some(propdef->pn_pos.begin), kind)) {
+      if (!pe.prepareForPropValue(propdef->pn_pos.begin, kind)) {
         //          [stack] CTOR? OBJ CTOR?
         return false;
       }
+
       if (!emitValue()) {
         //          [stack] CTOR? OBJ CTOR? VAL
         return false;
       }
 
-      RootedAtom keyAtom(cx, key->as<NameNode>().atom());
-      switch (accessorType) {
-        case AccessorType::None:
-          if (!pe.emitInitProp(keyAtom)) {
-            //      [stack] CTOR? OBJ
-            return false;
-          }
-          break;
-        case AccessorType::Getter:
-          if (!pe.emitInitGetter(keyAtom)) {
-            //      [stack] CTOR? OBJ
-            return false;
-          }
-          break;
-        case AccessorType::Setter:
-          if (!pe.emitInitSetter(keyAtom)) {
-            //      [stack] CTOR? OBJ
-            return false;
-          }
-          break;
-        default:
-          MOZ_CRASH("Invalid op");
+      if (!pe.emitInit(accessorType, keyAtom)) {
+        //          [stack] CTOR? OBJ
+        return false;
       }
 
       continue;
     }
 
-    MOZ_ASSERT(key->isKind(ParseNodeKind::ComputedName));
+    if (key->isKind(ParseNodeKind::ComputedName)) {
+      //            [stack] CTOR? OBJ
 
-    //              [stack] CTOR? OBJ
+      if (!pe.prepareForComputedPropKey(propdef->pn_pos.begin, kind)) {
+        //          [stack] CTOR? OBJ CTOR?
+        return false;
+      }
+      if (!emitTree(key->as<UnaryNode>().kid())) {
+        //          [stack] CTOR? OBJ CTOR? KEY
+        return false;
+      }
+      if (!pe.prepareForComputedPropValue()) {
+        //          [stack] CTOR? OBJ CTOR? KEY
+        return false;
+      }
+      if (!emitValue()) {
+        //          [stack] CTOR? OBJ CTOR? KEY VAL
+        return false;
+      }
 
-    if (!pe.prepareForComputedPropKey(Some(propdef->pn_pos.begin), kind)) {
-      //            [stack] CTOR? OBJ CTOR?
+      if (!pe.emitInitIndexOrComputed(accessorType)) {
+        //          [stack] CTOR? OBJ
+        return false;
+      }
+
+      continue;
+    }
+
+    MOZ_ASSERT(key->isKind(ParseNodeKind::PrivateName));
+    MOZ_ASSERT(type == ClassBody);
+
+    auto* privateName = &key->as<NameNode>();
+
+    if (kind == PropertyEmitter::Kind::Prototype) {
+      MOZ_ASSERT(accessorType == AccessorType::None);
+      if (!pe.prepareForPrivateMethod()) {
+        //          [stack] CTOR OBJ
+        return false;
+      }
+      NameOpEmitter noe(this, privateName->atom(),
+                        NameOpEmitter::Kind::SimpleAssignment);
+
+      // Ensure the NameOp emitter doesn't push an environment onto the stack,
+      // because that would change the stack location of the home object.
+      MOZ_ASSERT(noe.loc().kind() == NameLocation::Kind::FrameSlot ||
+                 noe.loc().kind() == NameLocation::Kind::EnvironmentCoordinate);
+
+      if (!noe.prepareForRhs()) {
+        //          [stack] CTOR OBJ
+        return false;
+      }
+      if (!emitValue()) {
+        //          [stack] CTOR OBJ METHOD
+        return false;
+      }
+      if (!noe.emitAssignment()) {
+        //          [stack] CTOR OBJ METHOD
+        return false;
+      }
+      if (!emit1(JSOp::Pop)) {
+        //          [stack] CTOR OBJ
+        return false;
+      }
+      if (!pe.skipInit()) {
+        //          [stack] CTOR OBJ
+        return false;
+      }
+      continue;
+    }
+
+    MOZ_ASSERT(kind == PropertyEmitter::Kind::Static);
+
+    //              [stack] CTOR OBJ
+
+    if (!pe.prepareForPrivateStaticMethod(propdef->pn_pos.begin)) {
+      //            [stack] CTOR OBJ CTOR
       return false;
     }
-    if (!emitTree(key->as<UnaryNode>().kid())) {
-      //            [stack] CTOR? OBJ CTOR? KEY
-      return false;
-    }
-    if (!pe.prepareForComputedPropValue()) {
-      //            [stack] CTOR? OBJ CTOR? KEY
+    if (!emitGetPrivateName(privateName)) {
+      //            [stack] CTOR OBJ CTOR KEY
       return false;
     }
     if (!emitValue()) {
-      //            [stack] CTOR? OBJ CTOR? KEY VAL
+      //            [stack] CTOR OBJ CTOR KEY VAL
       return false;
     }
 
-    switch (accessorType) {
-      case AccessorType::None:
-        if (!pe.emitInitComputedProp()) {
-          //        [stack] CTOR? OBJ
-          return false;
-        }
-        break;
-      case AccessorType::Getter:
-        if (!pe.emitInitComputedGetter()) {
-          //        [stack] CTOR? OBJ
-          return false;
-        }
-        break;
-      case AccessorType::Setter:
-        if (!pe.emitInitComputedSetter()) {
-          //        [stack] CTOR? OBJ
-          return false;
-        }
-        break;
-      default:
-        MOZ_CRASH("Invalid op");
+    if (!pe.emitPrivateStaticMethod(accessorType)) {
+      //            [stack] CTOR OBJ
+      return false;
+    }
+
+    if (privateName->privateNameKind() == PrivateNameKind::Setter) {
+      if (!emitDupAt(1)) {
+        //          [stack] CTOR OBJ CTOR
+        return false;
+      }
+      if (!emitGetPrivateName(privateName)) {
+        //          [stack] CTOR OBJ CTOR NAME
+        return false;
+      }
+      if (!emitAtomOp(JSOp::GetIntrinsic,
+                      TaggedParserAtomIndex::WellKnown::NoPrivateGetter())) {
+        //          [stack] CTOR OBJ CTOR NAME FUN
+        return false;
+      }
+      if (!emit1(JSOp::InitHiddenElemGetter)) {
+        //          [stack] CTOR OBJ CTOR
+        return false;
+      }
+      if (!emit1(JSOp::Pop)) {
+        //          [stack] CTOR OBJ
+        return false;
+      }
     }
   }
 
   return true;
 }
 
-bool BytecodeEmitter::emitPropertyListObjLiteral(ListNode* obj,
-                                                 ObjLiteralFlags flags) {
-  ObjLiteralCreationData data(cx);
-  data.writer().beginObject(flags);
-  bool noValues = flags.contains(ObjLiteralFlag::NoValues);
-  bool singleton = flags.contains(ObjLiteralFlag::Singleton);
+bool BytecodeEmitter::emitPropertyListObjLiteral(ListNode* obj, JSOp op,
+                                                 bool useObjLiteralValues) {
+  ObjLiteralWriter writer;
+
+#ifdef DEBUG
+  // In self-hosted JS, we check duplication only on debug build.
+  mozilla::Maybe<mozilla::HashSet<frontend::TaggedParserAtomIndex,
+                                  frontend::TaggedParserAtomIndexHasher>>
+      selfHostedPropNames;
+  if (emitterMode == BytecodeEmitter::SelfHosting) {
+    selfHostedPropNames.emplace();
+  }
+#endif
+
+  if (op == JSOp::Object) {
+    writer.beginObject(op);
+  } else {
+    MOZ_ASSERT(op == JSOp::NewObject);
+    writer.beginShape(op);
+  }
 
   for (ParseNode* propdef : obj->contents()) {
     BinaryNode* prop = &propdef->as<BinaryNode>();
     ParseNode* key = prop->left();
 
     if (key->is<NameNode>()) {
-      uint32_t propNameIndex = 0;
-      if (!data.addAtom(key->as<NameNode>().atom(), &propNameIndex)) {
-        return false;
+      if (emitterMode == BytecodeEmitter::SelfHosting) {
+        auto propName = key->as<NameNode>().atom();
+#ifdef DEBUG
+        // Self-hosted JS shouldn't contain duplicate properties.
+        auto p = selfHostedPropNames->lookupForAdd(propName);
+        MOZ_ASSERT(!p);
+        if (!selfHostedPropNames->add(p, propName)) {
+          js::ReportOutOfMemory(cx);
+          return false;
+        }
+#endif
+        writer.setPropNameNoDuplicateCheck(parserAtoms(), propName);
+      } else {
+        if (!writer.setPropName(cx, parserAtoms(),
+                                key->as<NameNode>().atom())) {
+          return false;
+        }
       }
-      data.writer().setPropName(propNameIndex);
     } else {
       double numValue = key->as<NumericLiteral>().value();
       int32_t i = 0;
@@ -8683,32 +9202,42 @@ bool BytecodeEmitter::emitPropertyListObjLiteral(ListNode* obj,
       MOZ_ASSERT(numIsInt);
       MOZ_ASSERT(
           ObjLiteralWriter::arrayIndexInRange(i));  // checked previously.
-      data.writer().setPropIndex(i);
+
+      // Ignore indexed properties if we're not storing property values, and
+      // rely on InitElem ops to define those. These properties will be either
+      // dense elements (not possible to represent in the literal's shape) or
+      // sparse elements (enumerated separately, so this doesn't affect property
+      // iteration order).
+      if (!useObjLiteralValues) {
+        continue;
+      }
+
+      writer.setPropIndex(i);
     }
 
-    if (noValues) {
-      if (!data.writer().propWithUndefinedValue()) {
+    if (useObjLiteralValues) {
+      MOZ_ASSERT(op == JSOp::Object);
+      ParseNode* value = prop->right();
+      if (!emitObjLiteralValue(writer, value)) {
         return false;
       }
     } else {
-      ParseNode* value = prop->right();
-      if (!emitObjLiteralValue(&data, value)) {
+      if (!writer.propWithUndefinedValue(cx)) {
         return false;
       }
     }
   }
 
-  uint32_t gcThingIndex = 0;
-  if (!perScriptData().gcThingList().append(std::move(data), &gcThingIndex)) {
+  GCThingIndex index;
+  if (!addObjLiteralData(writer, &index)) {
     return false;
   }
 
-  bool isInnerSingleton = flags.contains(ObjLiteralFlag::IsInnerSingleton);
+  // JSOp::Object may only be used by (top-level) run-once scripts.
+  MOZ_ASSERT_IF(op == JSOp::Object,
+                sc->isTopLevelContext() && sc->treatAsRunOnce());
 
-  JSOp op = singleton
-                ? JSOp::Object
-                : isInnerSingleton ? JSOp::NewObjectWithGroup : JSOp::NewObject;
-  if (!emitIndexOp(op, gcThingIndex)) {
+  if (!emitGCIndexOp(op, index)) {
     //              [stack] OBJ
     return false;
   }
@@ -8718,13 +9247,13 @@ bool BytecodeEmitter::emitPropertyListObjLiteral(ListNode* obj,
 
 bool BytecodeEmitter::emitDestructuringRestExclusionSetObjLiteral(
     ListNode* pattern) {
-  // Use |NoValues| to keep the flags consistent with their usage for normal
-  // object literal creation, where |NoValues| is always used in conjunction
-  // with |NewObject|.
-  ObjLiteralFlags flags{ObjLiteralFlag::NoValues};
+  // Note: if we want to squeeze out a little more performance, we could switch
+  // to the `JSOp::Object` opcode, because the exclusion set object is never
+  // exposed to the user, so it's safe to bake the object into the bytecode.
+  constexpr JSOp op = JSOp::NewObject;
 
-  ObjLiteralCreationData data(cx);
-  data.writer().beginObject(flags);
+  ObjLiteralWriter writer;
+  writer.beginShape(op);
 
   for (ParseNode* member : pattern->contents()) {
     if (member->isKind(ParseNodeKind::Spread)) {
@@ -8732,36 +9261,29 @@ bool BytecodeEmitter::emitDestructuringRestExclusionSetObjLiteral(
       break;
     }
 
-    JSAtom* atom;
+    TaggedParserAtomIndex atom;
     if (member->isKind(ParseNodeKind::MutateProto)) {
-      atom = cx->names().proto;
+      atom = TaggedParserAtomIndex::WellKnown::proto();
     } else {
       ParseNode* key = member->as<BinaryNode>().left();
       atom = key->as<NameNode>().atom();
     }
 
-    uint32_t propNameIndex = 0;
-    if (!data.addAtom(atom, &propNameIndex)) {
+    if (!writer.setPropName(cx, parserAtoms(), atom)) {
       return false;
     }
-    data.writer().setPropName(propNameIndex);
 
-    if (!data.writer().propWithUndefinedValue()) {
+    if (!writer.propWithUndefinedValue(cx)) {
       return false;
     }
   }
 
-  uint32_t gcThingIndex = 0;
-  if (!perScriptData().gcThingList().append(std::move(data), &gcThingIndex)) {
+  GCThingIndex index;
+  if (!addObjLiteralData(writer, &index)) {
     return false;
   }
 
-  // If we want to squeeze out a little more performance, we could switch to the
-  // `JSOp::Object` opcode, because the exclusion set object is never exposed to
-  // the user, so it's safe to bake the object into the bytecode. But first we
-  // need to make sure this won't interfere with XDR, cf. the
-  // `RealmBehaviors::singletonsAsTemplates_` flag.
-  if (!emitIndexOp(JSOp::NewObject, gcThingIndex)) {
+  if (!emitGCIndexOp(op, index)) {
     //              [stack] OBJ
     return false;
   }
@@ -8769,29 +9291,27 @@ bool BytecodeEmitter::emitDestructuringRestExclusionSetObjLiteral(
   return true;
 }
 
-bool BytecodeEmitter::emitObjLiteralArray(ParseNode* arrayHead, bool isCow) {
-  ObjLiteralCreationData data(cx);
-  ObjLiteralFlags flags(ObjLiteralFlag::Array);
-  if (isCow) {
-    flags += ObjLiteralFlag::ArrayCOW;
-  }
-  data.writer().beginObject(flags);
+bool BytecodeEmitter::emitObjLiteralArray(ParseNode* arrayHead) {
+  MOZ_ASSERT(checkSingletonContext());
 
-  uint32_t index = 0;
-  data.writer().beginDenseArrayElements();
-  for (ParseNode* elem = arrayHead; elem; elem = elem->pn_next, index++) {
-    if (!emitObjLiteralValue(&data, elem)) {
+  constexpr JSOp op = JSOp::Object;
+
+  ObjLiteralWriter writer;
+  writer.beginArray(op);
+
+  writer.beginDenseArrayElements();
+  for (ParseNode* elem = arrayHead; elem; elem = elem->pn_next) {
+    if (!emitObjLiteralValue(writer, elem)) {
       return false;
     }
   }
 
-  uint32_t gcThingIndex = 0;
-  if (!perScriptData().gcThingList().append(std::move(data), &gcThingIndex)) {
+  GCThingIndex index;
+  if (!addObjLiteralData(writer, &index)) {
     return false;
   }
 
-  JSOp op = isCow ? JSOp::NewArrayCopyOnWrite : JSOp::Object;
-  if (!emitIndexOp(op, gcThingIndex)) {
+  if (!emitGCIndexOp(op, index)) {
     //              [stack] OBJ
     return false;
   }
@@ -8809,7 +9329,7 @@ bool BytecodeEmitter::isRHSObjLiteralCompatible(ParseNode* value) {
          value->isKind(ParseNodeKind::TemplateStringExpr);
 }
 
-bool BytecodeEmitter::emitObjLiteralValue(ObjLiteralCreationData* data,
+bool BytecodeEmitter::emitObjLiteralValue(ObjLiteralWriter& writer,
                                           ParseNode* value) {
   MOZ_ASSERT(isRHSObjLiteralCompatible(value));
   if (value->isKind(ParseNodeKind::NumberExpr)) {
@@ -8821,32 +9341,29 @@ bool BytecodeEmitter::emitObjLiteralValue(ObjLiteralCreationData* data,
     } else {
       v.setDouble(numValue);
     }
-    if (!data->writer().propWithConstNumericValue(v)) {
+    if (!writer.propWithConstNumericValue(cx, v)) {
       return false;
     }
   } else if (value->isKind(ParseNodeKind::TrueExpr)) {
-    if (!data->writer().propWithTrueValue()) {
+    if (!writer.propWithTrueValue(cx)) {
       return false;
     }
   } else if (value->isKind(ParseNodeKind::FalseExpr)) {
-    if (!data->writer().propWithFalseValue()) {
+    if (!writer.propWithFalseValue(cx)) {
       return false;
     }
   } else if (value->isKind(ParseNodeKind::NullExpr)) {
-    if (!data->writer().propWithNullValue()) {
+    if (!writer.propWithNullValue(cx)) {
       return false;
     }
   } else if (value->isKind(ParseNodeKind::RawUndefinedExpr)) {
-    if (!data->writer().propWithUndefinedValue()) {
+    if (!writer.propWithUndefinedValue(cx)) {
       return false;
     }
   } else if (value->isKind(ParseNodeKind::StringExpr) ||
              value->isKind(ParseNodeKind::TemplateStringExpr)) {
-    uint32_t valueAtomIndex = 0;
-    if (!data->addAtom(value->as<NameNode>().atom(), &valueAtomIndex)) {
-      return false;
-    }
-    if (!data->writer().propWithAtomValue(valueAtomIndex)) {
+    if (!writer.propWithAtomValue(cx, parserAtoms(),
+                                  value->as<NameNode>().atom())) {
       return false;
     }
   } else {
@@ -8855,22 +9372,37 @@ bool BytecodeEmitter::emitObjLiteralValue(ObjLiteralCreationData* data,
   return true;
 }
 
-mozilla::Maybe<FieldInitializers> BytecodeEmitter::setupFieldInitializers(
+static bool NeedsPrivateBrand(ParseNode* member) {
+  return member->is<ClassMethod>() &&
+         member->as<ClassMethod>().name().isKind(ParseNodeKind::PrivateName) &&
+         !member->as<ClassMethod>().isStatic();
+}
+
+mozilla::Maybe<MemberInitializers> BytecodeEmitter::setupMemberInitializers(
     ListNode* classMembers, FieldPlacement placement) {
   bool isStatic = placement == FieldPlacement::Static;
-  auto isClassField = [isStatic](ParseNode* propdef) {
-    return propdef->is<ClassField>() &&
-           propdef->as<ClassField>().isStatic() == isStatic;
-  };
 
-  size_t numFields =
-      std::count_if(classMembers->contents().begin(),
-                    classMembers->contents().end(), isClassField);
+  size_t numFields = 0;
+  size_t numPrivateInitializers = 0;
+  bool hasPrivateBrand = false;
+  for (ParseNode* member : classMembers->contents()) {
+    if (NeedsFieldInitializer(member, isStatic)) {
+      numFields++;
+    } else if (NeedsAccessorInitializer(member, isStatic)) {
+      numPrivateInitializers++;
+      hasPrivateBrand = true;
+    } else if (NeedsPrivateBrand(member)) {
+      hasPrivateBrand = true;
+    }
+  }
+
   // If there are more initializers than can be represented, return invalid.
-  if (numFields > FieldInitializers::MaxInitializers) {
+  if (numFields + numPrivateInitializers >
+      MemberInitializers::MaxInitializers) {
     return Nothing();
   }
-  return Some(FieldInitializers(numFields));
+  return Some(
+      MemberInitializers(hasPrivateBrand, numFields + numPrivateInitializers));
 }
 
 // Purpose of .fieldKeys:
@@ -8913,9 +9445,9 @@ bool BytecodeEmitter::emitCreateFieldKeys(ListNode* obj,
     return true;
   }
 
-  auto fieldKeysName =
-      isStatic ? &JSAtomState::dotStaticFieldKeys : &JSAtomState::dotFieldKeys;
-  HandlePropertyName fieldKeys = cx->names().*fieldKeysName;
+  auto fieldKeys = isStatic
+                       ? TaggedParserAtomIndex::WellKnown::dotStaticFieldKeys()
+                       : TaggedParserAtomIndex::WellKnown::dotFieldKeys();
   NameOpEmitter noe(this, fieldKeys, NameOpEmitter::Kind::Initialize);
   if (!noe.prepareForRhs()) {
     return false;
@@ -8939,44 +9471,66 @@ bool BytecodeEmitter::emitCreateFieldKeys(ListNode* obj,
   return true;
 }
 
-bool BytecodeEmitter::emitCreateFieldInitializers(ClassEmitter& ce,
-                                                  ListNode* obj,
-                                                  FieldPlacement placement) {
+static bool HasInitializer(ParseNode* node, bool isStaticContext) {
+  return (node->is<ClassField>() &&
+          node->as<ClassField>().isStatic() == isStaticContext) ||
+         (isStaticContext && node->is<StaticClassBlock>());
+}
+
+static FunctionNode* GetInitializer(ParseNode* node, bool isStaticContext) {
+  MOZ_ASSERT(HasInitializer(node, isStaticContext));
+  MOZ_ASSERT_IF(!node->is<ClassField>(), isStaticContext);
+  return node->is<ClassField>() ? node->as<ClassField>().initializer()
+                                : node->as<StaticClassBlock>().function();
+}
+
+bool BytecodeEmitter::emitCreateMemberInitializers(ClassEmitter& ce,
+                                                   ListNode* obj,
+                                                   FieldPlacement placement) {
   // FieldPlacement::Instance
   //                [stack] HOMEOBJ HERITAGE?
   //
   // FieldPlacement::Static
   //                [stack] CTOR HOMEOBJ
-  mozilla::Maybe<FieldInitializers> fieldInitializers =
-      setupFieldInitializers(obj, placement);
-  if (!fieldInitializers) {
+  mozilla::Maybe<MemberInitializers> memberInitializers =
+      setupMemberInitializers(obj, placement);
+  if (!memberInitializers) {
     ReportAllocationOverflow(cx);
     return false;
   }
-  size_t numFields = fieldInitializers->numFieldInitializers;
 
-  if (numFields == 0) {
+  size_t numInitializers = memberInitializers->numMemberInitializers;
+  if (numInitializers == 0) {
     return true;
   }
 
   bool isStatic = placement == FieldPlacement::Static;
-  if (!ce.prepareForFieldInitializers(numFields, isStatic)) {
+  if (!ce.prepareForMemberInitializers(numInitializers, isStatic)) {
     //              [stack] HOMEOBJ HERITAGE? ARRAY
     // or:
     //              [stack] CTOR HOMEOBJ ARRAY
     return false;
   }
 
-  for (ParseNode* propdef : obj->contents()) {
-    if (!propdef->is<ClassField>()) {
-      continue;
+  // Private accessors could be used in the field initializers, so make sure
+  // accessor initializers appear earlier in the .initializers array so they
+  // run first. Static private methods are not initialized using initializers
+  // (emitPropertyList emits bytecode to stamp them onto the constructor), so
+  // skip this step if isStatic.
+  if (!isStatic) {
+    if (!emitPrivateMethodInitializers(ce, obj)) {
+      return false;
     }
-    if (propdef->as<ClassField>().isStatic() != isStatic) {
+  }
+
+  for (ParseNode* propdef : obj->contents()) {
+    if (!HasInitializer(propdef, isStatic)) {
       continue;
     }
 
-    FunctionNode* initializer = propdef->as<ClassField>().initializer();
-    if (!ce.prepareForFieldInitializer()) {
+    FunctionNode* initializer = GetInitializer(propdef, isStatic);
+
+    if (!ce.prepareForMemberInitializer()) {
       return false;
     }
     if (!emitTree(initializer)) {
@@ -8987,14 +9541,14 @@ bool BytecodeEmitter::emitCreateFieldInitializers(ClassEmitter& ce,
     }
     if (initializer->funbox()->needsHomeObject()) {
       MOZ_ASSERT(initializer->funbox()->allowSuperProperty());
-      if (!ce.emitFieldInitializerHomeObject(isStatic)) {
+      if (!ce.emitMemberInitializerHomeObject(isStatic)) {
         //          [stack] HOMEOBJ HERITAGE? ARRAY LAMBDA
         // or:
         //          [stack] CTOR HOMEOBJ ARRAY LAMBDA
         return false;
       }
     }
-    if (!ce.emitStoreFieldInitializer()) {
+    if (!ce.emitStoreMemberInitializer()) {
       //            [stack] HOMEOBJ HERITAGE? ARRAY
       // or:
       //            [stack] CTOR HOMEOBJ ARRAY
@@ -9002,7 +9556,7 @@ bool BytecodeEmitter::emitCreateFieldInitializers(ClassEmitter& ce,
     }
   }
 
-  if (!ce.emitFieldInitializersEnd()) {
+  if (!ce.emitMemberInitializersEnd()) {
     //              [stack] HOMEOBJ HERITAGE?
     // or:
     //              [stack] CTOR HOMEOBJ
@@ -9012,7 +9566,208 @@ bool BytecodeEmitter::emitCreateFieldInitializers(ClassEmitter& ce,
   return true;
 }
 
-const FieldInitializers& BytecodeEmitter::findFieldInitializersForCall() {
+static bool IsPrivateInstanceAccessor(const ClassMethod* classMethod) {
+  return !classMethod->isStatic() &&
+         classMethod->name().isKind(ParseNodeKind::PrivateName) &&
+         classMethod->accessorType() != AccessorType::None;
+}
+
+bool BytecodeEmitter::emitPrivateMethodInitializers(ClassEmitter& ce,
+                                                    ListNode* obj) {
+  for (ParseNode* propdef : obj->contents()) {
+    if (!propdef->is<ClassMethod>()) {
+      continue;
+    }
+    auto* classMethod = &propdef->as<ClassMethod>();
+
+    // Skip over anything which isn't a private instance accessor.
+    if (!IsPrivateInstanceAccessor(classMethod)) {
+      continue;
+    }
+
+    if (!ce.prepareForMemberInitializer()) {
+      //            [stack] HOMEOBJ HERITAGE? ARRAY
+      // or:
+      //            [stack] CTOR HOMEOBJ ARRAY
+      return false;
+    }
+
+    // Synthesize a name for the lexical variable that will store the
+    // private method body.
+    TaggedParserAtomIndex name = classMethod->name().as<NameNode>().atom();
+    AccessorType accessorType = classMethod->accessorType();
+    StringBuffer storedMethodName(cx);
+    if (!storedMethodName.append(parserAtoms(), name)) {
+      return false;
+    }
+    if (!storedMethodName.append(
+            accessorType == AccessorType::Getter ? ".getter" : ".setter")) {
+      return false;
+    }
+    auto storedMethodAtom = storedMethodName.finishParserAtom(parserAtoms());
+
+    // Emit the private method body and store it as a lexical var.
+    if (!emitFunction(&classMethod->method())) {
+      //            [stack] HOMEOBJ HERITAGE? ARRAY METHOD
+      // or:
+      //            [stack] CTOR HOMEOBJ ARRAY METHOD
+      return false;
+    }
+    // The private method body needs to access the home object,
+    // and the CE knows where that is on the stack.
+    if (classMethod->method().funbox()->needsHomeObject()) {
+      if (!ce.emitMemberInitializerHomeObject(false)) {
+        //          [stack] HOMEOBJ HERITAGE? ARRAY METHOD
+        // or:
+        //          [stack] CTOR HOMEOBJ ARRAY METHOD
+        return false;
+      }
+    }
+    if (!emitLexicalInitialization(storedMethodAtom)) {
+      //            [stack] HOMEOBJ HERITAGE? ARRAY METHOD
+      // or:
+      //            [stack] CTOR HOMEOBJ ARRAY METHOD
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      //            [stack] HOMEOBJ HERITAGE? ARRAY
+      // or:
+      //            [stack] CTOR HOMEOBJ ARRAY
+      return false;
+    }
+
+    if (!emitPrivateMethodInitializer(classMethod, storedMethodAtom)) {
+      //            [stack] HOMEOBJ HERITAGE? ARRAY
+      // or:
+      //            [stack] CTOR HOMEOBJ ARRAY
+      return false;
+    }
+
+    // Store the emitted initializer function into the .initializers array.
+    if (!ce.emitStoreMemberInitializer()) {
+      //            [stack] HOMEOBJ HERITAGE? ARRAY
+      // or:
+      //            [stack] CTOR HOMEOBJ ARRAY
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitPrivateMethodInitializer(
+    ClassMethod* classMethod, TaggedParserAtomIndex storedMethodAtom) {
+  MOZ_ASSERT(IsPrivateInstanceAccessor(classMethod));
+
+  auto* name = &classMethod->name().as<NameNode>();
+
+  // Emit the synthesized initializer function.
+  FunctionNode* funNode = classMethod->initializerIfPrivate();
+  MOZ_ASSERT(funNode);
+  FunctionBox* funbox = funNode->funbox();
+  FunctionEmitter fe(this, funbox, funNode->syntaxKind(),
+                     FunctionEmitter::IsHoisted::No);
+  if (!fe.prepareForNonLazy()) {
+    //              [stack]
+    return false;
+  }
+
+  BytecodeEmitter bce2(this, parser, funbox, compilationState, emitterMode);
+  if (!bce2.init(funNode->pn_pos)) {
+    return false;
+  }
+  ListNode* paramsBody = &funNode->body()->as<ListNode>();
+  FunctionScriptEmitter fse(&bce2, funbox, Nothing(), Nothing());
+  if (!fse.prepareForParameters()) {
+    //              [stack]
+    return false;
+  }
+  if (!bce2.emitFunctionFormalParameters(paramsBody)) {
+    //              [stack]
+    return false;
+  }
+  if (!fse.prepareForBody()) {
+    //              [stack]
+    return false;
+  }
+
+  if (!bce2.emit1(JSOp::FunctionThis)) {
+    //              [stack] THIS
+    return false;
+  }
+  if (!bce2.emitGetPrivateName(name)) {
+    //              [stack] THIS NAME
+    return false;
+  }
+  if (!bce2.emitGetName(storedMethodAtom)) {
+    //              [stack] THIS NAME METHOD
+    return false;
+  }
+
+  switch (name->privateNameKind()) {
+    case PrivateNameKind::Setter:
+      if (!bce2.emit1(JSOp::InitHiddenElemSetter)) {
+        //          [stack] THIS
+        return false;
+      }
+      if (!bce2.emitGetPrivateName(name)) {
+        //          [stack] THIS NAME
+        return false;
+      }
+      if (!bce2.emitAtomOp(
+              JSOp::GetIntrinsic,
+              TaggedParserAtomIndex::WellKnown::NoPrivateGetter())) {
+        //          [stack] THIS NAME FUN
+        return false;
+      }
+      if (!bce2.emit1(JSOp::InitHiddenElemGetter)) {
+        //          [stack] THIS
+        return false;
+      }
+      break;
+    case PrivateNameKind::Getter:
+    case PrivateNameKind::GetterSetter:
+      if (classMethod->accessorType() == AccessorType::Getter) {
+        if (!bce2.emit1(JSOp::InitHiddenElemGetter)) {
+          //        [stack] THIS
+          return false;
+        }
+      } else {
+        if (!bce2.emit1(JSOp::InitHiddenElemSetter)) {
+          //        [stack] THIS
+          return false;
+        }
+      }
+      break;
+    default:
+      MOZ_CRASH("Invalid op");
+  }
+
+  // Pop remaining THIS.
+  if (!bce2.emit1(JSOp::Pop)) {
+    //              [stack]
+    return false;
+  }
+
+  if (!fse.emitEndBody()) {
+    //              [stack]
+    return false;
+  }
+  if (!fse.intoStencil()) {
+    return false;
+  }
+
+  if (!fe.emitNonLazyEnd()) {
+    //              [stack] HOMEOBJ HERITAGE? ARRAY FUN
+    // or:
+    //              [stack] CTOR HOMEOBJ ARRAY FUN
+    return false;
+  }
+
+  return true;
+}
+
+const MemberInitializers& BytecodeEmitter::findMemberInitializersForCall() {
   for (BytecodeEmitter* current = this; current; current = current->parent) {
     if (current->sc->isFunctionBox()) {
       FunctionBox* funbox = current->sc->asFunctionBox();
@@ -9025,30 +9780,68 @@ const FieldInitializers& BytecodeEmitter::findFieldInitializersForCall() {
       // expect fields in the first place.
       MOZ_RELEASE_ASSERT(funbox->isClassConstructor());
 
-      MOZ_ASSERT(funbox->fieldInitializers->valid);
-      return *funbox->fieldInitializers;
+      return funbox->useMemberInitializers() ? funbox->memberInitializers()
+                                             : MemberInitializers::Empty();
     }
   }
 
-  MOZ_RELEASE_ASSERT(compilationInfo.scopeContext.fieldInitializers);
-  return *compilationInfo.scopeContext.fieldInitializers;
+  MOZ_RELEASE_ASSERT(compilationState.scopeContext.memberInitializers);
+  return *compilationState.scopeContext.memberInitializers;
 }
 
-bool BytecodeEmitter::emitInitializeInstanceFields() {
-  const FieldInitializers& fieldInitializers = findFieldInitializersForCall();
-  size_t numFields = fieldInitializers.numFieldInitializers;
+bool BytecodeEmitter::emitInitializeInstanceMembers(
+    bool isDerivedClassConstructor) {
+  const MemberInitializers& memberInitializers =
+      findMemberInitializersForCall();
+  MOZ_ASSERT(memberInitializers.valid);
 
-  if (numFields == 0) {
+  if (memberInitializers.hasPrivateBrand) {
+    // This is guaranteed to run after super(), so we don't need TDZ checks.
+    if (!emitGetName(TaggedParserAtomIndex::WellKnown::dotThis())) {
+      //            [stack] THIS
+      return false;
+    }
+    if (!emitGetName(TaggedParserAtomIndex::WellKnown::dotPrivateBrand())) {
+      //            [stack] THIS BRAND
+      return false;
+    }
+    if (isDerivedClassConstructor) {
+      if (!emitCheckPrivateField(ThrowCondition::ThrowHas,
+                                 ThrowMsgKind::PrivateBrandDoubleInit)) {
+        //          [stack] THIS BRAND BOOL
+        return false;
+      }
+      if (!emit1(JSOp::Pop)) {
+        //          [stack] THIS BRAND
+        return false;
+      }
+    }
+    if (!emit1(JSOp::Null)) {
+      //            [stack] THIS BRAND NULL
+      return false;
+    }
+    if (!emit1(JSOp::InitHiddenElem)) {
+      //            [stack] THIS
+      return false;
+    }
+    if (!emit1(JSOp::Pop)) {
+      //            [stack]
+      return false;
+    }
+  }
+
+  size_t numInitializers = memberInitializers.numMemberInitializers;
+  if (numInitializers == 0) {
     return true;
   }
 
-  if (!emitGetName(cx->names().dotInitializers)) {
+  if (!emitGetName(TaggedParserAtomIndex::WellKnown::dotInitializers())) {
     //              [stack] ARRAY
     return false;
   }
 
-  for (size_t fieldIndex = 0; fieldIndex < numFields; fieldIndex++) {
-    if (fieldIndex < numFields - 1) {
+  for (size_t index = 0; index < numInitializers; index++) {
+    if (index < numInitializers - 1) {
       // We Dup to keep the array around (it is consumed in the bytecode
       // below) for next iterations of this loop, except for the last
       // iteration, which avoids an extra Pop at the end of the loop.
@@ -9058,21 +9851,18 @@ bool BytecodeEmitter::emitInitializeInstanceFields() {
       }
     }
 
-    if (!emitNumberOp(fieldIndex)) {
+    if (!emitNumberOp(index)) {
       //            [stack] ARRAY? ARRAY INDEX
       return false;
     }
 
-    // Don't use CallElem here, because the receiver of the call != the
-    // receiver of this getelem. (Specifically, the call receiver is `this`,
-    // and the receiver of this getelem is `.initializers`)
     if (!emit1(JSOp::GetElem)) {
       //            [stack] ARRAY? FUNC
       return false;
     }
 
     // This is guaranteed to run after super(), so we don't need TDZ checks.
-    if (!emitGetName(cx->names().dotThis)) {
+    if (!emitGetName(TaggedParserAtomIndex::WellKnown::dotThis())) {
       //            [stack] ARRAY? FUNC THIS
       return false;
     }
@@ -9093,7 +9883,7 @@ bool BytecodeEmitter::emitInitializeInstanceFields() {
 
 bool BytecodeEmitter::emitInitializeStaticFields(ListNode* classMembers) {
   auto isStaticField = [](ParseNode* propdef) {
-    return propdef->is<ClassField>() && propdef->as<ClassField>().isStatic();
+    return HasInitializer(propdef, true);
   };
   size_t numFields =
       std::count_if(classMembers->contents().begin(),
@@ -9103,7 +9893,7 @@ bool BytecodeEmitter::emitInitializeStaticFields(ListNode* classMembers) {
     return true;
   }
 
-  if (!emitGetName(cx->names().dotStaticInitializers)) {
+  if (!emitGetName(TaggedParserAtomIndex::WellKnown::dotStaticInitializers())) {
     //              [stack] CTOR ARRAY
     return false;
   }
@@ -9125,9 +9915,6 @@ bool BytecodeEmitter::emitInitializeStaticFields(ListNode* classMembers) {
       return false;
     }
 
-    // Don't use CallElem here, because the receiver of the call != the receiver
-    // of this getelem. (Specifically, the call receiver is `ctor`, and the
-    // receiver of this getelem is `.staticInitializers`)
     if (!emit1(JSOp::GetElem)) {
       //            [stack] CTOR ARRAY? FUNC
       return false;
@@ -9151,7 +9938,7 @@ bool BytecodeEmitter::emitInitializeStaticFields(ListNode* classMembers) {
 
   // Overwrite |.staticInitializers| and |.staticFieldKeys| with undefined to
   // avoid keeping the arrays alive indefinitely.
-  auto clearStaticFieldSlot = [&](HandlePropertyName name) {
+  auto clearStaticFieldSlot = [&](TaggedParserAtomIndex name) {
     NameOpEmitter noe(this, name, NameOpEmitter::Kind::SimpleAssignment);
     if (!noe.prepareForRhs()) {
       //            [stack] ENV? VAL?
@@ -9176,7 +9963,8 @@ bool BytecodeEmitter::emitInitializeStaticFields(ListNode* classMembers) {
     return true;
   };
 
-  if (!clearStaticFieldSlot(cx->names().dotStaticInitializers)) {
+  if (!clearStaticFieldSlot(
+          TaggedParserAtomIndex::WellKnown::dotStaticInitializers())) {
     return false;
   }
 
@@ -9189,7 +9977,8 @@ bool BytecodeEmitter::emitInitializeStaticFields(ListNode* classMembers) {
   if (std::any_of(classMembers->contents().begin(),
                   classMembers->contents().end(),
                   isStaticFieldWithComputedName)) {
-    if (!clearStaticFieldSlot(cx->names().dotStaticFieldKeys)) {
+    if (!clearStaticFieldSlot(
+            TaggedParserAtomIndex::WellKnown::dotStaticFieldKeys())) {
       return false;
     }
   }
@@ -9199,19 +9988,15 @@ bool BytecodeEmitter::emitInitializeStaticFields(ListNode* classMembers) {
 
 // Using MOZ_NEVER_INLINE in here is a workaround for llvm.org/pr14047. See
 // the comment on emitSwitch.
-MOZ_NEVER_INLINE bool BytecodeEmitter::emitObject(ListNode* objNode,
-                                                  bool isInner) {
-  bool isSingletonContext = !objNode->hasNonConstInitializer() &&
-                            objNode->head() && checkSingletonContext();
-
-  // Note: this method uses the ObjLiteralWriter and emits
-  // ObjLiteralCreationData objects into the GCThingList, which will evaluate
-  // them into real GC objects during JSScript::fullyInitFromEmitter.
-  // Eventually we want OBJLITERAL to be a real opcode, but for now,
-  // performance constraints limit us to evaluating object literals at the end
-  // of parse, when we're allowed to allocate GC things.
+MOZ_NEVER_INLINE bool BytecodeEmitter::emitObject(ListNode* objNode) {
+  // Note: this method uses the ObjLiteralWriter and emits ObjLiteralStencil
+  // objects into the GCThingList, which will evaluate them into real GC objects
+  // or shapes during JSScript::fullyInitFromEmitter. Eventually we want
+  // OBJLITERAL to be a real opcode, but for now, performance constraints limit
+  // us to evaluating object literals at the end of parse, when we're allowed to
+  // allocate GC things.
   //
-  // There are three cases here, in descending order of preference:
+  // There are four cases here, in descending order of preference:
   //
   // 1. The list of property names is "normal" and constant (no computed
   //    values, no integer indices), the values are all simple constants
@@ -9221,17 +10006,22 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitObject(ListNode* objNode,
   //    attached to a JSOp::Object opcode, whose semantics are for the backend
   //    to simply steal the object from the script.
   //
-  // 2. The list of property names is "normal" and constant as above, but some
-  //    values are complex (computed expressions, sub-objects, functions,
-  //    etc.), or else this occurs in a non-run-once (non-singleton) context.
-  //    In this case, we can use the ObjLiteral functionality to describe an
-  //    *empty* object (all values left undefined) with the right fields, which
-  //    will become a JSOp::NewObject opcode using this template object to speed
-  //    the creation of the object each time it executes (stealing its shape,
-  //    etc.). The emitted bytecode still needs InitProp ops to set the values
-  //    in this case.
+  // 2. The list of property names is "normal" and constant as above, *and* this
+  //    occurs in a run-once (singleton) context, but some values are complex
+  //    (computed expressions, sub-objects, functions, etc.). In this case, we
+  //    can still use JSOp::Object (because singleton context), but the object
+  //    has |undefined| property values and InitProp ops are emitted to set the
+  //    values.
   //
-  // 3. Any other case. As a fallback, we use NewInit to create a new, empty
+  // 3. The list of property names is "normal" and constant as above, but this
+  //    occurs in a non-run-once (non-singleton) context. In this case, we can
+  //    use the ObjLiteral functionality to describe an *empty* object (all
+  //    values left undefined) with the right fields, which will become a
+  //    JSOp::NewObject opcode using the object's shape to speed up the creation
+  //    of the object each time it executes. The emitted bytecode still needs
+  //    InitProp ops to set the values in this case.
+  //
+  // 4. Any other case. As a fallback, we use NewInit to create a new, empty
   //    object (i.e., `{}`) and then emit bytecode to initialize its properties
   //    one-by-one.
 
@@ -9240,75 +10030,55 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitObject(ListNode* objNode,
   isPropertyListObjLiteralCompatible(objNode, &useObjLiteralValues,
                                      &useObjLiteral);
 
-  // We can't rely on the ObjLiteral-constructed object's values to be used if
-  // we're only using ObjLiteral to build a template for JSOp::NewObject instead
-  // of JSOp::Object. This is the case either when we're not in singleton
-  // context, or when we are but we're treating it as non-singleton (see other
-  // comments related to isInner).
-  if (!isSingletonContext || isInner) {
-    useObjLiteralValues = false;
-  }
-
   //                [stack]
   //
   ObjectEmitter oe(this);
   if (useObjLiteral) {
-    // The flags here determine how the object is eventually constructed. The
-    // rules below are made to *exactly match* the frontend/parser behavior
-    // before the ObjLiteral functionality was added. Be very, very careful
-    // changing these rules: any deviation is bound to cause a regression in
-    // some benchmark that depends on the way the object groups are created. Do
-    // not change without running (at least) Speedometer, Octane, Kraken, TP6,
-    // and AWSY tests.
-    ObjLiteralFlags flags;
-    if (isSingletonContext) {
-      // Use `ObjectGroup::newPlainObject` rather than
-      // `NewPlainObjectWithProperties`.
-      flags += ObjLiteralFlag::SpecificGroup;
-      if (!isInner) {
-        flags += ObjLiteralFlag::Singleton;
-      }
-    }
-    if (!useObjLiteralValues) {
-      flags += ObjLiteralFlag::NoValues;
-    }
-    if (isInner) {
-      flags += ObjLiteralFlag::IsInnerSingleton;
+    bool singleton = checkSingletonContext() &&
+                     !objNode->hasNonConstInitializer() && objNode->head();
+    JSOp op;
+    if (singleton) {
+      // Case 1 or 2.
+      op = JSOp::Object;
+    } else {
+      // Case 3.
+      useObjLiteralValues = false;
+      op = JSOp::NewObject;
     }
 
     // Use an ObjLiteral op. This will record ObjLiteral insns in the
     // objLiteralWriter's buffer and add a fixup to the list of ObjLiteral
-    // fixups so that at GC-publish time at the end of parse, the full (case 1)
-    // or template-without-values (case 2) object can be allocated and the
-    // bytecode can be patched to refer to it.
-    if (!emitPropertyListObjLiteral(objNode, flags)) {
-      //              [stack] OBJ
+    // fixups so that at GC-publish time at the end of parse, the full object
+    // (case 1 or 2) or shape (case 3) can be allocated and the bytecode can be
+    // patched to refer to it.
+    if (!emitPropertyListObjLiteral(objNode, op, useObjLiteralValues)) {
+      //            [stack] OBJ
       return false;
     }
     // Put the ObjectEmitter in the right state. This tells it that there will
     // already be an object on the stack as a result of the (eventual)
     // NewObject or Object op, and prepares it to emit values if needed.
     if (!oe.emitObjectWithTemplateOnStack()) {
-      //              [stack] OBJ
+      //            [stack] OBJ
       return false;
     }
     if (!useObjLiteralValues) {
-      // Case 2 above: the ObjLiteral only created a template object. We still
-      // need to emit bytecode to fill in its values.
-      if (!emitPropertyList(objNode, oe, ObjectLiteral,
-                            /* isInner = */ true)) {
-        //              [stack] OBJ
+      // Case 2 or 3 above: we still need to emit bytecode to fill in the
+      // object's property values.
+      if (!emitPropertyList(objNode, oe, ObjectLiteral)) {
+        //          [stack] OBJ
         return false;
       }
     }
   } else {
-    // No ObjLiteral use, just bytecode to build the object from scratch.
+    // Case 4 above: no ObjLiteral use, just bytecode to build the object from
+    // scratch.
     if (!oe.emitObject(objNode->count())) {
-      //              [stack] OBJ
+      //            [stack] OBJ
       return false;
     }
     if (!emitPropertyList(objNode, oe, ObjectLiteral)) {
-      //              [stack] OBJ
+      //            [stack] OBJ
       return false;
     }
   }
@@ -9322,30 +10092,17 @@ MOZ_NEVER_INLINE bool BytecodeEmitter::emitObject(ListNode* objNode,
 }
 
 bool BytecodeEmitter::emitArrayLiteral(ListNode* array) {
-  bool isSingleton = checkSingletonContext();
-  if (!array->hasNonConstInitializer() && array->head()) {
-    // If the array consists entirely of primitive values, make a
-    // template object with copy on write elements that can be reused
-    // every time the initializer executes. In non-singleton mode, don't do
-    // this if the array is small: copying the elements lazily is not worth it
-    // in that case.
-    // Note: for now we don't use COW arrays if TI is disabled. We probably need
-    // a BaseShape flag to optimize this better without TI. See bug 1626854.
-    static const size_t MinElementsForCopyOnWrite = 5;
-    if (IsTypeInferenceEnabled() &&
-        emitterMode != BytecodeEmitter::SelfHosting &&
-        (array->count() >= MinElementsForCopyOnWrite || isSingleton) &&
-        isArrayObjLiteralCompatible(array->head())) {
-      return emitObjLiteralArray(array->head(), /* isCow = */ !isSingleton);
-    }
+  // Emit JSOp::Object if the array consists entirely of primitive values and we
+  // are in a singleton context.
+  if (checkSingletonContext() && !array->hasNonConstInitializer() &&
+      array->head() && isArrayObjLiteralCompatible(array->head())) {
+    return emitObjLiteralArray(array->head());
   }
 
-  return emitArray(array->head(), array->count(),
-                   /* isInner = */ isSingleton);
+  return emitArray(array->head(), array->count());
 }
 
-bool BytecodeEmitter::emitArray(ParseNode* arrayHead, uint32_t count,
-                                bool isInner /* = false */) {
+bool BytecodeEmitter::emitArray(ParseNode* arrayHead, uint32_t count) {
   /*
    * Emit code for [a, b, c] that is equivalent to constructing a new
    * array and in source order evaluating each element value and adding
@@ -9395,7 +10152,7 @@ bool BytecodeEmitter::emitArray(ParseNode* arrayHead, uint32_t count,
       return false;
     }
 
-    bool allowSelfHostedIter = false;
+    bool allowSelfHostedIterFlag = false;
     if (elem->isKind(ParseNodeKind::Elision)) {
       if (!emit1(JSOp::Hole)) {
         return false;
@@ -9405,16 +10162,11 @@ bool BytecodeEmitter::emitArray(ParseNode* arrayHead, uint32_t count,
       if (elem->isKind(ParseNodeKind::Spread)) {
         expr = elem->as<UnaryNode>().kid();
 
-        if (emitterMode == BytecodeEmitter::SelfHosting &&
-            expr->isKind(ParseNodeKind::CallExpr) &&
-            expr->as<BinaryNode>().left()->isName(
-                cx->names().allowContentIter)) {
-          allowSelfHostedIter = true;
-        }
+        allowSelfHostedIterFlag = allowSelfHostedIter(expr);
       } else {
         expr = elem;
       }
-      if (!emitTree(expr, ValueUsage::WantValue, EMIT_LINENOTE, isInner)) {
+      if (!emitTree(expr, ValueUsage::WantValue, EMIT_LINENOTE)) {
         //          [stack] ARRAY INDEX? VALUE
         return false;
       }
@@ -9432,7 +10184,7 @@ bool BytecodeEmitter::emitArray(ParseNode* arrayHead, uint32_t count,
         //          [stack] NEXT ITER ARRAY INDEX
         return false;
       }
-      if (!emitSpread(allowSelfHostedIter)) {
+      if (!emitSpread(allowSelfHostedIterFlag)) {
         //          [stack] ARRAY INDEX
         return false;
       }
@@ -9455,6 +10207,162 @@ bool BytecodeEmitter::emitArray(ParseNode* arrayHead, uint32_t count,
   }
   return true;
 }
+
+bool BytecodeEmitter::emitSpreadIntoArray(UnaryNode* elem) {
+  MOZ_ASSERT(elem->isKind(ParseNodeKind::Spread));
+
+  if (!updateSourceCoordNotes(elem->pn_pos.begin)) {
+    //              [stack] VALUE
+    return false;
+  }
+
+  if (!emitIterator()) {
+    //              [stack] NEXT ITER
+    return false;
+  }
+
+  if (!emitUint32Operand(JSOp::NewArray, 0)) {
+    //              [stack] NEXT ITER ARRAY
+    return false;
+  }
+
+  if (!emitNumberOp(0)) {
+    //              [stack] NEXT ITER ARRAY INDEX
+    return false;
+  }
+
+  bool allowSelfHostedIterFlag = allowSelfHostedIter(elem->kid());
+  if (!emitSpread(allowSelfHostedIterFlag)) {
+    //              [stack] ARRAY INDEX
+    return false;
+  }
+
+  if (!emit1(JSOp::Pop)) {
+    //              [stack] ARRAY
+    return false;
+  }
+  return true;
+}
+
+#ifdef ENABLE_RECORD_TUPLE
+bool BytecodeEmitter::emitRecordLiteral(ListNode* record) {
+  if (!emitUint32Operand(JSOp::InitRecord, record->count())) {
+    //              [stack] RECORD
+    return false;
+  }
+
+  for (ParseNode* propdef : record->contents()) {
+    if (propdef->isKind(ParseNodeKind::Spread)) {
+      if (!emitTree(propdef->as<UnaryNode>().kid())) {
+        //          [stack] RECORD SPREADEE
+        return false;
+      }
+      if (!emit1(JSOp::AddRecordSpread)) {
+        //          [stack] RECORD
+        return false;
+      }
+    } else {
+      BinaryNode* prop = &propdef->as<BinaryNode>();
+
+      ParseNode* key = prop->left();
+      ParseNode* value = prop->right();
+
+      switch (key->getKind()) {
+        case ParseNodeKind::ObjectPropertyName:
+          if (!emitStringOp(JSOp::String, key->as<NameNode>().atom())) {
+            return false;
+          }
+          break;
+        case ParseNodeKind::ComputedName:
+          if (!emitTree(key->as<UnaryNode>().kid())) {
+            return false;
+          }
+          break;
+        default:
+          MOZ_ASSERT(key->isKind(ParseNodeKind::StringExpr) ||
+                     key->isKind(ParseNodeKind::NumberExpr) ||
+                     key->isKind(ParseNodeKind::BigIntExpr));
+          if (!emitTree(key)) {
+            return false;
+          }
+          break;
+      }
+      //            [stack] RECORD KEY
+
+      if (!emitTree(value)) {
+        //          [stack] RECORD KEY VALUE
+        return false;
+      }
+
+      if (!emit1(JSOp::AddRecordProperty)) {
+        //          [stack] RECORD
+        return false;
+      }
+    }
+  }
+
+  if (!emit1(JSOp::FinishRecord)) {
+    //              [stack] RECORD
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitTupleLiteral(ListNode* tuple) {
+  if (!emitUint32Operand(JSOp::InitTuple, tuple->count())) {
+    //              [stack] TUPLE
+    return false;
+  }
+
+  for (ParseNode* elt : tuple->contents()) {
+    if (elt->isKind(ParseNodeKind::Spread)) {
+      ParseNode* expr = elt->as<UnaryNode>().kid();
+
+      if (!emitTree(expr)) {
+        //          [stack] TUPLE VALUE
+        return false;
+      }
+      if (!emitIterator()) {
+        //          [stack] TUPLE NEXT ITER
+        return false;
+      }
+      if (!emit2(JSOp::Pick, 2)) {
+        //          [stack] NEXT ITER TUPLE
+        return false;
+      }
+      if (!emitSpread(allowSelfHostedIter(expr), /* spreadeeStackItems = */ 1,
+                      JSOp::AddTupleElement)) {
+        //          [stack] TUPLE
+        return false;
+      }
+    } else {
+      if (!emitTree(elt)) {
+        //          [stack] TUPLE VALUE
+        return false;
+      }
+
+      // Update location to throw errors about non-primitive elements
+      // in the correct position.
+      if (!updateSourceCoordNotes(elt->pn_pos.begin)) {
+        return false;
+      }
+
+      if (!emit1(JSOp::AddTupleElement)) {
+        //          [stack] TUPLE
+        return false;
+      }
+    }
+  }
+
+  if (!emit1(JSOp::FinishTuple)) {
+    //              [stack] TUPLE
+    return false;
+  }
+
+  return true;
+}
+#endif
 
 static inline JSOp UnaryOpParseNodeKindToJSOp(ParseNodeKind pnk) {
   switch (pnk) {
@@ -9561,7 +10469,7 @@ bool BytecodeEmitter::emitFunctionFormalParameters(ListNode* paramsBody) {
           return false;
         }
       } else {
-        RootedAtom paramName(cx, bindingElement->as<NameNode>().name());
+        auto paramName = bindingElement->as<NameNode>().name();
         if (!fpe.emitRest(paramName)) {
           //        [stack]
           return false;
@@ -9620,7 +10528,7 @@ bool BytecodeEmitter::emitFunctionFormalParameters(ListNode* paramsBody) {
         //          [stack]
         return false;
       }
-      RootedAtom paramName(cx, bindingElement->as<NameNode>().name());
+      auto paramName = bindingElement->as<NameNode>().name();
       if (!fpe.emitDefaultEnd(paramName)) {
         //          [stack]
         return false;
@@ -9629,7 +10537,7 @@ bool BytecodeEmitter::emitFunctionFormalParameters(ListNode* paramsBody) {
       continue;
     }
 
-    RootedAtom paramName(cx, bindingElement->as<NameNode>().name());
+    auto paramName = bindingElement->as<NameNode>().name();
     if (!fpe.emitSimple(paramName)) {
       //            [stack]
       return false;
@@ -9645,7 +10553,7 @@ bool BytecodeEmitter::emitInitializeFunctionSpecialNames() {
   //                [stack]
 
   auto emitInitializeFunctionSpecialName =
-      [](BytecodeEmitter* bce, HandlePropertyName name, JSOp op) {
+      [](BytecodeEmitter* bce, TaggedParserAtomIndex name, JSOp op) {
         // A special name must be slotful, either on the frame or on the
         // call environment.
         MOZ_ASSERT(bce->lookupName(name).hasKnownSlot());
@@ -9656,11 +10564,11 @@ bool BytecodeEmitter::emitInitializeFunctionSpecialNames() {
           return false;
         }
         if (!bce->emit1(op)) {
-          //        [stack] THIS/ARGUMENTS
+          //        [stack] THIS/ARGUMENTS/NEW.TARGET
           return false;
         }
         if (!noe.emitAssignment()) {
-          //        [stack] THIS/ARGUMENTS
+          //        [stack] THIS/ARGUMENTS/NEW.TARGET
           return false;
         }
         if (!bce->emit1(JSOp::Pop)) {
@@ -9672,9 +10580,10 @@ bool BytecodeEmitter::emitInitializeFunctionSpecialNames() {
       };
 
   // Do nothing if the function doesn't have an arguments binding.
-  if (funbox->argumentsHasVarBinding()) {
-    if (!emitInitializeFunctionSpecialName(this, cx->names().arguments,
-                                           JSOp::Arguments)) {
+  if (funbox->needsArgsObj()) {
+    if (!emitInitializeFunctionSpecialName(
+            this, TaggedParserAtomIndex::WellKnown::arguments(),
+            JSOp::Arguments)) {
       //            [stack]
       return false;
     }
@@ -9684,16 +10593,29 @@ bool BytecodeEmitter::emitInitializeFunctionSpecialNames() {
   // happens for instance if it doesn't use this/eval or if it's an
   // arrow function).
   if (funbox->functionHasThisBinding()) {
-    if (!emitInitializeFunctionSpecialName(this, cx->names().dotThis,
-                                           JSOp::FunctionThis)) {
+    if (!emitInitializeFunctionSpecialName(
+            this, TaggedParserAtomIndex::WellKnown::dotThis(),
+            JSOp::FunctionThis)) {
+      return false;
+    }
+  }
+
+  // Do nothing if the function doesn't have a new.target-binding (this happens
+  // for instance if it doesn't use new.target/eval or if it's an arrow
+  // function).
+  if (funbox->functionHasNewTargetBinding()) {
+    if (!emitInitializeFunctionSpecialName(
+            this, TaggedParserAtomIndex::WellKnown::dotNewTarget(),
+            JSOp::NewTarget)) {
       return false;
     }
   }
 
   // Do nothing if the function doesn't implicitly return a promise result.
   if (funbox->needsPromiseResult()) {
-    if (!emitInitializeFunctionSpecialName(this, cx->names().dotGenerator,
-                                           JSOp::Generator)) {
+    if (!emitInitializeFunctionSpecialName(
+            this, TaggedParserAtomIndex::WellKnown::dotGenerator(),
+            JSOp::Generator)) {
       //            [stack]
       return false;
     }
@@ -9702,19 +10624,20 @@ bool BytecodeEmitter::emitInitializeFunctionSpecialNames() {
 }
 
 bool BytecodeEmitter::emitLexicalInitialization(NameNode* name) {
-  RootedAtom nameAtom(cx, name->name());
-  return emitLexicalInitialization(nameAtom);
+  return emitLexicalInitialization(name->name());
 }
 
-bool BytecodeEmitter::emitLexicalInitialization(Handle<JSAtom*> name) {
+bool BytecodeEmitter::emitLexicalInitialization(TaggedParserAtomIndex name) {
   NameOpEmitter noe(this, name, NameOpEmitter::Kind::Initialize);
   if (!noe.prepareForRhs()) {
     return false;
   }
 
   // The caller has pushed the RHS to the top of the stack. Assert that the
-  // name is lexical and no BIND[G]NAME ops were emitted.
-  MOZ_ASSERT(noe.loc().isLexical());
+  // binding can be initialized without a binding object on the stack, and that
+  // no BIND[G]NAME ops were emitted.
+  MOZ_ASSERT(noe.loc().isLexical() || noe.loc().isSynthetic() ||
+             noe.loc().isPrivateMethod());
   MOZ_ASSERT(!noe.emittedBindOp());
 
   if (!noe.emitAssignment()) {
@@ -9737,7 +10660,8 @@ static MOZ_ALWAYS_INLINE ParseNode* FindConstructor(JSContext* cx,
       if (!method.isStatic() &&
           (methodName.isKind(ParseNodeKind::ObjectPropertyName) ||
            methodName.isKind(ParseNodeKind::StringExpr)) &&
-          methodName.as<NameNode>().atom() == cx->names().constructor) {
+          methodName.as<NameNode>().atom() ==
+              TaggedParserAtomIndex::WellKnown::constructor()) {
         return classElement;
       }
     }
@@ -9745,14 +10669,85 @@ static MOZ_ALWAYS_INLINE ParseNode* FindConstructor(JSContext* cx,
   return nullptr;
 }
 
+bool BytecodeEmitter::emitNewPrivateName(TaggedParserAtomIndex bindingName,
+                                         TaggedParserAtomIndex symbolName) {
+  if (!emitAtomOp(JSOp::NewPrivateName, symbolName)) {
+    //              [stack] HERITAGE PRIVATENAME
+    return false;
+  }
+
+  // Add a binding for #name => privatename
+  if (!emitLexicalInitialization(bindingName)) {
+    //              [stack] HERITAGE PRIVATENAME
+    return false;
+  }
+
+  // Pop Private name off the stack.
+  if (!emit1(JSOp::Pop)) {
+    //              [stack] HERITAGE
+    return false;
+  }
+
+  return true;
+}
+
+bool BytecodeEmitter::emitNewPrivateNames(
+    TaggedParserAtomIndex privateBrandName, ListNode* classMembers) {
+  bool hasPrivateBrand = false;
+
+  for (ParseNode* classElement : classMembers->contents()) {
+    ParseNode* elementName;
+    if (classElement->is<ClassMethod>()) {
+      elementName = &classElement->as<ClassMethod>().name();
+    } else if (classElement->is<ClassField>()) {
+      elementName = &classElement->as<ClassField>().name();
+    } else {
+      continue;
+    }
+
+    if (!elementName->isKind(ParseNodeKind::PrivateName)) {
+      continue;
+    }
+
+    // Non-static private methods' private names are optimized away.
+    bool isOptimized = false;
+    if (classElement->is<ClassMethod>() &&
+        !classElement->as<ClassMethod>().isStatic()) {
+      hasPrivateBrand = true;
+      if (classElement->as<ClassMethod>().accessorType() ==
+          AccessorType::None) {
+        isOptimized = true;
+      }
+    }
+
+    if (!isOptimized) {
+      auto privateName = elementName->as<NameNode>().name();
+      if (!emitNewPrivateName(privateName, privateName)) {
+        return false;
+      }
+    }
+  }
+
+  if (hasPrivateBrand) {
+    // We don't make a private name for every optimized method, but we need one
+    // private name per class, the `.privateBrand`.
+    if (!emitNewPrivateName(TaggedParserAtomIndex::WellKnown::dotPrivateBrand(),
+                            privateBrandName)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // This follows ES6 14.5.14 (ClassDefinitionEvaluation) and ES6 14.5.15
 // (BindingClassDeclarationEvaluation).
 bool BytecodeEmitter::emitClass(
     ClassNode* classNode,
     ClassNameKind nameKind /* = ClassNameKind::BindingName */,
-    HandleAtom nameForAnonymousClass /* = nullptr */) {
+    TaggedParserAtomIndex
+        nameForAnonymousClass /* = TaggedParserAtomIndex::null() */) {
   MOZ_ASSERT((nameKind == ClassNameKind::InferredName) ==
-             (nameForAnonymousClass != nullptr));
+             bool(nameForAnonymousClass));
 
   ParseNode* heritageExpression = classNode->heritage();
   ListNode* classMembers = classNode->memberList();
@@ -9764,7 +10759,7 @@ bool BytecodeEmitter::emitClass(
   //                [stack] NAME
 
   ClassEmitter ce(this);
-  RootedAtom innerName(cx);
+  TaggedParserAtomIndex innerName;
   ClassEmitter::Kind kind = ClassEmitter::Kind::Expression;
   if (ClassNames* names = classNode->names()) {
     MOZ_ASSERT(nameKind == ClassNameKind::BindingName);
@@ -9785,12 +10780,7 @@ bool BytecodeEmitter::emitClass(
     }
   }
 
-  // This is kind of silly. In order to the get the home object defined on
-  // the constructor, we have to make it second, but we want the prototype
-  // on top for EmitPropertyList, because we expect static properties to be
-  // rarer. The result is a few more swaps than we would like. Such is life.
   bool isDerived = !!heritageExpression;
-  bool hasNameOnStack = nameKind == ClassNameKind::ComputedName;
   if (isDerived) {
     if (!updateSourceCoordNotes(classNode->pn_pos.begin)) {
       return false;
@@ -9802,6 +10792,34 @@ bool BytecodeEmitter::emitClass(
       //            [stack] HERITAGE
       return false;
     }
+  }
+
+  // The class body scope holds any private names. Those mustn't be visible in
+  // the heritage expression and hence the scope must be emitted after the
+  // heritage expression.
+  if (ClassBodyScopeNode* bodyScopeBindings = classNode->bodyScopeBindings()) {
+    if (!ce.emitBodyScope(bodyScopeBindings->scopeBindings())) {
+      //            [stack] HERITAGE
+      return false;
+    }
+
+    // The spec does not say anything about private brands being symbols.  It's
+    // an implementation detail. So we can give the special private brand
+    // symbol any description we want and users won't normally see it. For
+    // debugging, use the class name.
+    auto privateBrandName = innerName;
+    if (!innerName) {
+      privateBrandName = nameForAnonymousClass
+                             ? nameForAnonymousClass
+                             : TaggedParserAtomIndex::WellKnown::anonymous();
+    }
+    if (!emitNewPrivateNames(privateBrandName, classMembers)) {
+      return false;
+    }
+  }
+
+  bool hasNameOnStack = nameKind == ClassNameKind::ComputedName;
+  if (isDerived) {
     if (!ce.emitDerivedClass(innerName, nameForAnonymousClass,
                              hasNameOnStack)) {
       //            [stack] HERITAGE HOMEOBJ
@@ -9816,85 +10834,79 @@ bool BytecodeEmitter::emitClass(
 
   // Stack currently has HOMEOBJ followed by optional HERITAGE. When HERITAGE
   // is not used, an implicit value of %FunctionPrototype% is implied.
-  if (constructor) {
-    // See |Parser::classMember(...)| for the reason why |.initializers| is
-    // created within its own scope.
-    Maybe<LexicalScopeEmitter> lse;
-    FunctionNode* ctor;
-    if (constructor->is<LexicalScopeNode>()) {
-      LexicalScopeNode* constructorScope = &constructor->as<LexicalScopeNode>();
 
-      // The constructor scope should only contain the |.initializers| binding.
-      MOZ_ASSERT(!constructorScope->isEmptyScope());
-      MOZ_ASSERT(constructorScope->scopeBindings()->length == 1);
-      MOZ_ASSERT(constructorScope->scopeBindings()->trailingNames[0].name() ==
-                 cx->names().dotInitializers);
+  // See |Parser::classMember(...)| for the reason why |.initializers| is
+  // created within its own scope.
+  Maybe<LexicalScopeEmitter> lse;
+  FunctionNode* ctor;
+  if (constructor->is<LexicalScopeNode>()) {
+    LexicalScopeNode* constructorScope = &constructor->as<LexicalScopeNode>();
 
-      auto isInstanceField = [](ParseNode* propdef) {
-        return propdef->is<ClassField>() &&
-               !propdef->as<ClassField>().isStatic();
-      };
+    // The constructor scope should only contain the |.initializers| binding.
+    MOZ_ASSERT(!constructorScope->isEmptyScope());
+    MOZ_ASSERT(constructorScope->scopeBindings()->length == 1);
+    MOZ_ASSERT(GetScopeDataTrailingNames(constructorScope->scopeBindings())[0]
+                   .name() ==
+               TaggedParserAtomIndex::WellKnown::dotInitializers());
 
-      // As an optimization omit the |.initializers| binding when no instance
-      // fields are present.
-      bool hasInstanceFields =
-          std::any_of(classMembers->contents().begin(),
-                      classMembers->contents().end(), isInstanceField);
-      if (hasInstanceFields) {
-        lse.emplace(this);
-        if (!lse->emitScope(ScopeKind::Lexical,
-                            constructorScope->scopeBindings())) {
-          return false;
-        }
+    auto needsInitializer = [](ParseNode* propdef) {
+      return NeedsFieldInitializer(propdef, false) ||
+             NeedsAccessorInitializer(propdef, false);
+    };
 
-        // Any class with field initializers will have a constructor
-        if (!emitCreateFieldInitializers(ce, classMembers,
-                                         FieldPlacement::Instance)) {
-          return false;
-        }
+    // As an optimization omit the |.initializers| binding when no instance
+    // fields or private methods are present.
+    bool needsInitializers =
+        std::any_of(classMembers->contents().begin(),
+                    classMembers->contents().end(), needsInitializer);
+    if (needsInitializers) {
+      lse.emplace(this);
+      if (!lse->emitScope(ScopeKind::Lexical,
+                          constructorScope->scopeBindings())) {
+        return false;
       }
 
-      ctor = &constructorScope->scopeBody()->as<ClassMethod>().method();
-    } else {
-      // The |.initializers| binding is never emitted when in self-hosting mode.
-      MOZ_ASSERT(emitterMode == BytecodeEmitter::SelfHosting);
-      ctor = &constructor->as<ClassMethod>().method();
-    }
-
-    bool needsHomeObject = ctor->funbox()->needsHomeObject();
-    // HERITAGE is consumed inside emitFunction.
-    if (nameKind == ClassNameKind::InferredName) {
-      if (!setFunName(ctor->funbox(), nameForAnonymousClass)) {
+      // Any class with field initializers will have a constructor
+      if (!emitCreateMemberInitializers(ce, classMembers,
+                                        FieldPlacement::Instance)) {
         return false;
       }
     }
-    if (!emitFunction(ctor, isDerived, classMembers)) {
-      //            [stack] HOMEOBJ CTOR
-      return false;
-    }
-    if (lse.isSome()) {
-      if (!lse->emitEnd()) {
-        return false;
-      }
-      lse.reset();
-    }
-    if (!ce.emitInitConstructor(needsHomeObject)) {
-      //            [stack] CTOR HOMEOBJ
-      return false;
-    }
+
+    ctor = &constructorScope->scopeBody()->as<ClassMethod>().method();
   } else {
-    if (!ce.emitInitDefaultConstructor(classNode->pn_pos.begin,
-                                       classNode->pn_pos.end)) {
-      //            [stack] CTOR HOMEOBJ
+    // The |.initializers| binding is never emitted when in self-hosting mode.
+    MOZ_ASSERT(emitterMode == BytecodeEmitter::SelfHosting);
+    ctor = &constructor->as<ClassMethod>().method();
+  }
+
+  bool needsHomeObject = ctor->funbox()->needsHomeObject();
+  // HERITAGE is consumed inside emitFunction.
+  if (nameKind == ClassNameKind::InferredName) {
+    if (!setFunName(ctor->funbox(), nameForAnonymousClass)) {
       return false;
     }
+  }
+  if (!emitFunction(ctor, isDerived)) {
+    //              [stack] HOMEOBJ CTOR
+    return false;
+  }
+  if (lse.isSome()) {
+    if (!lse->emitEnd()) {
+      return false;
+    }
+    lse.reset();
+  }
+  if (!ce.emitInitConstructor(needsHomeObject)) {
+    //              [stack] CTOR HOMEOBJ
+    return false;
   }
 
   if (!emitCreateFieldKeys(classMembers, FieldPlacement::Instance)) {
     return false;
   }
 
-  if (!emitCreateFieldInitializers(ce, classMembers, FieldPlacement::Static)) {
+  if (!emitCreateMemberInitializers(ce, classMembers, FieldPlacement::Static)) {
     return false;
   }
 
@@ -9935,8 +10947,8 @@ bool BytecodeEmitter::emitExportDefault(BinaryNode* exportNode) {
   if (valueNode->isDirectRHSAnonFunction()) {
     MOZ_ASSERT(exportNode->right());
 
-    HandlePropertyName name = cx->names().default_;
-    if (!emitAnonymousFunctionWithName(valueNode, name)) {
+    if (!emitAnonymousFunctionWithName(
+            valueNode, TaggedParserAtomIndex::WellKnown::default_())) {
       return false;
     }
   } else {
@@ -9958,137 +10970,11 @@ bool BytecodeEmitter::emitExportDefault(BinaryNode* exportNode) {
   return true;
 }
 
-MOZ_NEVER_INLINE bool BytecodeEmitter::emitInstrumentationSlow(
-    InstrumentationKind kind,
-    const std::function<bool(uint32_t)>& pushOperandsCallback) {
-  MOZ_ASSERT(instrumentationKinds);
-
-  if (!(instrumentationKinds & (uint32_t)kind)) {
-    return true;
-  }
-
-  // Instrumentation is emitted in the form of a call to the realm's
-  // instrumentation callback, guarded by a test of whether instrumentation is
-  // currently active in the realm. The callback is invoked with the kind of
-  // operation which is executing, the current script's instrumentation ID,
-  // and the offset of the bytecode location after the instrumentation. Some
-  // operation kinds have more arguments, which will be pushed by
-  // pushOperandsCallback.
-
-  unsigned initialDepth = bytecodeSection().stackDepth();
-  InternalIfEmitter ifEmitter(this);
-
-  if (!emit1(JSOp::InstrumentationActive)) {
-    return false;
-  }
-  //            [stack] ACTIVE
-
-  if (!ifEmitter.emitThen()) {
-    return false;
-  }
-  //            [stack]
-
-  // Push the instrumentation callback for the current realm as the callee.
-  if (!emit1(JSOp::InstrumentationCallback)) {
-    return false;
-  }
-  //            [stack] CALLBACK
-
-  // Push undefined for the call's |this| value.
-  if (!emit1(JSOp::Undefined)) {
-    return false;
-  }
-  //            [stack] CALLBACK UNDEFINED
-
-  JSAtom* atom = RealmInstrumentation::getInstrumentationKindName(cx, kind);
-  if (!atom) {
-    return false;
-  }
-
-  if (!emitAtomOp(JSOp::String, atom)) {
-    return false;
-  }
-  //            [stack] CALLBACK UNDEFINED KIND
-
-  if (!emit1(JSOp::InstrumentationScriptId)) {
-    return false;
-  }
-  //            [stack] CALLBACK UNDEFINED KIND SCRIPT
-
-  // Push the offset of the bytecode location following the instrumentation.
-  BytecodeOffset updateOffset;
-  if (!emitN(JSOp::Int32, 4, &updateOffset)) {
-    return false;
-  }
-  //            [stack] CALLBACK UNDEFINED KIND SCRIPT OFFSET
-
-  unsigned numPushed = bytecodeSection().stackDepth() - initialDepth;
-
-  if (pushOperandsCallback && !pushOperandsCallback(numPushed)) {
-    return false;
-  }
-  //            [stack] CALLBACK UNDEFINED KIND SCRIPT OFFSET ...EXTRA_ARGS
-
-  unsigned argc = bytecodeSection().stackDepth() - initialDepth - 2;
-  if (!emitCall(JSOp::CallIgnoresRv, argc)) {
-    return false;
-  }
-  //            [stack] RV
-
-  if (!emit1(JSOp::Pop)) {
-    return false;
-  }
-  //            [stack]
-
-  if (!ifEmitter.emitEnd()) {
-    return false;
-  }
-
-  SET_INT32(bytecodeSection().code(updateOffset),
-            bytecodeSection().code().length());
-
-  return true;
-}
-
-MOZ_NEVER_INLINE bool BytecodeEmitter::emitInstrumentationForOpcodeSlow(
-    JSOp op, uint32_t atomIndex) {
-  MOZ_ASSERT(instrumentationKinds);
-
-  switch (op) {
-    case JSOp::GetProp:
-    case JSOp::CallProp:
-    case JSOp::Length:
-      return emitInstrumentationSlow(
-          InstrumentationKind::GetProperty, [=](uint32_t pushed) {
-            return emitDupAt(pushed) && emitAtomOp(JSOp::String, atomIndex);
-          });
-    case JSOp::SetProp:
-    case JSOp::StrictSetProp:
-      return emitInstrumentationSlow(
-          InstrumentationKind::SetProperty, [=](uint32_t pushed) {
-            return emitDupAt(pushed + 1) &&
-                   emitAtomOp(JSOp::String, atomIndex) && emitDupAt(pushed + 2);
-          });
-    case JSOp::GetElem:
-    case JSOp::CallElem:
-      return emitInstrumentationSlow(
-          InstrumentationKind::GetElement,
-          [=](uint32_t pushed) { return emitDupAt(pushed + 1, 2); });
-    case JSOp::SetElem:
-    case JSOp::StrictSetElem:
-      return emitInstrumentationSlow(
-          InstrumentationKind::SetElement,
-          [=](uint32_t pushed) { return emitDupAt(pushed + 2, 3); });
-    default:
-      return true;
-  }
-}
-
 bool BytecodeEmitter::emitTree(
     ParseNode* pn, ValueUsage valueUsage /* = ValueUsage::WantValue */,
-    EmitLineNumberNote emitLineNote /* = EMIT_LINENOTE */,
-    bool isInner /* = false */) {
-  if (!CheckRecursionLimit(cx)) {
+    EmitLineNumberNote emitLineNote /* = EMIT_LINENOTE */) {
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.check(cx)) {
     return false;
   }
 
@@ -10330,14 +11216,14 @@ bool BytecodeEmitter::emitTree(
       }
       break;
 
-    case ParseNodeKind::PowExpr:
-      if (!emitRightAssociative(&pn->as<ListNode>())) {
+    case ParseNodeKind::PrivateInExpr:
+      if (!emitPrivateInExpr(&pn->as<ListNode>())) {
         return false;
       }
       break;
 
-    case ParseNodeKind::PipelineExpr:
-      if (!emitPipeline(&pn->as<ListNode>())) {
+    case ParseNodeKind::PowExpr:
+      if (!emitRightAssociative(&pn->as<ListNode>())) {
         return false;
       }
       break;
@@ -10448,6 +11334,7 @@ bool BytecodeEmitter::emitTree(
     case ParseNodeKind::ElemExpr: {
       PropertyByValue* elem = &pn->as<PropertyByValue>();
       bool isSuper = elem->isSuper();
+      MOZ_ASSERT(!elem->key().isKind(ParseNodeKind::PrivateName));
       ElemOpEmitter eoe(this, ElemOpEmitter::Kind::Get,
                         isSuper ? ElemOpEmitter::ObjKind::Super
                                 : ElemOpEmitter::ObjKind::Other);
@@ -10460,6 +11347,26 @@ bool BytecodeEmitter::emitTree(
       }
       if (!eoe.emitGet()) {
         //          [stack] ELEM
+        return false;
+      }
+
+      break;
+    }
+
+    case ParseNodeKind::PrivateMemberExpr: {
+      PrivateMemberAccess* privateExpr = &pn->as<PrivateMemberAccess>();
+      PrivateOpEmitter xoe(this, PrivateOpEmitter::Kind::Get,
+                           privateExpr->privateName().name());
+      if (!emitTree(&privateExpr->expression())) {
+        //          [stack] OBJ
+        return false;
+      }
+      if (!xoe.emitReference()) {
+        //          [stack] OBJ NAME
+        return false;
+      }
+      if (!xoe.emitGet()) {
+        //          [stack] VALUE
         return false;
       }
 
@@ -10528,13 +11435,19 @@ bool BytecodeEmitter::emitTree(
       break;
 
     case ParseNodeKind::ObjectExpr:
-      if (!emitObject(&pn->as<ListNode>(), isInner)) {
+      if (!emitObject(&pn->as<ListNode>())) {
         return false;
       }
       break;
 
     case ParseNodeKind::Name:
       if (!emitGetName(&pn->as<NameNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::PrivateName:
+      if (!emitGetPrivateName(&pn->as<NameNode>())) {
         return false;
       }
       break;
@@ -10547,7 +11460,7 @@ bool BytecodeEmitter::emitTree(
 
     case ParseNodeKind::TemplateStringExpr:
     case ParseNodeKind::StringExpr:
-      if (!emitAtomOp(JSOp::String, pn->as<NameNode>().atom())) {
+      if (!emitStringOp(JSOp::String, pn->as<NameNode>().atom())) {
         return false;
       }
       break;
@@ -10565,7 +11478,7 @@ bool BytecodeEmitter::emitTree(
       break;
 
     case ParseNodeKind::RegExpExpr: {
-      uint32_t index;
+      GCThingIndex index;
       if (!perScriptData().gcThingList().append(&pn->as<RegExpLiteral>(),
                                                 &index)) {
         return false;
@@ -10622,7 +11535,7 @@ bool BytecodeEmitter::emitTree(
       break;
 
     case ParseNodeKind::NewTargetExpr:
-      if (!emit1(JSOp::NewTarget)) {
+      if (!emitNewTarget(&pn->as<NewTargetNode>())) {
         return false;
       }
       break;
@@ -10633,18 +11546,52 @@ bool BytecodeEmitter::emitTree(
       }
       break;
 
-    case ParseNodeKind::CallImportExpr:
-      if (!emitTree(pn->as<BinaryNode>().right()) ||
-          !emit1(JSOp::DynamicImport)) {
+    case ParseNodeKind::CallImportExpr: {
+      BinaryNode* spec = &pn->as<BinaryNode>().right()->as<BinaryNode>();
+
+      if (!emitTree(spec->left())) {
+        //          [stack] specifier
         return false;
       }
+
+      if (!spec->right()->isKind(ParseNodeKind::PosHolder)) {
+        //          [stack] specifier options
+        if (!emitTree(spec->right())) {
+          return false;
+        }
+      } else {
+        //          [stack] specifier undefined
+        if (!emit1(JSOp::Undefined)) {
+          return false;
+        }
+      }
+
+      if (!emit1(JSOp::DynamicImport)) {
+        return false;
+      }
+
       break;
+    }
 
     case ParseNodeKind::SetThis:
       if (!emitSetThis(&pn->as<BinaryNode>())) {
         return false;
       }
       break;
+
+#ifdef ENABLE_RECORD_TUPLE
+    case ParseNodeKind::RecordExpr:
+      if (!emitRecordLiteral(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+
+    case ParseNodeKind::TupleExpr:
+      if (!emitTupleLiteral(&pn->as<ListNode>())) {
+        return false;
+      }
+      break;
+#endif
 
     case ParseNodeKind::PropertyNameExpr:
     case ParseNodeKind::PosHolder:
@@ -10749,45 +11696,59 @@ bool BytecodeEmitter::newSrcNoteOperand(ptrdiff_t operand) {
   return SrcNoteWriter::writeOperand(operand, allocator);
 }
 
-bool BytecodeEmitter::intoScriptStencil(ScriptStencil* stencil) {
-  using ImmutableFlags = ImmutableScriptFlagsEnum;
-
+bool BytecodeEmitter::intoScriptStencil(ScriptIndex scriptIndex) {
   js::UniquePtr<ImmutableScriptData> immutableScriptData =
       createImmutableScriptData(cx);
   if (!immutableScriptData) {
     return false;
   }
 
-  stencil->immutableFlags = sc->immutableFlags();
-
-  MOZ_ASSERT(outermostScope().hasOnChain(ScopeKind::NonSyntactic) ==
+  MOZ_ASSERT(outermostScope().hasNonSyntacticScopeOnChain() ==
              sc->hasNonSyntacticScope());
 
-  stencil->gcThings = perScriptData().gcThingList().stealGCThings();
+  auto& things = perScriptData().gcThingList().objects();
+  if (!compilationState.appendGCThings(cx, scriptIndex, things)) {
+    return false;
+  }
 
   // Hand over the ImmutableScriptData instance generated by BCE.
-  stencil->immutableScriptData = std::move(immutableScriptData);
+  auto* sharedData =
+      SharedImmutableScriptData::createWith(cx, std::move(immutableScriptData));
+  if (!sharedData) {
+    return false;
+  }
+
+  // De-duplicate the bytecode within the runtime.
+  if (!compilationState.sharedData.addAndShare(cx, scriptIndex, sharedData)) {
+    return false;
+  }
+
+  ScriptStencil& script = compilationState.scriptData[scriptIndex];
+  script.setHasSharedData();
 
   // Update flags specific to functions.
   if (sc->isFunctionBox()) {
     FunctionBox* funbox = sc->asFunctionBox();
-    stencil->functionIndex.emplace(funbox->index());
-    stencil->fieldInitializers = funbox->fieldInitializers;
-
-    // Set flags that don't have direct flag representation within the
-    // FunctionBox.
-    stencil->immutableFlags.setFlag(ImmutableFlags::HasMappedArgsObj,
-                                    funbox->hasMappedArgsObj());
-
-    // While IsLikelyConstructorWrapper is required to be the same between
-    // syntax and normal parsing, BinAST cannot ensure this. Work around this by
-    // using the existing value if this is delazification.
-    if (emitterMode != BytecodeEmitter::LazyFunction) {
-      stencil->immutableFlags.setFlag(
-          ImmutableFlags::IsLikelyConstructorWrapper,
-          funbox->isLikelyConstructorWrapper());
-    }
-  } /* isFunctionBox */
+    MOZ_ASSERT(&script == &funbox->functionStencil());
+    funbox->copyUpdatedImmutableFlags();
+    MOZ_ASSERT(script.isFunction());
+  } else {
+    ScriptStencilExtra& scriptExtra = compilationState.scriptExtra[scriptIndex];
+    sc->copyScriptExtraFields(scriptExtra);
+  }
 
   return true;
 }
+
+bool BytecodeEmitter::allowSelfHostedIter(ParseNode* parseNode) {
+  return emitterMode == BytecodeEmitter::SelfHosting &&
+         parseNode->isKind(ParseNodeKind::CallExpr) &&
+         parseNode->as<BinaryNode>().left()->isName(
+             TaggedParserAtomIndex::WellKnown::allowContentIter());
+}
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+void BytecodeEmitter::dumpAtom(TaggedParserAtomIndex index) const {
+  parserAtoms().dump(index);
+}
+#endif

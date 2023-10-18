@@ -23,6 +23,8 @@
 #include "js/RootingAPI.h"
 #include "js/TypeDecls.h"
 
+struct JSClass;
+
 namespace JS {
 
 /**
@@ -101,11 +103,10 @@ class JS_PUBLIC_API ReadableStreamUnderlyingSource {
    * JS::ReadableStreamUpdateDataAvailableFromSource. If not, it is invoked
    * if and when a new read request is made.
    *
-   * Note: This method *must not cause GC*, because that could potentially
-   * invalidate the `buffer` pointer.
    */
   virtual void writeIntoReadRequestBuffer(JSContext* cx, HandleObject stream,
-                                          void* buffer, size_t length,
+                                          JS::Handle<JSObject*> aChunk,
+                                          size_t length,
                                           size_t* bytesWritten) = 0;
 
   /**
@@ -300,7 +301,7 @@ extern JS_PUBLIC_API bool ReadableStreamGetMode(JSContext* cx,
                                                 HandleObject stream,
                                                 ReadableStreamMode* mode);
 
-enum class ReadableStreamReaderMode { Default };
+enum class ReadableStreamReaderMode { Default, Byob };
 
 /**
  * Returns true if the given ReadableStream is readable, false if not.
@@ -484,21 +485,6 @@ extern JS_PUBLIC_API bool ReadableStreamReaderReleaseLock(JSContext* cx,
  */
 extern JS_PUBLIC_API JSObject* ReadableStreamDefaultReaderRead(
     JSContext* cx, HandleObject reader);
-
-class JS_PUBLIC_API WritableStreamUnderlyingSink {
- public:
-  virtual ~WritableStreamUnderlyingSink() = default;
-
-  /**
-   * Invoked when the associated WritableStream object is finalized. The
-   * stream object is not passed as an argument, as it might not be in a
-   * valid state anymore.
-   *
-   * Note: Finalization can happen on a background thread, so the embedding
-   * must be prepared for `finalize()` to be invoked from any thread.
-   */
-  virtual void finalize() = 0;
-};
 
 }  // namespace JS
 

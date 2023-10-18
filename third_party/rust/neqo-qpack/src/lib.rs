@@ -8,8 +8,6 @@
 #![warn(clippy::pedantic)]
 // This is because of Encoder and Decoder structs. TODO: think about a better namings for crate and structs.
 #![allow(clippy::module_name_repetitions)]
-// We need this because of TransportError.
-#![allow(clippy::pub_enum_variant_names)]
 
 pub mod decoder;
 mod decoder_instructions;
@@ -20,42 +18,55 @@ pub mod huffman;
 mod huffman_decode_helper;
 pub mod huffman_table;
 mod prefix;
+mod qlog;
 mod qpack_send_buf;
 pub mod reader;
 mod static_table;
+mod stats;
 mod table;
 
-pub type Header = (String, String);
+pub use decoder::QPackDecoder;
+pub use encoder::QPackEncoder;
+pub use stats::Stats;
+
 type Res<T> = Result<T, Error>;
 
-#[derive(Debug)]
-enum QPackSide {
-    Encoder,
-    Decoder,
-}
-
-impl ::std::fmt::Display for QPackSide {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
+#[derive(Debug, PartialEq, PartialOrd, Ord, Eq, Clone, Copy)]
+pub struct QpackSettings {
+    pub max_table_size_decoder: u64,
+    pub max_table_size_encoder: u64,
+    pub max_blocked_streams: u16,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    renamed_and_removed_lints,
+    clippy::pub_enum_variant_names,
+    clippy::enum_variant_names
+)]
 pub enum Error {
     DecompressionFailed,
     EncoderStream,
     DecoderStream,
     ClosedCriticalStream,
+    InternalError(u16),
 
-    // These are internal errors, they will be transfromed into one of the above.
+    // These are internal errors, they will be transformed into one of the above.
+    NeedMoreData, // Return when an input stream does not have more data that a decoder needs.(It does not mean that a stream is closed.)
     HeaderLookup,
-    NoMoreData,
+    HuffmanDecompressionFailed,
+    ToStringFailed,
+    ChangeCapacity,
+    DynamicTableFull,
+    IncrementAck,
     IntegerOverflow,
     WrongStreamCount,
+    Decoding, // Decoding internal error that is not one of the above.
+    EncoderStreamBlocked,
     Internal,
-    Decoding, // this will be translated into Encoder/DecoderStreamError or DecompressionFailed depending on the caller
 
     TransportError(neqo_transport::Error),
+    QlogError,
 }
 
 impl Error {
@@ -69,6 +80,18 @@ impl Error {
             // These are all internal errors.
             _ => 3,
         }
+    }
+
+    /// # Errors
+    ///   Any error is mapped to the indicated type.
+    fn map_error<R>(r: Result<R, Self>, err: Self) -> Result<R, Self> {
+        r.map_err(|e| {
+            if matches!(e, Self::ClosedCriticalStream) {
+                e
+            } else {
+                err
+            }
+        })
     }
 }
 
@@ -90,5 +113,11 @@ impl ::std::fmt::Display for Error {
 impl From<neqo_transport::Error> for Error {
     fn from(err: neqo_transport::Error) -> Self {
         Self::TransportError(err)
+    }
+}
+
+impl From<::qlog::Error> for Error {
+    fn from(_err: ::qlog::Error) -> Self {
+        Self::QlogError
     }
 }

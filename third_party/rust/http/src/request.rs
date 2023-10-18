@@ -878,6 +878,25 @@ impl Builder {
         })
     }
 
+    /// Get the HTTP version for this request
+    ///
+    /// By default this is HTTP/1.1.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use http::*;
+    ///
+    /// let mut req = Request::builder();
+    /// assert_eq!(req.version_ref().unwrap(), &Version::HTTP_11 );
+    ///
+    /// req = req.version(Version::HTTP_2);
+    /// assert_eq!(req.version_ref().unwrap(), &Version::HTTP_2 );
+    /// ```
+    pub fn version_ref(&self) -> Option<&Version> {
+        self.inner.as_ref().ok().map(|h| &h.version)
+    }
+
     /// Appends a header to this request builder.
     ///
     /// This function will append the provided key/value as a header to the
@@ -974,6 +993,41 @@ impl Builder {
             head.extensions.insert(extension);
             Ok(head)
         })
+    }
+
+    /// Get a reference to the extensions for this request builder.
+    ///
+    /// If the builder has an error, this returns `None`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use http::Request;
+    /// let req = Request::builder().extension("My Extension").extension(5u32);
+    /// let extensions = req.extensions_ref().unwrap();
+    /// assert_eq!(extensions.get::<&'static str>(), Some(&"My Extension"));
+    /// assert_eq!(extensions.get::<u32>(), Some(&5u32));
+    /// ```
+    pub fn extensions_ref(&self) -> Option<&Extensions> {
+        self.inner.as_ref().ok().map(|h| &h.extensions)
+    }
+
+    /// Get a mutable reference to the extensions for this request builder.
+    ///
+    /// If the builder has an error, this returns `None`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use http::Request;
+    /// let mut req = Request::builder().extension("My Extension");
+    /// let mut extensions = req.extensions_mut().unwrap();
+    /// assert_eq!(extensions.get::<&'static str>(), Some(&"My Extension"));
+    /// extensions.insert(5u32);
+    /// assert_eq!(extensions.get::<u32>(), Some(&5u32));
+    /// ```
+    pub fn extensions_mut(&mut self) -> Option<&mut Extensions> {
+        self.inner.as_mut().ok().map(|h| &mut h.extensions)
     }
 
     /// "Consumes" this builder, using the provided `body` to return a

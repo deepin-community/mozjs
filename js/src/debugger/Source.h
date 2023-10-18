@@ -7,8 +7,6 @@
 #ifndef dbg_Source_h
 #define dbg_Source_h
 
-#include "jsapi.h"
-
 #include "NamespaceImports.h"   // for Value, HandleObject, CallArgs
 #include "debugger/Debugger.h"  // for DebuggerSourceReferent
 #include "gc/Rooting.h"         // for HandleNativeObject
@@ -25,6 +23,7 @@ class DebuggerSource : public NativeObject {
   static const JSClass class_;
 
   enum {
+    SOURCE_SLOT,
     OWNER_SLOT,
     TEXT_SLOT,
     RESERVED_SLOTS,
@@ -43,10 +42,18 @@ class DebuggerSource : public NativeObject {
   NativeObject* getReferentRawObject() const;
   DebuggerSourceReferent getReferent() const;
 
+  void clearReferent() { clearReservedSlotGCThingAsPrivate(SOURCE_SLOT); }
+
   static DebuggerSource* check(JSContext* cx, HandleValue v);
   static bool construct(JSContext* cx, unsigned argc, Value* vp);
 
   struct CallData;
+
+  // The Debugger.Source.prototype object also has a class of
+  // DebuggerSource::class_ so we differentiate instances from the prototype
+  // based on the presence of an owner debugger.
+  bool isInstance() const { return !getReservedSlot(OWNER_SLOT).isUndefined(); }
+  Debugger* owner() const;
 
  private:
   static const JSClassOps classOps_;

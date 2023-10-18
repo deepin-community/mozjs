@@ -7,7 +7,7 @@
 #ifndef frontend_TryEmitter_h
 #define frontend_TryEmitter_h
 
-#include "mozilla/Attributes.h"  // MOZ_STACK_CLASS, MOZ_MUST_USE
+#include "mozilla/Attributes.h"  // MOZ_STACK_CLASS
 #include "mozilla/Maybe.h"       // mozilla::Maybe, mozilla::Nothing
 
 #include <stdint.h>  // uint32_t
@@ -69,13 +69,14 @@ class MOZ_STACK_CLASS TryEmitter {
   // return value.  For syntactic try-catch-finally, the bytecode marked with
   // "*" are emitted to clear return value with `undefined` before the catch
   // block and the finally block, and also to save/restore the return value
-  // before/after the finally block.
+  // before/after the finally block. Note that these instructions are not
+  // emitted for noScriptRval scripts that don't track the return value.
   //
   //     JSOp::Try offsetOf(jumpToEnd)
   //
   //     try_body...
   //
-  //     JSOp::Gosub finally
+  //     JSOp::Goto finally
   //     JSOp::JumpTarget
   //   jumpToEnd:
   //     JSOp::Goto end:
@@ -87,7 +88,7 @@ class MOZ_STACK_CLASS TryEmitter {
   //
   //     catch_body...
   //
-  //     JSOp::Gosub finally
+  //     JSOp::Goto finally
   //     JSOp::JumpTarget
   //     JSOp::Goto end
   //
@@ -114,10 +115,10 @@ class MOZ_STACK_CLASS TryEmitter {
   Kind kind_;
   ControlKind controlKind_;
 
-  // Track jumps-over-catches and gosubs-to-finally for later fixup.
+  // Tracks jumps to the finally block for later fixup.
   //
   // When a finally block is active, non-local jumps (including
-  // jumps-over-catches) result in a Gosub being written into the bytecode
+  // jumps-over-catches) result in a goto being written into the bytecode
   // stream and fixed-up later.
   //
   // For non-syntactic try-catch-finally, all that handling is skipped.
@@ -190,26 +191,33 @@ class MOZ_STACK_CLASS TryEmitter {
     return tryOpOffset_ + BytecodeOffsetDiff(JSOpLength_Try);
   }
 
+  // Returns true if catch and finally blocks should handle the frame's
+  // return value.
+  bool shouldUpdateRval() const;
+
+  // Jump to the finally block. After the finally block executes,
+  // fall through to the code following the finally block.
+  [[nodiscard]] bool emitJumpToFinallyWithFallthrough();
+
  public:
   TryEmitter(BytecodeEmitter* bce, Kind kind, ControlKind controlKind);
 
-  MOZ_MUST_USE bool emitTry();
-  MOZ_MUST_USE bool emitCatch();
+  [[nodiscard]] bool emitTry();
+  [[nodiscard]] bool emitCatch();
 
   // If `finallyPos` is specified, it's an offset of the finally block's
   // "{" character in the source code text, to improve line:column number in
   // the error reporting.
   // For non-syntactic try-catch-finally, `finallyPos` can be omitted.
-  MOZ_MUST_USE bool emitFinally(
+  [[nodiscard]] bool emitFinally(
       const mozilla::Maybe<uint32_t>& finallyPos = mozilla::Nothing());
 
-  MOZ_MUST_USE bool emitEnd();
+  [[nodiscard]] bool emitEnd();
 
  private:
-  MOZ_MUST_USE bool emitTryEnd();
-  MOZ_MUST_USE bool emitCatchEnd();
-  MOZ_MUST_USE bool emitFinallyEnd();
-  MOZ_MUST_USE bool instrumentEntryPoint();
+  [[nodiscard]] bool emitTryEnd();
+  [[nodiscard]] bool emitCatchEnd();
+  [[nodiscard]] bool emitFinallyEnd();
 };
 
 } /* namespace frontend */

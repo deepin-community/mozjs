@@ -143,11 +143,11 @@ var localeCache = {
  * Spec: ECMAScript Internationalization API Specification, 6.2.4.
  */
 function DefaultLocale() {
-    if (IsRuntimeDefaultLocale(localeCache.runtimeDefaultLocale))
+    if (intl_IsRuntimeDefaultLocale(localeCache.runtimeDefaultLocale))
         return localeCache.defaultLocale;
 
     // If we didn't have a cache hit, compute the candidate default locale.
-    var runtimeDefaultLocale = RuntimeDefaultLocale();
+    var runtimeDefaultLocale = intl_RuntimeDefaultLocale();
     var locale = intl_supportedLocaleOrFallback(runtimeDefaultLocale);
 
     assertIsValidAndCanonicalLanguageTag(locale, "the computed default locale");
@@ -208,8 +208,8 @@ function CanonicalizeLocaleList(locales) {
                    "ValidateAndCanonicalizeLanguageTag returns a string value");
 
             // Step 7.c.v.
-            if (callFunction(ArrayIndexOf, seen, tag) === -1)
-                _DefineDataProperty(seen, seen.length, tag);
+            if (callFunction(std_Array_indexOf, seen, tag) === -1)
+                DefineDataProperty(seen, seen.length, tag);
         }
 
         // Step 7.d.
@@ -254,7 +254,7 @@ function BestAvailableLocaleIgnoringDefault(availableLocales, locale) {
  */
 function LookupMatcher(availableLocales, requestedLocales) {
     // Step 1.
-    var result = new Record();
+    var result = new_Record();
 
     // Step 2.
     for (var i = 0; i < requestedLocales.length; i++) {
@@ -394,7 +394,7 @@ function ResolveLocale(availableLocales, requestedLocales, options, relevantExte
     var extension = r.extension;
 
     // Step 5.
-    var result = new Record();
+    var result = new_Record();
 
     // Step 6.
     result.dataLocale = foundLocale;
@@ -431,7 +431,7 @@ function ResolveLocale(availableLocales, requestedLocales, options, relevantExte
                 // Step 8.h.ii.1.
                 if (requestedValue !== "") {
                     // Step 8.h.ii.1.a.
-                    if (callFunction(ArrayIndexOf, keyLocaleData, requestedValue) !== -1) {
+                    if (callFunction(std_Array_indexOf, keyLocaleData, requestedValue) !== -1) {
                         value = requestedValue;
                         supportedExtensionAddition = "-" + key + "-" + value;
                     }
@@ -440,7 +440,7 @@ function ResolveLocale(availableLocales, requestedLocales, options, relevantExte
 
                     // According to the LDML spec, if there's no type value,
                     // and true is an allowed value, it's used.
-                    if (callFunction(ArrayIndexOf, keyLocaleData, "true") !== -1) {
+                    if (callFunction(std_Array_indexOf, keyLocaleData, "true") !== -1) {
                         value = "true";
                         supportedExtensionAddition = "-" + key;
                     }
@@ -466,7 +466,7 @@ function ResolveLocale(availableLocales, requestedLocales, options, relevantExte
                 keyLocaleData = callFunction(localeDataProvider[key], null, foundLocale);
 
             // Step 8.i.iii.
-            if (callFunction(ArrayIndexOf, keyLocaleData, optionsValue) !== -1) {
+            if (callFunction(std_Array_indexOf, keyLocaleData, optionsValue) !== -1) {
                 value = optionsValue;
                 supportedExtensionAddition = "";
             }
@@ -558,7 +558,7 @@ function LookupSupportedLocales(availableLocales, requestedLocales) {
 
         // Step 2.c.
         if (availableLocale !== undefined)
-            _DefineDataProperty(subset, subset.length, locale);
+            DefineDataProperty(subset, subset.length, locale);
     }
 
     // Step 3.
@@ -628,7 +628,7 @@ function GetOption(options, property, type, values, fallback) {
             assert(false, "GetOption");
 
         // Step 2.d.
-        if (values !== undefined && callFunction(ArrayIndexOf, values, value) === -1)
+        if (values !== undefined && callFunction(std_Array_indexOf, values, value) === -1)
             ThrowRangeError(JSMSG_INVALID_OPTION_VALUE, property, `"${value}"`);
 
         // Step 2.e.
@@ -637,6 +637,40 @@ function GetOption(options, property, type, values, fallback) {
 
     // Step 3.
     return fallback;
+}
+
+/**
+ * Extracts a property value from the provided options object, converts it to
+ * a boolean or string, checks whether it is one of a list of allowed values,
+ * and fills in a fallback value if necessary.
+ */
+function GetStringOrBooleanOption(options, property, values, trueValue, falsyValue, fallback) {
+    assert(IsObject(values), "GetStringOrBooleanOption");
+
+    // Step 1.
+    var value = options[property];
+
+    // Step 2.
+    if (value === undefined)
+        return fallback;
+
+    // Step 3.
+    if (value === true)
+        return trueValue;
+
+    // Steps 4-5.
+    if (!value)
+        return falsyValue;
+
+    // Step 6.
+    value = ToString(value);
+
+    // Step 7.
+    if (callFunction(std_Array_indexOf, values, value) === -1)
+        return fallback;
+
+    // Step 8.
+    return value;
 }
 
 /**
@@ -649,22 +683,26 @@ function GetOption(options, property, type, values, fallback) {
 function DefaultNumberOption(value, minimum, maximum, fallback) {
     assert(typeof minimum === "number" && (minimum | 0) === minimum, "DefaultNumberOption");
     assert(typeof maximum === "number" && (maximum | 0) === maximum, "DefaultNumberOption");
-    assert(typeof fallback === "number" && (fallback | 0) === fallback, "DefaultNumberOption");
-    assert(minimum <= fallback && fallback <= maximum, "DefaultNumberOption");
+    assert(fallback === undefined || (typeof fallback === "number" && (fallback | 0) === fallback),
+           "DefaultNumberOption");
+    assert(fallback === undefined || (minimum <= fallback && fallback <= maximum),
+           "DefaultNumberOption");
 
     // Step 1.
-    if (value !== undefined) {
-        value = ToNumber(value);
-        if (Number_isNaN(value) || value < minimum || value > maximum)
-            ThrowRangeError(JSMSG_INVALID_DIGITS_VALUE, value);
-
-        // Apply bitwise-or to convert -0 to +0 per ES2017, 5.2 and to ensure
-        // the result is an int32 value.
-        return std_Math_floor(value) | 0;
-    }
+    if (value === undefined)
+        return fallback;
 
     // Step 2.
-    return fallback;
+    value = ToNumber(value);
+
+    // Step 3.
+    if (Number_isNaN(value) || value < minimum || value > maximum)
+        ThrowRangeError(JSMSG_INVALID_DIGITS_VALUE, value);
+
+    // Step 4.
+    // Apply bitwise-or to convert -0 to +0 per ES2017, 5.2 and to ensure the
+    // result is an int32 value.
+    return std_Math_floor(value) | 0;
 }
 
 /**
@@ -693,7 +731,8 @@ var intlFallbackSymbolHolder = { value: undefined };
 function intlFallbackSymbol() {
     var fallbackSymbol = intlFallbackSymbolHolder.value;
     if (!fallbackSymbol) {
-        fallbackSymbol = std_Symbol("IntlLegacyConstructedSymbol");
+        let Symbol = GetBuiltinConstructor("Symbol");
+        fallbackSymbol = Symbol("IntlLegacyConstructedSymbol");
         intlFallbackSymbolHolder.value = fallbackSymbol;
     }
     return fallbackSymbol;
@@ -704,13 +743,13 @@ function intlFallbackSymbol() {
  */
 function initializeIntlObject(obj, type, lazyData) {
     assert(IsObject(obj), "Non-object passed to initializeIntlObject");
-    assert((type === "Collator" && GuardToCollator(obj) !== null) ||
-           (type === "DateTimeFormat" && GuardToDateTimeFormat(obj) !== null) ||
-           (type === "DisplayNames" && GuardToDisplayNames(obj) !== null) ||
-           (type === "ListFormat" && GuardToListFormat(obj) !== null) ||
-           (type === "NumberFormat" && GuardToNumberFormat(obj) !== null) ||
-           (type === "PluralRules" && GuardToPluralRules(obj) !== null) ||
-           (type === "RelativeTimeFormat" && GuardToRelativeTimeFormat(obj) !== null),
+    assert((type === "Collator" && intl_GuardToCollator(obj) !== null) ||
+           (type === "DateTimeFormat" && intl_GuardToDateTimeFormat(obj) !== null) ||
+           (type === "DisplayNames" && intl_GuardToDisplayNames(obj) !== null) ||
+           (type === "ListFormat" && intl_GuardToListFormat(obj) !== null) ||
+           (type === "NumberFormat" && intl_GuardToNumberFormat(obj) !== null) ||
+           (type === "PluralRules" && intl_GuardToPluralRules(obj) !== null) ||
+           (type === "RelativeTimeFormat" && intl_GuardToRelativeTimeFormat(obj) !== null),
            "type must match the object's class");
     assert(IsObject(lazyData), "non-object lazy data");
 
@@ -780,26 +819,26 @@ function maybeInternalProperties(internals) {
  */
 function getIntlObjectInternals(obj) {
     assert(IsObject(obj), "getIntlObjectInternals called with non-Object");
-    assert(GuardToCollator(obj) !== null ||
-           GuardToDateTimeFormat(obj) !== null ||
-           GuardToDisplayNames(obj) !== null ||
-           GuardToListFormat(obj) !== null ||
-           GuardToNumberFormat(obj) !== null ||
-           GuardToPluralRules(obj) !== null ||
-           GuardToRelativeTimeFormat(obj) !== null,
+    assert(intl_GuardToCollator(obj) !== null ||
+           intl_GuardToDateTimeFormat(obj) !== null ||
+           intl_GuardToDisplayNames(obj) !== null ||
+           intl_GuardToListFormat(obj) !== null ||
+           intl_GuardToNumberFormat(obj) !== null ||
+           intl_GuardToPluralRules(obj) !== null ||
+           intl_GuardToRelativeTimeFormat(obj) !== null,
            "getIntlObjectInternals called with non-Intl object");
 
     var internals = UnsafeGetReservedSlot(obj, INTL_INTERNALS_OBJECT_SLOT);
 
     assert(IsObject(internals), "internals not an object");
     assert(hasOwn("type", internals), "missing type");
-    assert((internals.type === "Collator" && GuardToCollator(obj) !== null) ||
-           (internals.type === "DateTimeFormat" && GuardToDateTimeFormat(obj) !== null) ||
-           (internals.type === "DisplayNames" && GuardToDisplayNames(obj) !== null) ||
-           (internals.type === "ListFormat" && GuardToListFormat(obj) !== null) ||
-           (internals.type === "NumberFormat" && GuardToNumberFormat(obj) !== null) ||
-           (internals.type === "PluralRules" && GuardToPluralRules(obj) !== null) ||
-           (internals.type === "RelativeTimeFormat" && GuardToRelativeTimeFormat(obj) !== null),
+    assert((internals.type === "Collator" && intl_GuardToCollator(obj) !== null) ||
+           (internals.type === "DateTimeFormat" && intl_GuardToDateTimeFormat(obj) !== null) ||
+           (internals.type === "DisplayNames" && intl_GuardToDisplayNames(obj) !== null) ||
+           (internals.type === "ListFormat" && intl_GuardToListFormat(obj) !== null) ||
+           (internals.type === "NumberFormat" && intl_GuardToNumberFormat(obj) !== null) ||
+           (internals.type === "PluralRules" && intl_GuardToPluralRules(obj) !== null) ||
+           (internals.type === "RelativeTimeFormat" && intl_GuardToRelativeTimeFormat(obj) !== null),
            "type must match the object's class");
     assert(hasOwn("lazyData", internals), "missing lazyData");
     assert(hasOwn("internalProps", internals), "missing internalProps");

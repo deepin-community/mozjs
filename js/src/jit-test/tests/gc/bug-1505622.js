@@ -1,30 +1,37 @@
 // Test that we don't repeatedly trigger last-ditch GCs.
 
-function allocUntilFail() {
-    gc();
-    let initGCNumber = gcparam("gcNumber");
-    let error;
-    try {
-        let a = [];
-        while (true) {
-            a.push(Symbol()); // Symbols are tenured.
-        }
-    } catch(err) {
-        error = err;
-    }
-    let finalGCNumber = gcparam("gcNumber");
-    gc();
-    assertEq(error, "out of memory");
-    return finalGCNumber - initGCNumber;
-}
-
 // Turn of any zeal which will disrupt GC number checks.
 gczeal(0);
 
-// Set a small heap limit.
-gc();
-let currentSize = gcparam("gcBytes");
-gcparam("maxBytes", currentSize + 16 * 1024);
+function allocUntilFail() {
+  gc(null, 'shrinking');
+
+  const initialSize = gcparam("gcBytes");
+  const initialMaxSize = gcparam("maxBytes");
+  const initGCNumber = gcparam("majorGCNumber");
+
+  // Set a small heap limit.
+  gcparam("maxBytes", initialSize + 16 * 1024);
+
+  let error;
+  try {
+    let a = [];
+    while (true) {
+      a.push(Symbol()); // Symbols are tenured.
+    }
+  } catch(err) {
+    error = err;
+  }
+
+  const finalGCNumber = gcparam("majorGCNumber");
+
+  // Resetore heap limit.
+  gcparam("maxBytes", initialMaxSize);
+
+  gc();
+  assertEq(error, "out of memory");
+  return finalGCNumber - initGCNumber;
+}
 
 // Set the time limit for skipping last ditch GCs to 5 seconds.
 gcparam("minLastDitchGCPeriod", 5);

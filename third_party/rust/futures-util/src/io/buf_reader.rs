@@ -1,43 +1,40 @@
+use super::DEFAULT_BUF_SIZE;
+use futures_core::future::Future;
+use futures_core::ready;
 use futures_core::task::{Context, Poll};
-#[cfg(feature = "read-initializer")]
-use futures_io::Initializer;
-use futures_io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite, IoSlice, IoSliceMut, SeekFrom};
-use pin_utils::{unsafe_pinned, unsafe_unpinned};
+use futures_io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite, IoSliceMut, SeekFrom};
+use pin_project_lite::pin_project;
 use std::io::{self, Read};
 use std::pin::Pin;
 use std::{cmp, fmt};
-use super::DEFAULT_BUF_SIZE;
 
-/// The `BufReader` struct adds buffering to any reader.
-///
-/// It can be excessively inefficient to work directly with a [`AsyncRead`]
-/// instance. A `BufReader` performs large, infrequent reads on the underlying
-/// [`AsyncRead`] and maintains an in-memory buffer of the results.
-///
-/// `BufReader` can improve the speed of programs that make *small* and
-/// *repeated* read calls to the same file or network socket. It does not
-/// help when reading very large amounts at once, or reading just one or a few
-/// times. It also provides no advantage when reading from a source that is
-/// already in memory, like a `Vec<u8>`.
-///
-/// When the `BufReader` is dropped, the contents of its buffer will be
-/// discarded. Creating multiple instances of a `BufReader` on the same
-/// stream can cause data loss.
-///
-/// [`AsyncRead`]: futures_io::AsyncRead
-///
-// TODO: Examples
-pub struct BufReader<R> {
-    inner: R,
-    buf: Box<[u8]>,
-    pos: usize,
-    cap: usize,
-}
-
-impl<R> BufReader<R> {
-    unsafe_pinned!(inner: R);
-    unsafe_unpinned!(pos: usize);
-    unsafe_unpinned!(cap: usize);
+pin_project! {
+    /// The `BufReader` struct adds buffering to any reader.
+    ///
+    /// It can be excessively inefficient to work directly with a [`AsyncRead`]
+    /// instance. A `BufReader` performs large, infrequent reads on the underlying
+    /// [`AsyncRead`] and maintains an in-memory buffer of the results.
+    ///
+    /// `BufReader` can improve the speed of programs that make *small* and
+    /// *repeated* read calls to the same file or network socket. It does not
+    /// help when reading very large amounts at once, or reading just one or a few
+    /// times. It also provides no advantage when reading from a source that is
+    /// already in memory, like a `Vec<u8>`.
+    ///
+    /// When the `BufReader` is dropped, the contents of its buffer will be
+    /// discarded. Creating multiple instances of a `BufReader` on the same
+    /// stream can cause data loss.
+    ///
+    /// [`AsyncRead`]: futures_io::AsyncRead
+    ///
+    // TODO: Examples
+    pub struct BufReader<R> {
+        #[pin]
+        inner: R,
+        buffer: Box<[u8]>,
+        pos: usize,
+        cap: usize,
+    }
 }
 
 impl<R: AsyncRead> BufReader<R> {
@@ -53,55 +50,59 @@ impl<R: AsyncRead> BufReader<R> {
             let mut buffer = Vec::with_capacity(capacity);
             buffer.set_len(capacity);
             super::initialize(&inner, &mut buffer);
-            Self {
-                inner,
-                buf: buffer.into_boxed_slice(),
-                pos: 0,
-                cap: 0,
-            }
+            Self { inner, buffer: buffer.into_boxed_slice(), pos: 0, cap: 0 }
         }
     }
 
-    /// Gets a reference to the underlying reader.
-    ///
-    /// It is inadvisable to directly read from the underlying reader.
-    pub fn get_ref(&self) -> &R {
-        &self.inner
-    }
-
-    /// Gets a mutable reference to the underlying reader.
-    ///
-    /// It is inadvisable to directly read from the underlying reader.
-    pub fn get_mut(&mut self) -> &mut R {
-        &mut self.inner
-    }
-
-    /// Gets a pinned mutable reference to the underlying reader.
-    ///
-    /// It is inadvisable to directly read from the underlying reader.
-    pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut R> {
-        self.inner()
-    }
-
-    /// Consumes this `BufWriter`, returning the underlying reader.
-    ///
-    /// Note that any leftover data in the internal buffer is lost.
-    pub fn into_inner(self) -> R {
-        self.inner
-    }
+    delegate_access_inner!(inner, R, ());
 
     /// Returns a reference to the internally buffered data.
     ///
     /// Unlike `fill_buf`, this will not attempt to fill the buffer if it is empty.
     pub fn buffer(&self) -> &[u8] {
-        &self.buf[self.pos..self.cap]
+        &self.buffer[self.pos..self.cap]
     }
 
     /// Invalidates all data in the internal buffer.
     #[inline]
-    fn discard_buffer(mut self: Pin<&mut Self>) {
-        *self.as_mut().pos() = 0;
-        *self.cap() = 0;
+    fn discard_buffer(self: Pin<&mut Self>) {
+        let this = self.project();
+        *this.pos = 0;
+        *this.cap = 0;
+    }
+}
+
+impl<R: AsyncRead + AsyncSeek> BufReader<R> {
+    /// Seeks relative to the current position. If the new position lies within the buffer,
+    /// the buffer will not be flushed, allowing for more efficient seeks.
+    /// This method does not return the location of the underlying reader, so the caller
+    /// must track this information themselves if it is required.
+    pub fn seek_relative(self: Pin<&mut Self>, offset: i64) -> SeeKRelative<'_, R> {
+        SeeKRelative { inner: self, offset, first: true }
+    }
+
+    /// Attempts to seek relative to the current position. If the new position lies within the buffer,
+    /// the buffer will not be flushed, allowing for more efficient seeks.
+    /// This method does not return the location of the underlying reader, so the caller
+    /// must track this information themselves if it is required.
+    pub fn poll_seek_relative(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        offset: i64,
+    ) -> Poll<io::Result<()>> {
+        let pos = self.pos as u64;
+        if offset < 0 {
+            if let Some(new_pos) = pos.checked_sub((-offset) as u64) {
+                *self.project().pos = new_pos as usize;
+                return Poll::Ready(Ok(()));
+            }
+        } else if let Some(new_pos) = pos.checked_add(offset as u64) {
+            if new_pos <= self.cap as u64 {
+                *self.project().pos = new_pos as usize;
+                return Poll::Ready(Ok(()));
+            }
+        }
+        self.poll_seek(cx, SeekFrom::Current(offset)).map(|res| res.map(|_| ()))
     }
 }
 
@@ -114,8 +115,8 @@ impl<R: AsyncRead> AsyncRead for BufReader<R> {
         // If we don't have any buffered data and we're doing a massive read
         // (larger than our internal buffer), bypass our internal buffer
         // entirely.
-        if self.pos == self.cap && buf.len() >= self.buf.len() {
-            let res = ready!(self.as_mut().inner().poll_read(cx, buf));
+        if self.pos == self.cap && buf.len() >= self.buffer.len() {
+            let res = ready!(self.as_mut().project().inner.poll_read(cx, buf));
             self.discard_buffer();
             return Poll::Ready(res);
         }
@@ -131,8 +132,8 @@ impl<R: AsyncRead> AsyncRead for BufReader<R> {
         bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
         let total_len = bufs.iter().map(|b| b.len()).sum::<usize>();
-        if self.pos == self.cap && total_len >= self.buf.len() {
-            let res = ready!(self.as_mut().inner().poll_read_vectored(cx, bufs));
+        if self.pos == self.cap && total_len >= self.buffer.len() {
+            let res = ready!(self.as_mut().project().inner.poll_read_vectored(cx, bufs));
             self.discard_buffer();
             return Poll::Ready(res);
         }
@@ -141,70 +142,38 @@ impl<R: AsyncRead> AsyncRead for BufReader<R> {
         self.consume(nread);
         Poll::Ready(Ok(nread))
     }
-
-    // we can't skip unconditionally because of the large buffer case in read.
-    #[cfg(feature = "read-initializer")]
-    unsafe fn initializer(&self) -> Initializer {
-        self.inner.initializer()
-    }
 }
 
 impl<R: AsyncRead> AsyncBufRead for BufReader<R> {
-    fn poll_fill_buf(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<&[u8]>> {
-        let Self { inner, buf, cap, pos } = unsafe { self.get_unchecked_mut() };
-        let mut inner = unsafe { Pin::new_unchecked(inner) };
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let this = self.project();
 
         // If we've reached the end of our internal buffer then we need to fetch
         // some more data from the underlying reader.
         // Branch using `>=` instead of the more correct `==`
         // to tell the compiler that the pos..cap slice is always valid.
-        if *pos >= *cap {
-            debug_assert!(*pos == *cap);
-            *cap = ready!(inner.as_mut().poll_read(cx, buf))?;
-            *pos = 0;
+        if *this.pos >= *this.cap {
+            debug_assert!(*this.pos == *this.cap);
+            *this.cap = ready!(this.inner.poll_read(cx, this.buffer))?;
+            *this.pos = 0;
         }
-        Poll::Ready(Ok(&buf[*pos..*cap]))
+        Poll::Ready(Ok(&this.buffer[*this.pos..*this.cap]))
     }
 
-    fn consume(mut self: Pin<&mut Self>, amt: usize) {
-        *self.as_mut().pos() = cmp::min(self.pos + amt, self.cap);
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        *self.project().pos = cmp::min(self.pos + amt, self.cap);
     }
 }
 
 impl<R: AsyncWrite> AsyncWrite for BufReader<R> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.inner().poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        self.inner().poll_write_vectored(cx, bufs)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner().poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner().poll_close(cx)
-    }
+    delegate_async_write!(inner);
 }
 
 impl<R: fmt::Debug> fmt::Debug for BufReader<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BufReader")
             .field("reader", &self.inner)
-            .field("buffer", &format_args!("{}/{}", self.cap - self.pos, self.buf.len()))
+            .field("buffer", &format_args!("{}/{}", self.cap - self.pos, self.buffer.len()))
             .finish()
     }
 }
@@ -220,6 +189,10 @@ impl<R: AsyncRead + AsyncSeek> AsyncSeek for BufReader<R> {
     /// would otherwise fall within it. This guarantees that calling
     /// `.into_inner()` immediately after a seek yields the underlying reader
     /// at the same position.
+    ///
+    /// To seek without discarding the internal buffer, use
+    /// [`BufReader::seek_relative`](BufReader::seek_relative) or
+    /// [`BufReader::poll_seek_relative`](BufReader::poll_seek_relative).
     ///
     /// See [`AsyncSeek`](futures_io::AsyncSeek) for more details.
     ///
@@ -242,18 +215,49 @@ impl<R: AsyncRead + AsyncSeek> AsyncSeek for BufReader<R> {
             // support seeking by i64::min_value() so we need to handle underflow when subtracting
             // remainder.
             if let Some(offset) = n.checked_sub(remainder) {
-                result = ready!(self.as_mut().inner().poll_seek(cx, SeekFrom::Current(offset)))?;
+                result =
+                    ready!(self.as_mut().project().inner.poll_seek(cx, SeekFrom::Current(offset)))?;
             } else {
                 // seek backwards by our remainder, and then by the offset
-                ready!(self.as_mut().inner().poll_seek(cx, SeekFrom::Current(-remainder)))?;
+                ready!(self.as_mut().project().inner.poll_seek(cx, SeekFrom::Current(-remainder)))?;
                 self.as_mut().discard_buffer();
-                result = ready!(self.as_mut().inner().poll_seek(cx, SeekFrom::Current(n)))?;
+                result = ready!(self.as_mut().project().inner.poll_seek(cx, SeekFrom::Current(n)))?;
             }
         } else {
             // Seeking with Start/End doesn't care about our buffer length.
-            result = ready!(self.as_mut().inner().poll_seek(cx, pos))?;
+            result = ready!(self.as_mut().project().inner.poll_seek(cx, pos))?;
         }
         self.discard_buffer();
         Poll::Ready(Ok(result))
+    }
+}
+
+/// Future for the [`BufReader::seek_relative`](self::BufReader::seek_relative) method.
+#[derive(Debug)]
+#[must_use = "futures do nothing unless polled"]
+pub struct SeeKRelative<'a, R> {
+    inner: Pin<&'a mut BufReader<R>>,
+    offset: i64,
+    first: bool,
+}
+
+impl<R> Future for SeeKRelative<'_, R>
+where
+    R: AsyncRead + AsyncSeek,
+{
+    type Output = io::Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let offset = self.offset;
+        if self.first {
+            self.first = false;
+            self.inner.as_mut().poll_seek_relative(cx, offset)
+        } else {
+            self.inner
+                .as_mut()
+                .as_mut()
+                .poll_seek(cx, SeekFrom::Current(offset))
+                .map(|res| res.map(|_| ()))
+        }
     }
 }

@@ -79,6 +79,8 @@ class PICChain {
 // Class for object that holds ForOfPIC chain.
 class ForOfPICObject : public NativeObject {
  public:
+  enum { ChainSlot, SlotCount };
+
   static const JSClass class_;
 };
 
@@ -194,7 +196,7 @@ struct ForOfPIC {
     bool tryOptimizeArrayIteratorNext(JSContext* cx, bool* optimized);
 
     void trace(JSTracer* trc);
-    void finalize(JSFreeOp* fop, JSObject* obj);
+    void finalize(JS::GCContext* gcx, JSObject* obj);
 
    private:
     // Check if the global array-related objects have not been messed with
@@ -203,8 +205,7 @@ struct ForOfPIC {
 
     // Check if ArrayIterator.next is still optimizable.
     inline bool isArrayNextStillSane() {
-      return (arrayIteratorProto_->lastProperty() ==
-              arrayIteratorProtoShape_) &&
+      return (arrayIteratorProto_->shape() == arrayIteratorProtoShape_) &&
              (arrayIteratorProto_->getSlot(arrayIteratorProtoNextSlot_) ==
               canonicalNextFunc_);
     }
@@ -218,7 +219,7 @@ struct ForOfPIC {
     // Erase the stub chain.
     void eraseChain(JSContext* cx);
 
-    void freeAllStubs(JSFreeOp* fop);
+    void freeAllStubs(JS::GCContext* gcx);
   };
 
   static NativeObject* createForOfPICObject(JSContext* cx,
@@ -226,7 +227,7 @@ struct ForOfPIC {
 
   static inline Chain* fromJSObject(NativeObject* obj) {
     MOZ_ASSERT(obj->is<ForOfPICObject>());
-    return (ForOfPIC::Chain*)obj->getPrivate();
+    return obj->maybePtrFromReservedSlot<Chain>(ForOfPICObject::ChainSlot);
   }
   static inline Chain* getOrCreate(JSContext* cx) {
     NativeObject* obj = cx->global()->getForOfPICObject();

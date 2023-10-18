@@ -2,85 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-// ES2020 draft rev dc1e21c454bd316810be1c0e7af0131a2d7f38e9
-// 22.1.3.14 Array.prototype.indexOf ( searchElement [ , fromIndex ] )
-function ArrayIndexOf(searchElement/*, fromIndex*/) {
-    // Step 1.
-    var O = ToObject(this);
-
-    // Step 2.
-    var len = ToLength(O.length);
-
-    // Step 3.
-    if (len === 0)
-        return -1;
-
-    // Steps 4-5.
-    var n = arguments.length > 1 ? ToInteger(arguments[1]) : 0;
-
-    // Step 6.
-    if (n >= len)
-        return -1;
-
-    // Steps 7-8.
-    var k;
-    if (n >= 0) {
-        // Step 7.a.
-        k = n;
-    } else {
-        // Step 8.a.
-        k = len + n;
-
-        // Step 8.b.
-        if (k < 0)
-            k = 0;
-    }
-
-    // Step 9.
-    for (; k < len; k++) {
-        if (k in O && O[k] === searchElement)
-            return k;
-    }
-
-    // Step 10.
-    return -1;
-}
-
-// ES2020 draft rev dc1e21c454bd316810be1c0e7af0131a2d7f38e9
-// 22.1.3.17 Array.prototype.lastIndexOf ( searchElement [ , fromIndex ] )
-function ArrayLastIndexOf(searchElement/*, fromIndex*/) {
-    // Step 1.
-    var O = ToObject(this);
-
-    // Step 2.
-    var len = ToLength(O.length);
-
-    // Step 3.
-    if (len === 0)
-        return -1;
-
-    // Step 4.
-    var n = arguments.length > 1 ? ToInteger(arguments[1]) : len - 1;
-
-    // Steps 5-6.
-    var k;
-    if (n > len - 1)
-        k = len - 1;
-    else if (n < 0)
-        k = len + n;
-    else
-        k = n;
-
-    // Step 7.
-    for (; k >= 0; k--) {
-        if (k in O && O[k] === searchElement)
-            return k;
-    }
-
-    // Step 8.
-    return -1;
-}
-
 /* ES5 15.4.4.16. */
 function ArrayEvery(callbackfn/*, thisArg*/) {
     /* Step 1. */
@@ -112,6 +33,8 @@ function ArrayEvery(callbackfn/*, thisArg*/) {
     /* Step 8. */
     return true;
 }
+// Inlining this enables inlining of the callback function.
+SetIsInlinableLargeFunction(ArrayEvery);
 
 /* ES5 15.4.4.17. */
 function ArraySome(callbackfn/*, thisArg*/) {
@@ -144,10 +67,16 @@ function ArraySome(callbackfn/*, thisArg*/) {
     /* Step 8. */
     return false;
 }
+// Inlining this enables inlining of the callback function.
+SetIsInlinableLargeFunction(ArraySome);
 
 // ES2018 draft rev 3bbc87cd1b9d3bf64c3e68ca2fe9c5a3f2c304c0
 // 22.1.3.25 Array.prototype.sort ( comparefn )
 function ArraySort(comparefn) {
+    return SortArray(this, comparefn);
+}
+
+function SortArray(obj, comparefn) {
     // Step 1.
     if (comparefn !== undefined) {
         if (!IsCallable(comparefn))
@@ -155,7 +84,7 @@ function ArraySort(comparefn) {
     }
 
     // Step 2.
-    var O = ToObject(this);
+    var O = ToObject(obj);
 
     // First try to sort the array in native code, if that fails, indicated by
     // returning |false| from ArrayNativeSort, sort it in self-hosted code.
@@ -220,6 +149,8 @@ function ArrayForEach(callbackfn/*, thisArg*/) {
     /* Step 8. */
     return void 0;
 }
+// Inlining this enables inlining of the callback function.
+SetIsInlinableLargeFunction(ArrayForEach);
 
 /* ES 2016 draft Mar 25, 2016 22.1.3.15. */
 function ArrayMap(callbackfn/*, thisArg*/) {
@@ -248,13 +179,15 @@ function ArrayMap(callbackfn/*, thisArg*/) {
         if (k in O) {
             /* Steps 7.c.i-iii. */
             var mappedValue = callContentFunction(callbackfn, T, O[k], k, O);
-            _DefineDataProperty(A, k, mappedValue);
+            DefineDataProperty(A, k, mappedValue);
         }
     }
 
     /* Step 8. */
     return A;
 }
+// Inlining this enables inlining of the callback function.
+SetIsInlinableLargeFunction(ArrayMap);
 
 /* ES 2016 draft Mar 25, 2016 22.1.3.7 Array.prototype.filter. */
 function ArrayFilter(callbackfn/*, thisArg*/) {
@@ -287,13 +220,156 @@ function ArrayFilter(callbackfn/*, thisArg*/) {
             var selected = callContentFunction(callbackfn, T, kValue, k, O);
             /* Step 8.c.iii. */
             if (selected)
-                _DefineDataProperty(A, to++, kValue);
+                DefineDataProperty(A, to++, kValue);
         }
     }
 
     /* Step 9. */
     return A;
 }
+
+#ifdef NIGHTLY_BUILD
+// Array Grouping proposal
+//
+// Array.prototype.groupBy
+// https://tc39.es/proposal-array-grouping/#sec-array.prototype.groupby
+function ArrayGroupBy(callbackfn/*, thisArg*/) {
+    /* Step 1. Let O be ? ToObject(this value). */
+    var O = ToObject(this);
+
+    /* Step 2. Let len be ? LengthOfArrayLike(O). */
+    var len = ToLength(O.length);
+
+    /* Step 3. If IsCallable(callbackfn) is false, throw a TypeError exception. */
+    if (!IsCallable(callbackfn)) {
+        ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+    }
+
+    /* Step 5. Let groups be a new empty List. */
+    var groups = new_List();
+
+    var T = arguments.length > 1 ? arguments[1] : void 0;
+
+    /* Steps 4, 6. */
+    for (var k = 0; k < len; k++) {
+
+        /* Skip Step 6.a. Let Pk be ! ToString(𝔽(k)).
+         *
+         * k is coerced into a string through the property access. */
+
+        /* Step 6.b. Let kValue be ? Get(O, Pk). */
+        var kValue = O[k];
+
+        /* Step 6.c.
+         * Let propertyKey be ? ToPropertyKey(
+         *   ? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »)).
+         */
+        var propertyKey = TO_PROPERTY_KEY(
+          callContentFunction(callbackfn, T, kValue, k, O)
+        );
+
+        /* Step 6.d. Perform ! AddValueToKeyedGroup(groups, propertyKey, kValue). */
+        if (!groups[propertyKey]) {
+            var elements = [ kValue ];
+            DefineDataProperty(groups, propertyKey, elements);
+        } else {
+            var lenElements = groups[propertyKey].length;
+            DefineDataProperty(groups[propertyKey], lenElements, kValue);
+        }
+    }
+
+    /* Step 7. Let obj be ! OrdinaryObjectCreate(null). */
+    var object = std_Object_create(null);
+
+    /* Step 8. For each Record { [[Key]], [[Elements]] } g of groups, do
+     *  a. Let elements be ! CreateArrayFromList(g.[[Elements]]).
+     *  b. Perform ! CreateDataPropertyOrThrow(obj, g.[[Key]], elements).
+     */
+    for (var propertyKey in groups) {
+        DefineDataProperty(object, propertyKey, groups[propertyKey])
+    }
+
+    /* Step 9. Return obj. */
+    return object;
+}
+
+// Array Grouping proposal
+//
+// Array.prototype.groupByToMap
+// https://tc39.es/proposal-array-grouping/#sec-array.prototype.groupbymap
+function ArrayGroupByToMap(callbackfn/*, thisArg*/) {
+
+    /* Step 1. Let O be ? ToObject(this value). */
+    var O = ToObject(this);
+
+    /* Step 2. Let len be ? LengthOfArrayLike(O). */
+    var len = ToLength(O.length);
+
+    /* Step 3.
+     * If IsCallable(callbackfn) is false, throw a TypeError exception.
+     */
+    if (!IsCallable(callbackfn)) {
+        ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+    }
+
+    /* Skipping Step 5. Let groups be a new empty List.
+     *
+     * Intermediate object isn't necessary as we have direct access
+     * to the map constructor and set/get methods.
+     */
+
+    /* Step 7. Let map be ! Construct(%Map%). */
+    var C = GetBuiltinConstructor("Map");
+    var map = new C();
+
+    var T = arguments.length > 1 ? arguments[1] : void 0;
+
+    /* Combine Step 6. and Step 8.
+     *
+     * We have direct access to the map constructor and set/get methods.
+     * We can treat these two loops as one, as there isn't a risk that user
+     * polyfilling will impact the implementation.
+     */
+    for (var k = 0; k < len; k++) {
+        /* Skipping Step 6.a. Let Pk be ! ToString(𝔽(k)).
+         *
+         * Value is coerced to String by property access in step 6.b.
+         */
+
+        /* Step 6.b. Let kValue be ? Get(O, Pk). */
+        var kValue = O[k];
+
+        /* Step 6.c.
+         * Let key be ? Call(callbackfn, thisArg, « kValue, 𝔽(k), O »).
+         */
+        var propertyKey = callContentFunction(callbackfn,T, kValue, k, O);
+
+        /* Skipping Step 6.d. If key is -0𝔽, set key to +0𝔽.
+         *
+         * This step is performed by std_Map_set.
+         */
+
+        /* Step 8.c. Append entry as the last element of map.[[MapData]].
+         *
+         * We are not using an intermediate object to store the values.
+         * So, this step applies it directly to the map object. Skips steps
+         * 6.e (Perform ! AddValueToKeyedGroup(groups, key, kValue))
+         * and 8.a-b as a result.
+         */
+        if (!callFunction(std_Map_get, map, propertyKey)) {
+            var elements = [ kValue ];
+            callFunction(std_Map_set, map, propertyKey, elements);
+        } else {
+            var elements = callFunction(std_Map_get, map, propertyKey);
+            DefineDataProperty(elements, elements.length, kValue);
+        }
+    }
+
+    /* Step 9. Return map. */
+    return map;
+}
+
+#endif
 
 /* ES5 15.4.4.21. */
 function ArrayReduce(callbackfn/*, initialValue*/) {
@@ -575,50 +651,6 @@ function ArrayFill(value, start = 0, end = undefined) {
     return O;
 }
 
-// ES2020 draft rev dc1e21c454bd316810be1c0e7af0131a2d7f38e9
-// 22.1.3.13 Array.prototype.includes ( searchElement [ , fromIndex ] )
-function ArrayIncludes(searchElement, fromIndex = 0) {
-    // Step 1.
-    var O = ToObject(this);
-
-    // Step 2.
-    var len = ToLength(O.length);
-
-    // Step 3.
-    if (len === 0)
-        return false;
-
-    // Steps 4-5.
-    var n = ToInteger(fromIndex);
-
-    // Steps 6-7.
-    var k;
-    if (n >= 0) {
-        // Step 6.a.
-        k = n;
-    } else {
-        // Step 7.a.
-        k = len + n;
-
-        // Step 7.b.
-        if (k < 0)
-            k = 0;
-    }
-
-    // Step 8.
-    while (k < len) {
-        // Steps 8.a-c.
-        if (SameValueZero(searchElement, O[k]))
-            return true;
-
-        // Step 8.d.
-        k++;
-    }
-
-    // Step 9.
-    return false;
-}
-
 // ES6 draft specification, section 22.1.5.1, version 2013-09-05.
 function CreateArrayIterator(obj, kind) {
     var iteratedObject = ToObject(obj);
@@ -633,8 +665,8 @@ function CreateArrayIterator(obj, kind) {
 // http://www.ecma-international.org/ecma-262/6.0/index.html#sec-%arrayiteratorprototype%.next
 function ArrayIteratorNext() {
     // Step 1-3.
-    var obj;
-    if (!IsObject(this) || (obj = GuardToArrayIterator(this)) === null) {
+    var obj = this;
+    if (!IsObject(obj) || (obj = GuardToArrayIterator(obj)) === null) {
         return callFunction(CallArrayIteratorMethodIfWrapped, this,
                             "ArrayIteratorNext");
     }
@@ -698,13 +730,16 @@ function ArrayIteratorNext() {
     result.value = index;
     return result;
 }
+// We want to inline this to do scalar replacement of the result object.
+SetIsInlinableLargeFunction(ArrayIteratorNext);
+
 
 // Uncloned functions with `$` prefix are allocated as extended function
-// to store the original name in `_SetCanonicalName`.
+// to store the original name in `SetCanonicalName`.
 function $ArrayValues() {
     return CreateArrayIterator(this, ITEM_KIND_VALUE);
 }
-_SetCanonicalName($ArrayValues, "values");
+SetCanonicalName($ArrayValues, "values");
 
 function ArrayEntries() {
     return CreateArrayIterator(this, ITEM_KIND_KEY_AND_VALUE);
@@ -727,7 +762,7 @@ function ArrayFrom(items, mapfn = undefined, thisArg = undefined) {
 
     // Step 4.
     // Inlined: GetMethod, steps 1-2.
-    var usingIterator = items[std_iterator];
+    var usingIterator = items[GetBuiltinSymbol("iterator")];
 
     // Step 5.
     // Inlined: GetMethod, step 3.
@@ -749,9 +784,9 @@ function ArrayFrom(items, mapfn = undefined, thisArg = undefined) {
         for (var nextValue of allowContentIter(iterator)) {
             // Step 5.e.i.
             // Disabled for performance reason.  We won't hit this case on
-            // normal array, since _DefineDataProperty will throw before it.
+            // normal array, since DefineDataProperty will throw before it.
             // We could hit this when |A| is a proxy and it ignores
-            // |_DefineDataProperty|, but it happens only after too long loop.
+            // |DefineDataProperty|, but it happens only after too long loop.
             /*
             if (k >= 0x1fffffffffffff)
                 ThrowTypeError(JSMSG_TOO_LONG_ARRAY);
@@ -761,7 +796,7 @@ function ArrayFrom(items, mapfn = undefined, thisArg = undefined) {
             var mappedValue = mapping ? callContentFunction(mapfn, T, nextValue, k) : nextValue;
 
             // Steps 5.e.ii (reordered), 5.e.viii.
-            _DefineDataProperty(A, k++, mappedValue);
+            DefineDataProperty(A, k++, mappedValue);
         }
 
         // Step 5.e.iv.
@@ -790,7 +825,7 @@ function ArrayFrom(items, mapfn = undefined, thisArg = undefined) {
         var mappedValue = mapping ? callContentFunction(mapfn, T, kValue, k) : kValue;
 
         // Steps 16.f-g.
-        _DefineDataProperty(A, k, mappedValue);
+        DefineDataProperty(A, k, mappedValue);
     }
 
     // Steps 17-18.
@@ -809,7 +844,7 @@ function MakeIteratorWrapper(items, method) {
     return {
         // Use a named function expression instead of a method definition, so
         // we don't create an inferred name for this function at runtime.
-        [std_iterator]: function IteratorMethod() {
+        [GetBuiltinSymbol("iterator")]: function IteratorMethod() {
             return callContentFunction(method, items);
         },
     };
@@ -889,7 +924,7 @@ function $ArraySpecies() {
     // Step 1.
     return this;
 }
-_SetCanonicalName($ArraySpecies, "get [Symbol.species]");
+SetCanonicalName($ArraySpecies, "get [Symbol.species]");
 
 // ES 2016 draft Mar 25, 2016 9.4.2.3.
 function ArraySpeciesCreate(originalArray, length) {
@@ -916,7 +951,7 @@ function ArraySpeciesCreate(originalArray, length) {
     // Step 5.c.
     if (IsObject(C)) {
         // Step 5.c.i.
-        C = C[std_species];
+        C = C[GetBuiltinSymbol("species")];
 
         // Optimized path for an ordinary Array.
         if (C === GetBuiltinConstructor("Array"))
@@ -942,15 +977,25 @@ function ArraySpeciesCreate(originalArray, length) {
 // ES 2017 draft (April 8, 2016) 22.1.3.1.1
 function IsConcatSpreadable(O) {
     // Step 1.
-    if (!IsObject(O))
+    if (!IsObject(O)
+#ifdef ENABLE_RECORD_TUPLE
+        && !IsTuple(O)
+#endif
+    ) {
         return false;
+    }
 
     // Step 2.
-    var spreadable = O[std_isConcatSpreadable];
+    var spreadable = O[GetBuiltinSymbol("isConcatSpreadable")];
 
     // Step 3.
     if (spreadable !== undefined)
         return ToBoolean(spreadable);
+
+#ifdef ENABLE_RECORD_TUPLE
+    if (IsTuple(O))
+        return true;
+#endif
 
     // Step 4.
     return IsArray(O);
@@ -980,6 +1025,11 @@ function ArrayConcat(arg1) {
     while (true) {
         // Steps 5.b-c.
         if (IsConcatSpreadable(E)) {
+#ifdef ENABLE_RECORD_TUPLE
+            // FIXME: spec bug - steps below expect that |E| is an object.
+            E = ToObject(E);
+#endif
+
             // Step 5.c.ii.
             len = ToLength(E.length);
 
@@ -992,7 +1042,7 @@ function ArrayConcat(arg1) {
                 for (k = 0; k < len; k++) {
                     // Steps 5.c.iv.1-3.
                     // IsPackedArray(E) ensures that |k in E| is always true.
-                    _DefineDataProperty(A, n, E[k]);
+                    DefineDataProperty(A, n, E[k]);
 
                     // Step 5.c.iv.4.
                     n++;
@@ -1002,7 +1052,7 @@ function ArrayConcat(arg1) {
                 for (k = 0; k < len; k++) {
                     // Steps 5.c.iv.1-3.
                     if (k in E)
-                        _DefineDataProperty(A, n, E[k]);
+                        DefineDataProperty(A, n, E[k]);
 
                     // Step 5.c.iv.4.
                     n++;
@@ -1014,7 +1064,7 @@ function ArrayConcat(arg1) {
                 ThrowTypeError(JSMSG_TOO_LONG_ARRAY);
 
             // Step 5.d.ii.
-            _DefineDataProperty(A, n, E);
+            DefineDataProperty(A, n, E);
 
             // Step 5.d.iii.
             n++;
@@ -1129,7 +1179,7 @@ function FlattenIntoArray(target, source, sourceLen, start, depth, mapperFunctio
                     ThrowTypeError(JSMSG_TOO_LONG_ARRAY);
 
                 // Step 3.c.vi.2.
-                _DefineDataProperty(target, targetIndex, element);
+                DefineDataProperty(target, targetIndex, element);
 
                 // Step 3.c.vi.3.
                 targetIndex++;
@@ -1140,3 +1190,98 @@ function FlattenIntoArray(target, source, sourceLen, start, depth, mapperFunctio
     // Step 4.
     return targetIndex;
 }
+
+// https://github.com/tc39/proposal-relative-indexing-method
+// Array.prototype.at ( index )
+function ArrayAt(index) {
+     // Step 1.
+    var O = ToObject(this);
+
+    // Step 2.
+    var len = ToLength(O.length);
+
+    // Step 3.
+    var relativeIndex = ToInteger(index);
+
+    // Steps 4-5.
+    var k;
+    if (relativeIndex >= 0) {
+        k = relativeIndex;
+    } else {
+        k = len + relativeIndex;
+    }
+
+    // Step 6.
+    if (k < 0 || k >= len) {
+        return undefined;
+    }
+
+    // Step 7.
+    return O[k];
+}
+// This function is only barely too long for normal inlining.
+SetIsInlinableLargeFunction(ArrayAt);
+
+#ifdef ENABLE_CHANGE_ARRAY_BY_COPY
+
+// https://github.com/tc39/proposal-change-array-by-copy
+// Array.prototype.withReversed()
+function ArrayWithReversed() {
+
+    /* Step 1. */
+    var O = ToObject(this);
+
+    /* Step 2. */
+    var len = ToLength(O.length);
+
+    /* Step 3. */
+    var A = std_Array(len);
+
+    /* Steps 4-5. */
+    for (var k = 0; k < len; k++) {
+        /* Step 5a. */
+        var from = len - k - 1;
+        /* Step 5b - not necessary. */
+        /* Step 5c. */
+        var fromValue = O[from];
+        /* Step 5d. */
+        DefineDataProperty(A, k, fromValue);
+    }
+
+    /* Step 6. */
+    return A;
+}
+
+// https://github.com/tc39/proposal-change-array-by-copy
+// Array.prototype.withSorted()
+function ArrayWithSorted(comparefn) {
+
+    /* Step 1. */
+
+    if (comparefn !== undefined && !IsCallable(comparefn)) {
+        ThrowTypeError(JSMSG_BAD_WITHSORTED_ARG);
+    }
+
+    /* Step 2. */
+    var O = ToObject(this);
+
+    /* Step 3. */
+    var len = ToLength(O.length);
+
+    /* Step 4. */
+    var items = std_Array(len);
+
+    /* Steps 5-6. */
+    for (var k = 0; k < len; k++) {
+        DefineDataProperty(items, k, O[k]);
+    }
+
+    /* Step 7. */
+    SortArray(items, comparefn);
+
+    /* Steps 8-10 unnecessary */
+    /* Step 11. */
+    return items;
+}
+
+#endif

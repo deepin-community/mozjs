@@ -18,90 +18,19 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.
 
-use core::ptr;
-
-#[cfg(maybe_uninit)]
-use core::mem::MaybeUninit;
-
-#[cfg(not(maybe_uninit))]
-use core::mem;
-
-use common::*;
+use crate::common::*;
 #[cfg(not(feature = "small"))]
-use d2s_full_table::*;
-use d2s_intrinsics::*;
+pub use crate::d2s_full_table::*;
+use crate::d2s_intrinsics::*;
 #[cfg(feature = "small")]
-use d2s_small_table::*;
+pub use crate::d2s_small_table::*;
+use core::mem::MaybeUninit;
 
 pub const DOUBLE_MANTISSA_BITS: u32 = 52;
 pub const DOUBLE_EXPONENT_BITS: u32 = 11;
-
-const DOUBLE_BIAS: i32 = 1023;
-const DOUBLE_POW5_INV_BITCOUNT: i32 = 122;
-const DOUBLE_POW5_BITCOUNT: i32 = 121;
-
-#[cfg(integer128)]
-#[cfg_attr(feature = "no-panic", inline)]
-fn mul_shift(m: u64, mul: &(u64, u64), j: u32) -> u64 {
-    let b0 = m as u128 * mul.0 as u128;
-    let b2 = m as u128 * mul.1 as u128;
-    (((b0 >> 64) + b2) >> (j - 64)) as u64
-}
-
-#[cfg(integer128)]
-#[cfg_attr(feature = "no-panic", inline)]
-unsafe fn mul_shift_all(
-    m: u64,
-    mul: &(u64, u64),
-    j: u32,
-    vp: *mut u64,
-    vm: *mut u64,
-    mm_shift: u32,
-) -> u64 {
-    ptr::write(vp, mul_shift(4 * m + 2, mul, j));
-    ptr::write(vm, mul_shift(4 * m - 1 - mm_shift as u64, mul, j));
-    mul_shift(4 * m, mul, j)
-}
-
-#[cfg(not(integer128))]
-#[cfg_attr(feature = "no-panic", inline)]
-unsafe fn mul_shift_all(
-    mut m: u64,
-    mul: &(u64, u64),
-    j: u32,
-    vp: *mut u64,
-    vm: *mut u64,
-    mm_shift: u32,
-) -> u64 {
-    m <<= 1;
-    // m is maximum 55 bits
-    let (lo, tmp) = umul128(m, mul.0);
-    let (mut mid, mut hi) = umul128(m, mul.1);
-    mid = mid.wrapping_add(tmp);
-    hi = hi.wrapping_add((mid < tmp) as u64); // overflow into hi
-
-    let lo2 = lo.wrapping_add(mul.0);
-    let mid2 = mid.wrapping_add(mul.1).wrapping_add((lo2 < lo) as u64);
-    let hi2 = hi.wrapping_add((mid2 < mid) as u64);
-    ptr::write(vp, shiftright128(mid2, hi2, j - 64 - 1));
-
-    if mm_shift == 1 {
-        let lo3 = lo.wrapping_sub(mul.0);
-        let mid3 = mid.wrapping_sub(mul.1).wrapping_sub((lo3 > lo) as u64);
-        let hi3 = hi.wrapping_sub((mid3 > mid) as u64);
-        ptr::write(vm, shiftright128(mid3, hi3, j - 64 - 1));
-    } else {
-        let lo3 = lo + lo;
-        let mid3 = mid.wrapping_add(mid).wrapping_add((lo3 < lo) as u64);
-        let hi3 = hi.wrapping_add(hi).wrapping_add((mid3 < mid) as u64);
-        let lo4 = lo3.wrapping_sub(mul.0);
-        let mid4 = mid3.wrapping_sub(mul.1).wrapping_sub((lo4 > lo3) as u64);
-        let hi4 = hi3.wrapping_sub((mid4 > mid3) as u64);
-        ptr::write(vm, shiftright128(mid4, hi4, j - 64));
-    }
-
-    shiftright128(mid, hi, j - 64 - 1)
-}
+pub const DOUBLE_BIAS: i32 = 1023;
+pub const DOUBLE_POW5_INV_BITCOUNT: i32 = 125;
+pub const DOUBLE_POW5_BITCOUNT: i32 = 125;
 
 #[cfg_attr(feature = "no-panic", inline)]
 pub fn decimal_length17(v: u64) -> u32 {
@@ -185,14 +114,7 @@ pub fn d2d(ieee_mantissa: u64, ieee_exponent: u32) -> FloatingDecimal64 {
     let mut vr: u64;
     let mut vp: u64;
     let mut vm: u64;
-    #[cfg(not(maybe_uninit))]
-    {
-        vp = unsafe { mem::uninitialized() };
-        vm = unsafe { mem::uninitialized() };
-    }
-    #[cfg(maybe_uninit)]
     let mut vp_uninit: MaybeUninit<u64> = MaybeUninit::uninit();
-    #[cfg(maybe_uninit)]
     let mut vm_uninit: MaybeUninit<u64> = MaybeUninit::uninit();
     let e10: i32;
     let mut vm_is_trailing_zeros = false;
@@ -205,7 +127,7 @@ pub fn d2d(ieee_mantissa: u64, ieee_exponent: u32) -> FloatingDecimal64 {
         let k = DOUBLE_POW5_INV_BITCOUNT + pow5bits(q as i32) - 1;
         let i = -e2 + q as i32 + k;
         vr = unsafe {
-            mul_shift_all(
+            mul_shift_all_64(
                 m2,
                 #[cfg(feature = "small")]
                 &compute_inv_pow5(q),
@@ -215,30 +137,13 @@ pub fn d2d(ieee_mantissa: u64, ieee_exponent: u32) -> FloatingDecimal64 {
                     DOUBLE_POW5_INV_SPLIT.get_unchecked(q as usize)
                 },
                 i as u32,
-                #[cfg(maybe_uninit)]
-                {
-                    vp_uninit.as_mut_ptr()
-                },
-                #[cfg(not(maybe_uninit))]
-                {
-                    &mut vp
-                },
-                #[cfg(maybe_uninit)]
-                {
-                    vm_uninit.as_mut_ptr()
-                },
-                #[cfg(not(maybe_uninit))]
-                {
-                    &mut vm
-                },
+                vp_uninit.as_mut_ptr(),
+                vm_uninit.as_mut_ptr(),
                 mm_shift,
             )
         };
-        #[cfg(maybe_uninit)]
-        {
-            vp = unsafe { vp_uninit.assume_init() };
-            vm = unsafe { vm_uninit.assume_init() };
-        }
+        vp = unsafe { vp_uninit.assume_init() };
+        vm = unsafe { vm_uninit.assume_init() };
         if q <= 21 {
             // This should use q <= 22, but I think 21 is also safe. Smaller values
             // may still be safe, but it's more difficult to reason about them.
@@ -264,7 +169,7 @@ pub fn d2d(ieee_mantissa: u64, ieee_exponent: u32) -> FloatingDecimal64 {
         let k = pow5bits(i) - DOUBLE_POW5_BITCOUNT;
         let j = q as i32 - k;
         vr = unsafe {
-            mul_shift_all(
+            mul_shift_all_64(
                 m2,
                 #[cfg(feature = "small")]
                 &compute_pow5(i as u32),
@@ -274,30 +179,13 @@ pub fn d2d(ieee_mantissa: u64, ieee_exponent: u32) -> FloatingDecimal64 {
                     DOUBLE_POW5_SPLIT.get_unchecked(i as usize)
                 },
                 j as u32,
-                #[cfg(maybe_uninit)]
-                {
-                    vp_uninit.as_mut_ptr()
-                },
-                #[cfg(not(maybe_uninit))]
-                {
-                    &mut vp
-                },
-                #[cfg(maybe_uninit)]
-                {
-                    vm_uninit.as_mut_ptr()
-                },
-                #[cfg(not(maybe_uninit))]
-                {
-                    &mut vm
-                },
+                vp_uninit.as_mut_ptr(),
+                vm_uninit.as_mut_ptr(),
                 mm_shift,
             )
         };
-        #[cfg(maybe_uninit)]
-        {
-            vp = unsafe { vp_uninit.assume_init() };
-            vm = unsafe { vm_uninit.assume_init() };
-        }
+        vp = unsafe { vp_uninit.assume_init() };
+        vm = unsafe { vm_uninit.assume_init() };
         if q <= 1 {
             // {vr,vp,vm} is trailing zeros if {mv,mp,mm} has at least q trailing 0 bits.
             // mv = 4 * m2, so it always has at least two trailing 0 bits.

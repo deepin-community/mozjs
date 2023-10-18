@@ -9,7 +9,7 @@ use rand::Rng;
 
 fn bench(b: &mut Bencher, size: usize, hasher_init: Hasher) {
     let mut bytes = vec![0u8; size];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::thread_rng().fill(&mut bytes[..]);
 
     b.iter(|| {
         let mut hasher = hasher_init.clone();
@@ -21,19 +21,23 @@ fn bench(b: &mut Bencher, size: usize, hasher_init: Hasher) {
 }
 
 fn bench_kilobyte_baseline(b: &mut Bencher) {
-    bench(b, 1024, Hasher::internal_new_baseline(0))
+    bench(b, 1024, Hasher::internal_new_baseline(0, 0))
 }
 
 fn bench_kilobyte_specialized(b: &mut Bencher) {
-    bench(b, 1024, Hasher::internal_new_specialized(0).unwrap())
+    bench(b, 1024, Hasher::internal_new_specialized(0, 0).unwrap())
 }
 
 fn bench_megabyte_baseline(b: &mut Bencher) {
-    bench(b, 1024 * 1024, Hasher::internal_new_baseline(0))
+    bench(b, 1024 * 1024, Hasher::internal_new_baseline(0, 0))
 }
 
 fn bench_megabyte_specialized(b: &mut Bencher) {
-    bench(b, 1024 * 1024, Hasher::internal_new_specialized(0).unwrap())
+    bench(
+        b,
+        1024 * 1024,
+        Hasher::internal_new_specialized(0, 0).unwrap(),
+    )
 }
 
 benchmark_group!(

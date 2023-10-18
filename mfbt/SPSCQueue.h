@@ -14,13 +14,15 @@
 #include "mozilla/PodOperations.h"
 #include <algorithm>
 #include <atomic>
-#include <cstdint>
+#include <cstddef>
+#include <limits>
 #include <memory>
 #include <thread>
+#include <type_traits>
 
 namespace mozilla {
 
-namespace details {
+namespace detail {
 template <typename T, bool IsPod = std::is_trivial<T>::value>
 struct MemoryOperations {
   /**
@@ -58,7 +60,7 @@ struct MemoryOperations<T, false> {
     std::move(aSource, aSource + aCount, aDestination);
   }
 };
-}  // namespace details
+}  // namespace detail
 
 /**
  * This data structure allows producing data from one thread, and consuming it
@@ -101,17 +103,15 @@ class SPSCRingBufferBase {
    */
   explicit SPSCRingBufferBase(int aCapacity)
       : mReadIndex(0),
-        mWriteIndex(0)
+        mWriteIndex(0),
         /* One more element to distinguish from empty and full buffer. */
-        ,
         mCapacity(aCapacity + 1) {
-    MOZ_ASSERT(StorageCapacity() < std::numeric_limits<int>::max() / 2,
-               "buffer too large for the type of index used.");
-    MOZ_ASSERT(mCapacity > 0 && aCapacity != std::numeric_limits<int>::max());
+    MOZ_RELEASE_ASSERT(aCapacity != std::numeric_limits<int>::max());
+    MOZ_RELEASE_ASSERT(mCapacity > 0);
 
     mData = std::make_unique<T[]>(StorageCapacity());
 
-    std::atomic_thread_fence(std::memory_order::memory_order_seq_cst);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
   }
   /**
    * Push `aCount` zero or default constructed elements in the array.
@@ -121,8 +121,9 @@ class SPSCRingBufferBase {
    * @param count The number of elements to enqueue.
    * @return The number of element enqueued.
    */
-  MOZ_MUST_USE
-  int EnqueueDefault(int aCount) { return Enqueue(nullptr, aCount); }
+  [[nodiscard]] int EnqueueDefault(int aCount) {
+    return Enqueue(nullptr, aCount);
+  }
   /**
    * @brief Put an element in the queue.
    *
@@ -132,8 +133,7 @@ class SPSCRingBufferBase {
    *
    * @return 1 if the element was inserted, 0 otherwise.
    */
-  MOZ_MUST_USE
-  int Enqueue(T& aElement) { return Enqueue(&aElement, 1); }
+  [[nodiscard]] int Enqueue(T& aElement) { return Enqueue(&aElement, 1); }
   /**
    * Push `aCount` elements in the ring buffer.
    *
@@ -145,14 +145,13 @@ class SPSCRingBufferBase {
    * @return The number of elements successfully coped from `elements` and
    * inserted into the ring buffer.
    */
-  MOZ_MUST_USE
-  int Enqueue(T* aElements, int aCount) {
+  [[nodiscard]] int Enqueue(T* aElements, int aCount) {
 #ifdef DEBUG
     AssertCorrectThread(mProducerId);
 #endif
 
-    int rdIdx = mReadIndex.load(std::memory_order::memory_order_acquire);
-    int wrIdx = mWriteIndex.load(std::memory_order::memory_order_relaxed);
+    int rdIdx = mReadIndex.load(std::memory_order_acquire);
+    int wrIdx = mWriteIndex.load(std::memory_order_relaxed);
 
     if (IsFull(rdIdx, wrIdx)) {
       return 0;
@@ -166,18 +165,18 @@ class SPSCRingBufferBase {
     int secondPart = toWrite - firstPart;
 
     if (aElements) {
-      details::MemoryOperations<T>::MoveOrCopy(mData.get() + wrIdx, aElements,
-                                               firstPart);
-      details::MemoryOperations<T>::MoveOrCopy(
+      detail::MemoryOperations<T>::MoveOrCopy(mData.get() + wrIdx, aElements,
+                                              firstPart);
+      detail::MemoryOperations<T>::MoveOrCopy(
           mData.get(), aElements + firstPart, secondPart);
     } else {
-      details::MemoryOperations<T>::ConstructDefault(mData.get() + wrIdx,
-                                                     firstPart);
-      details::MemoryOperations<T>::ConstructDefault(mData.get(), secondPart);
+      detail::MemoryOperations<T>::ConstructDefault(mData.get() + wrIdx,
+                                                    firstPart);
+      detail::MemoryOperations<T>::ConstructDefault(mData.get(), secondPart);
     }
 
     mWriteIndex.store(IncrementIndex(wrIdx, toWrite),
-                      std::memory_order::memory_order_release);
+                      std::memory_order_release);
 
     return toWrite;
   }
@@ -192,14 +191,13 @@ class SPSCRingBufferBase {
    * @param count The maximum number of elements to Dequeue.
    * @return The number of elements written to `elements`.
    */
-  MOZ_MUST_USE
-  int Dequeue(T* elements, int count) {
+  [[nodiscard]] int Dequeue(T* elements, int count) {
 #ifdef DEBUG
     AssertCorrectThread(mConsumerId);
 #endif
 
-    int wrIdx = mWriteIndex.load(std::memory_order::memory_order_acquire);
-    int rdIdx = mReadIndex.load(std::memory_order::memory_order_relaxed);
+    int wrIdx = mWriteIndex.load(std::memory_order_acquire);
+    int rdIdx = mReadIndex.load(std::memory_order_relaxed);
 
     if (IsEmpty(rdIdx, wrIdx)) {
       return 0;
@@ -211,54 +209,43 @@ class SPSCRingBufferBase {
     int secondPart = toRead - firstPart;
 
     if (elements) {
-      details::MemoryOperations<T>::MoveOrCopy(elements, mData.get() + rdIdx,
-                                               firstPart);
-      details::MemoryOperations<T>::MoveOrCopy(elements + firstPart,
-                                               mData.get(), secondPart);
+      detail::MemoryOperations<T>::MoveOrCopy(elements, mData.get() + rdIdx,
+                                              firstPart);
+      detail::MemoryOperations<T>::MoveOrCopy(elements + firstPart, mData.get(),
+                                              secondPart);
     }
 
-    mReadIndex.store(IncrementIndex(rdIdx, toRead),
-                     std::memory_order::memory_order_release);
+    mReadIndex.store(IncrementIndex(rdIdx, toRead), std::memory_order_release);
 
     return toRead;
   }
   /**
    * Get the number of available elements for consuming.
    *
-   * Only safely called on the consumer thread. This can be less than the actual
-   * number of elements in the queue, since the mWriteIndex is updated at the
-   * very end of the Enqueue method on the producer thread, but consequently
-   * always returns a number of elements such that a call to Dequeue return this
-   * number of elements.
+   * This can be less than the actual number of elements in the queue, since the
+   * mWriteIndex is updated at the very end of the Enqueue method on the
+   * producer thread, but consequently always returns a number of elements such
+   * that a call to Dequeue return this number of elements.
    *
    * @return The number of available elements for reading.
    */
   int AvailableRead() const {
-#ifdef DEBUG
-    AssertCorrectThread(mConsumerId);
-#endif
-    return AvailableReadInternal(
-        mReadIndex.load(std::memory_order::memory_order_relaxed),
-        mWriteIndex.load(std::memory_order::memory_order_relaxed));
+    return AvailableReadInternal(mReadIndex.load(std::memory_order_relaxed),
+                                 mWriteIndex.load(std::memory_order_relaxed));
   }
   /**
    * Get the number of available elements for writing.
    *
-   * Only safely called on the producer thread. This can be less than than the
-   * actual number of slots that are available, because mReadIndex is update at
-   * the very end of the Deque method. It always returns a number such that a
-   * call to Enqueue with this number will succeed in enqueuing this number of
-   * elements.
+   * This can be less than than the actual number of slots that are available,
+   * because mReadIndex is updated at the very end of the Deque method. It
+   * always returns a number such that a call to Enqueue with this number will
+   * succeed in enqueuing this number of elements.
    *
    * @return The number of empty slots in the buffer, available for writing.
    */
   int AvailableWrite() const {
-#ifdef DEBUG
-    AssertCorrectThread(mProducerId);
-#endif
-    return AvailableWriteInternal(
-        mReadIndex.load(std::memory_order::memory_order_relaxed),
-        mWriteIndex.load(std::memory_order::memory_order_relaxed));
+    return AvailableWriteInternal(mReadIndex.load(std::memory_order_relaxed),
+                                  mWriteIndex.load(std::memory_order_relaxed));
   }
   /**
    * Get the total Capacity, for this ring buffer.
@@ -274,8 +261,19 @@ class SPSCRingBufferBase {
    * asserts are disabled.
    */
   void ResetThreadIds() {
+    ResetProducerThreadId();
+    ResetConsumerThreadId();
+  }
+
+  void ResetConsumerThreadId() {
 #ifdef DEBUG
-    mConsumerId = mProducerId = std::thread::id();
+    mConsumerId = std::thread::id();
+#endif
+  }
+
+  void ResetProducerThreadId() {
+#ifdef DEBUG
+    mProducerId = std::thread::id();
 #endif
   }
 

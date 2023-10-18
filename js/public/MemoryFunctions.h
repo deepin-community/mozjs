@@ -9,14 +9,12 @@
 #define js_MemoryFunctions_h
 
 #include "mozilla/Assertions.h"  // MOZ_ASSERT
-#include "mozilla/Attributes.h"  // MOZ_MUST_USE
 
 #include <stddef.h>  // size_t
 
 #include "jstypes.h"  // JS_PUBLIC_API
 
 struct JS_PUBLIC_API JSContext;
-class JS_PUBLIC_API JSFreeOp;
 class JS_PUBLIC_API JSObject;
 struct JS_PUBLIC_API JSRuntime;
 
@@ -43,12 +41,6 @@ extern JS_PUBLIC_API void* JS_string_realloc(JSContext* cx, void* p,
 
 extern JS_PUBLIC_API void JS_string_free(JSContext* cx, void* p);
 
-/**
- * A wrapper for |js_free(p)| that may delay |js_free(p)| invocation as a
- * performance optimization as specified by the given JSFreeOp instance.
- */
-extern JS_PUBLIC_API void JS_freeop(JSFreeOp* fop, void* p);
-
 namespace JS {
 
 /**
@@ -65,7 +57,6 @@ namespace JS {
   _(CDataBuffer)                         \
   _(CClosureInfo)                        \
   _(CTypesInt64)                         \
-  _(PerfMeasurement)                     \
   _(Embedding1)                          \
   _(Embedding2)                          \
   _(Embedding3)                          \

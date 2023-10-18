@@ -44,8 +44,10 @@ class Creator(object):
         self._debug = None
         self.dest = Path(options.dest)
         self.clear = options.clear
+        self.no_vcs_ignore = options.no_vcs_ignore
         self.pyenv_cfg = PyEnvCfg.from_folder(self.dest)
         self.app_data = options.app_data
+        self.env = options.env
 
     def __repr__(self):
         return ensure_str(self.__unicode__())
@@ -57,6 +59,7 @@ class Creator(object):
         return [
             ("dest", ensure_text(str(self.dest))),
             ("clear", self.clear),
+            ("no_vcs_ignore", self.no_vcs_ignore),
         ]
 
     @classmethod
@@ -79,13 +82,22 @@ class Creator(object):
         :param meta: value as returned by :meth:`can_create`
         """
         parser.add_argument(
-            "dest", help="directory to create virtualenv at", type=cls.validate_dest,
+            "dest",
+            help="directory to create virtualenv at",
+            type=cls.validate_dest,
         )
         parser.add_argument(
             "--clear",
             dest="clear",
             action="store_true",
             help="remove the destination directory if exist before starting (will overwrite files otherwise)",
+            default=False,
+        )
+        parser.add_argument(
+            "--no-vcs-ignore",
+            dest="no_vcs_ignore",
+            action="store_true",
+            help="don't create VCS ignore directive in the destination directory",
             default=False,
         )
 
@@ -120,7 +132,9 @@ class Creator(object):
         if refused:
             raise ArgumentTypeError(
                 "the file system codec ({}) cannot handle characters {!r} within {!r}".format(
-                    encoding, "".join(refused.keys()), raw_value,
+                    encoding,
+                    "".join(refused.keys()),
+                    raw_value,
                 ),
             )
         if os.pathsep in raw_value:
@@ -156,7 +170,8 @@ class Creator(object):
             safe_delete(self.dest)
         self.create()
         self.set_pyenv_cfg()
-        self.setup_ignore_vcs()
+        if not self.no_vcs_ignore:
+            self.setup_ignore_vcs()
 
     def set_pyenv_cfg(self):
         self.pyenv_cfg.content = OrderedDict()
@@ -190,7 +205,7 @@ class Creator(object):
         :return: debug information about the virtual environment (only valid after :meth:`create` has run)
         """
         if self._debug is None and self.exe is not None:
-            self._debug = get_env_debug_info(self.exe, self.debug_script(), self.app_data)
+            self._debug = get_env_debug_info(self.exe, self.debug_script(), self.app_data, self.env)
         return self._debug
 
     # noinspection PyMethodMayBeStatic
@@ -198,8 +213,8 @@ class Creator(object):
         return DEBUG_SCRIPT
 
 
-def get_env_debug_info(env_exe, debug_script, app_data):
-    env = os.environ.copy()
+def get_env_debug_info(env_exe, debug_script, app_data, env):
+    env = env.copy()
     env.pop(str("PYTHONPATH"), None)
 
     with app_data.ensure_extracted(debug_script) as debug_script:

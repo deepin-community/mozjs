@@ -53,10 +53,10 @@ function checkLcov(fun) {
     }
   }
 
-  // Evaluate the code, and generate the Lcov result from the execution. We have
-  // to disable lazy parsing, as we rely on the ZoneCellIter to emulate the
-  // behaviour of the finalizer.
-  var g = newGlobal({ disableLazyParsing: true });
+  // Evaluate the code, and generate the Lcov result from the execution.
+  // Enabling LCov disables lazy parsing, as we rely on the ZoneCellIter to
+  // emulate the behaviour of the finalizer.
+  var g = newGlobal();
   g.eval(source);
   var lcovResRaw = getLcovInfo(g);
 
@@ -242,8 +242,8 @@ checkLcov(function () { //FN:$,top-level //FNDA:1,%
   //FNH:1
   //LF:10
   //LH:9
-  //BRF:2
-  //BRH:1
+  //BRF:4
+  //BRH:2
 });
 
 checkLcov(function () { //FN:$,top-level //FNDA:1,%

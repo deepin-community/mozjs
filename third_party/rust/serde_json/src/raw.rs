@@ -1,14 +1,12 @@
-use std::fmt::{self, Debug, Display};
-use std::mem;
-
+use crate::error::Error;
+use crate::lib::*;
 use serde::de::value::BorrowedStrDeserializer;
 use serde::de::{
     self, Deserialize, DeserializeSeed, Deserializer, IntoDeserializer, MapAccess, Unexpected,
     Visitor,
 };
+use serde::forward_to_deserialize_any;
 use serde::ser::{Serialize, SerializeStruct, Serializer};
-
-use error::Error;
 
 /// Reference to a range of bytes encompassing a single valid JSON value in the
 /// input data.
@@ -32,7 +30,7 @@ use error::Error;
 ///
 /// # Example
 ///
-/// ```edition2018
+/// ```
 /// use serde::{Deserialize, Serialize};
 /// use serde_json::{Result, value::RawValue};
 ///
@@ -78,7 +76,7 @@ use error::Error;
 ///
 /// The typical usage of `RawValue` will be in the borrowed form:
 ///
-/// ```edition2018
+/// ```
 /// # use serde::Deserialize;
 /// # use serde_json::value::RawValue;
 /// #
@@ -101,7 +99,7 @@ use error::Error;
 /// [`serde_json::from_slice`]: ../fn.from_slice.html
 /// [`serde_json::from_reader`]: ../fn.from_reader.html
 ///
-/// ```edition2018
+/// ```
 /// # use serde::Deserialize;
 /// # use serde_json::value::RawValue;
 /// #
@@ -111,6 +109,7 @@ use error::Error;
 /// }
 /// ```
 #[repr(C)]
+#[cfg_attr(docsrs, doc(cfg(feature = "raw_value")))]
 pub struct RawValue {
     json: str,
 }
@@ -122,6 +121,10 @@ impl RawValue {
 
     fn from_owned(json: Box<str>) -> Box<Self> {
         unsafe { mem::transmute::<Box<str>, Box<RawValue>>(json) }
+    }
+
+    fn into_owned(raw_value: Box<Self>) -> Box<str> {
+        unsafe { mem::transmute::<Box<RawValue>, Box<str>>(raw_value) }
     }
 }
 
@@ -171,7 +174,7 @@ impl RawValue {
     /// - the input has capacity equal to its length.
     pub fn from_string(json: String) -> Result<Box<Self>, Error> {
         {
-            let borrowed = ::from_str::<&Self>(&json)?;
+            let borrowed = crate::from_str::<&Self>(&json)?;
             if borrowed.json.len() < json.len() {
                 return Ok(borrowed.to_owned());
             }
@@ -183,7 +186,7 @@ impl RawValue {
     ///
     /// # Example
     ///
-    /// ```edition2018
+    /// ```
     /// use serde::Deserialize;
     /// use serde_json::{Result, value::RawValue};
     ///
@@ -217,7 +220,74 @@ impl RawValue {
     }
 }
 
-pub const TOKEN: &'static str = "$serde_json::private::RawValue";
+impl From<Box<RawValue>> for Box<str> {
+    fn from(raw_value: Box<RawValue>) -> Self {
+        RawValue::into_owned(raw_value)
+    }
+}
+
+/// Convert a `T` into a boxed `RawValue`.
+///
+/// # Example
+///
+/// ```
+/// // Upstream crate
+/// # #[derive(Serialize)]
+/// pub struct Thing {
+///     foo: String,
+///     bar: Option<String>,
+///     extra_data: Box<RawValue>,
+/// }
+///
+/// // Local crate
+/// use serde::Serialize;
+/// use serde_json::value::{to_raw_value, RawValue};
+///
+/// #[derive(Serialize)]
+/// struct MyExtraData {
+///     a: u32,
+///     b: u32,
+/// }
+///
+/// let my_thing = Thing {
+///     foo: "FooVal".into(),
+///     bar: None,
+///     extra_data: to_raw_value(&MyExtraData { a: 1, b: 2 }).unwrap(),
+/// };
+/// # assert_eq!(
+/// #     serde_json::to_value(my_thing).unwrap(),
+/// #     serde_json::json!({
+/// #         "foo": "FooVal",
+/// #         "bar": null,
+/// #         "extra_data": { "a": 1, "b": 2 }
+/// #     })
+/// # );
+/// ```
+///
+/// # Errors
+///
+/// This conversion can fail if `T`'s implementation of `Serialize` decides to
+/// fail, or if `T` contains a map with non-string keys.
+///
+/// ```
+/// use std::collections::BTreeMap;
+///
+/// // The keys in this map are vectors, not strings.
+/// let mut map = BTreeMap::new();
+/// map.insert(vec![32, 64], "x86");
+///
+/// println!("{}", serde_json::value::to_raw_value(&map).unwrap_err());
+/// ```
+#[cfg_attr(docsrs, doc(cfg(feature = "raw_value")))]
+pub fn to_raw_value<T>(value: &T) -> Result<Box<RawValue>, Error>
+where
+    T: Serialize,
+{
+    let json_string = crate::to_string(value)?;
+    Ok(RawValue::from_owned(json_string.into_boxed_str()))
+}
+
+pub const TOKEN: &str = "$serde_json::private::RawValue";
 
 impl Serialize for RawValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>

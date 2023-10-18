@@ -8,6 +8,7 @@
 #define frontend_TypedIndex_h
 
 #include <cstdint>
+#include <stddef.h>
 
 namespace js {
 namespace frontend {
@@ -17,7 +18,7 @@ namespace frontend {
 template <typename Tag>
 struct TypedIndex {
   TypedIndex() = default;
-  explicit TypedIndex(uint32_t index) : index(index){};
+  constexpr explicit TypedIndex(uint32_t index) : index(index){};
 
   uint32_t index = 0;
 
@@ -28,6 +29,11 @@ struct TypedIndex {
     index = idx;
     return *this;
   }
+
+  bool operator<(TypedIndex other) { return index < other.index; }
+  bool operator<=(TypedIndex other) { return index <= other.index; }
+  bool operator>(TypedIndex other) { return index > other.index; }
+  bool operator>=(TypedIndex other) { return index >= other.index; }
 };
 
 }  // namespace frontend

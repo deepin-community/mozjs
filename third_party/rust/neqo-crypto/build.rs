@@ -14,7 +14,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use toml;
 
 const BINDINGS_DIR: &str = "bindings";
 const BINDINGS_CONFIG: &str = "bindings.toml";
@@ -22,25 +21,31 @@ const BINDINGS_CONFIG: &str = "bindings.toml";
 // This is the format of a single section of the configuration file.
 #[derive(Deserialize)]
 struct Bindings {
-    // types that are explicitly included
-    types: Option<Vec<String>>,
-    // functions that are explicitly included
-    functions: Option<Vec<String>>,
-    // variables (and `#define`s) that are explicitly included
-    variables: Option<Vec<String>>,
-    // types that should be explicitly marked as opaque
-    opaque: Option<Vec<String>>,
-    // enumerations that are turned into a module (without this, the enum is
-    // mapped using the default, which means that the individual values are
-    // formed with an underscore as <enum_type>_<enum_value_name>).
-    enums: Option<Vec<String>>,
+    /// types that are explicitly included
+    #[serde(default)]
+    types: Vec<String>,
+    /// functions that are explicitly included
+    #[serde(default)]
+    functions: Vec<String>,
+    /// variables (and `#define`s) that are explicitly included
+    #[serde(default)]
+    variables: Vec<String>,
+    /// types that should be explicitly marked as opaque
+    #[serde(default)]
+    opaque: Vec<String>,
+    /// enumerations that are turned into a module (without this, the enum is
+    /// mapped using the default, which means that the individual values are
+    /// formed with an underscore as <enum_type>_<enum_value_name>).
+    #[serde(default)]
+    enums: Vec<String>,
 
-    // Any item that is specifically excluded; if none of the types, functions,
-    // or variables fields are specified, everything defined will be mapped,
-    // so this can be used to limit that.
-    exclude: Option<Vec<String>>,
+    /// Any item that is specifically excluded; if none of the types, functions,
+    /// or variables fields are specified, everything defined will be mapped,
+    /// so this can be used to limit that.
+    #[serde(default)]
+    exclude: Vec<String>,
 
-    // Whether the file is to be interpreted as C++
+    /// Whether the file is to be interpreted as C++
     #[serde(default)]
     cplusplus: bool,
 }
@@ -69,7 +74,7 @@ fn setup_clang() {
         eprintln!("warning: Building without a gecko setup is not likely to work.");
         eprintln!("         A working libclang is needed to build neqo.");
         eprintln!("         Either LIBCLANG_PATH or MOZBUILD_STATE_PATH needs to be set.");
-        eprintln!("");
+        eprintln!();
         eprintln!("    We recommend checking out https://github.com/mozilla/gecko-dev");
         eprintln!("    Then run `./mach bootstrap` which will retrieve clang.");
         eprintln!("    Make sure to export MOZBUILD_STATE_PATH when building.");
@@ -111,9 +116,9 @@ fn nss_dir() -> PathBuf {
                 .status()
                 .expect("can't clone nspr");
         }
-        dir.to_path_buf()
+        dir
     };
-    assert!(dir.is_dir());
+    assert!(dir.is_dir(), "NSS_DIR {:?} doesn't exist", dir);
     // Note that this returns a relative path because UNC
     // paths on windows cause certain tools to explode.
     dir
@@ -124,7 +129,7 @@ fn get_bash() -> PathBuf {
     // another instance of bash that might be sitting around (like WSL).
     match env::var("MOZILLABUILD") {
         Ok(d) => PathBuf::from(d).join("msys").join("bin").join("bash.exe"),
-        _ => PathBuf::from("bash"),
+        Err(_) => PathBuf::from("bash"),
     }
 }
 
@@ -250,23 +255,22 @@ fn build_bindings(base: &str, bindings: &Bindings, flags: &[String], gecko: bool
     builder = builder.clang_args(flags);
 
     // Apply the configuration.
-    let empty: Vec<String> = vec![];
-    for v in bindings.types.as_ref().unwrap_or_else(|| &empty).iter() {
+    for v in &bindings.types {
         builder = builder.whitelist_type(v);
     }
-    for v in bindings.functions.as_ref().unwrap_or_else(|| &empty).iter() {
+    for v in &bindings.functions {
         builder = builder.whitelist_function(v);
     }
-    for v in bindings.variables.as_ref().unwrap_or_else(|| &empty).iter() {
+    for v in &bindings.variables {
         builder = builder.whitelist_var(v);
     }
-    for v in bindings.exclude.as_ref().unwrap_or_else(|| &empty).iter() {
+    for v in &bindings.exclude {
         builder = builder.blacklist_item(v);
     }
-    for v in bindings.opaque.as_ref().unwrap_or_else(|| &empty).iter() {
+    for v in &bindings.opaque {
         builder = builder.opaque_type(v);
     }
-    for v in bindings.enums.as_ref().unwrap_or_else(|| &empty).iter() {
+    for v in &bindings.enums {
         builder = builder.constified_enum_module(v);
     }
 
@@ -311,27 +315,34 @@ fn setup_standalone() -> Vec<String> {
     flags
 }
 
+#[cfg(feature = "gecko")]
 fn setup_for_gecko() -> Vec<String> {
+    use mozbuild::TOPOBJDIR;
+
     let mut flags: Vec<String> = Vec::new();
 
-    let libs = match env::var("CARGO_CFG_TARGET_OS")
-        .as_ref()
-        .map(std::string::String::as_str)
-    {
-        Ok("android") | Ok("macos") => vec!["nss3"],
-        _ => vec!["nssutil3", "nss3", "ssl3", "plds4", "plc4", "nspr4"],
+    let fold_libs = mozbuild::config::MOZ_FOLD_LIBS;
+    let libs = if fold_libs {
+        vec!["nss3"]
+    } else {
+        vec!["nssutil3", "nss3", "ssl3", "plds4", "plc4", "nspr4"]
     };
 
     for lib in &libs {
         println!("cargo:rustc-link-lib=dylib={}", lib);
     }
 
-    if let Some(path) = env::var_os("MOZ_TOPOBJDIR").map(PathBuf::from) {
+    if fold_libs {
         println!(
             "cargo:rustc-link-search=native={}",
-            path.join("dist").join("bin").to_str().unwrap()
+            TOPOBJDIR.join("security").to_str().unwrap()
         );
-        let nsslib_path = path.clone().join("security").join("nss").join("lib");
+    } else {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            TOPOBJDIR.join("dist").join("bin").to_str().unwrap()
+        );
+        let nsslib_path = TOPOBJDIR.join("security").join("nss").join("lib");
         println!(
             "cargo:rustc-link-search=native={}",
             nsslib_path.join("nss").join("nss_nss3").to_str().unwrap()
@@ -342,36 +353,41 @@ fn setup_for_gecko() -> Vec<String> {
         );
         println!(
             "cargo:rustc-link-search=native={}",
-            path.join("config")
+            TOPOBJDIR
+                .join("config")
                 .join("external")
                 .join("nspr")
                 .join("pr")
                 .to_str()
                 .unwrap()
         );
-
-        let flags_path = path.join("netwerk/socket/neqo/extra-bindgen-flags");
-
-        println!("cargo:rerun-if-changed={}", flags_path.to_str().unwrap());
-        flags = fs::read_to_string(flags_path)
-            .expect("Failed to read extra-bindgen-flags file")
-            .split_whitespace()
-            .map(std::borrow::ToOwned::to_owned)
-            .collect();
-
-        flags.push(String::from("-include"));
-        flags.push(
-            path.join("dist")
-                .join("include")
-                .join("mozilla-config.h")
-                .to_str()
-                .unwrap()
-                .to_string(),
-        );
-    } else {
-        println!("cargo:warning=MOZ_TOPOBJDIR should be set by default, otherwise the build is not guaranteed to finish.");
     }
+
+    let flags_path = TOPOBJDIR.join("netwerk/socket/neqo/extra-bindgen-flags");
+
+    println!("cargo:rerun-if-changed={}", flags_path.to_str().unwrap());
+    flags = fs::read_to_string(flags_path)
+        .expect("Failed to read extra-bindgen-flags file")
+        .split_whitespace()
+        .map(std::borrow::ToOwned::to_owned)
+        .collect();
+
+    flags.push(String::from("-include"));
+    flags.push(
+        TOPOBJDIR
+            .join("dist")
+            .join("include")
+            .join("mozilla-config.h")
+            .to_str()
+            .unwrap()
+            .to_string(),
+    );
     flags
+}
+
+#[cfg(not(feature = "gecko"))]
+fn setup_for_gecko() -> Vec<String> {
+    unreachable!()
 }
 
 fn main() {
@@ -384,7 +400,7 @@ fn main() {
     let config_file = PathBuf::from(BINDINGS_DIR).join(BINDINGS_CONFIG);
     println!("cargo:rerun-if-changed={}", config_file.to_str().unwrap());
     let config = fs::read_to_string(config_file).expect("unable to read binding configuration");
-    let config: HashMap<String, Bindings> = toml::from_str(&config).unwrap();
+    let config: HashMap<String, Bindings> = ::toml::from_str(&config).unwrap();
 
     for (k, v) in &config {
         build_bindings(k, v, &flags[..], cfg!(feature = "gecko"));

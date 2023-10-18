@@ -4,6 +4,10 @@
 : "${BUILDDIR:=./debian/build}"
 : "${DEB_HOST_ARCH:=$(dpkg --print-architecture)}"
 
+# Sometimes the build doesn't make these executable for some reason
+chmod 0755 "$BUILDDIR/js/src/js"
+chmod 0755 "$BUILDDIR/dist/bin/js"
+
 if "$BUILDDIR/js/src/js" -e 'print("Hello, world")'; then
 	echo "Smoke-test successful, continuing with full test suite"
 else
@@ -27,7 +31,7 @@ fi
 # we want to expand --exclude to several arguments
 # shellcheck disable=SC2086
 if "${BUILDDIR}"/dist/bin/run-mozilla.sh \
-   "${BUILDDIR}"/_virtualenvs/init_py3/bin/python -u \
+   "${BUILDDIR}"/_virtualenvs/build/bin/python3 -u \
    "${SRCDIR}"/jit-test/jit_test.py \
    --format=automation \
    --no-slow \

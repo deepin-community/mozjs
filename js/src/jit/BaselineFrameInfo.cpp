@@ -14,6 +14,7 @@
 #endif
 
 #include "jit/BaselineFrameInfo-inl.h"
+#include "jit/JitFrames.h"
 #include "jit/MacroAssembler-inl.h"
 
 using namespace js;
@@ -46,10 +47,6 @@ void CompilerFrameInfo::sync(StackValue* val) {
       break;
     case StackValue::ThisSlot:
       masm.pushValue(addressOfThis());
-      break;
-    case StackValue::EvalNewTargetSlot:
-      MOZ_ASSERT(script->isForEval());
-      masm.pushValue(addressOfEvalNewTarget());
       break;
     case StackValue::Register:
       masm.pushValue(val->reg());
@@ -102,9 +99,6 @@ void CompilerFrameInfo::popValue(ValueOperand dest) {
     case StackValue::ThisSlot:
       masm.loadValue(addressOfThis(), dest);
       break;
-    case StackValue::EvalNewTargetSlot:
-      masm.loadValue(addressOfEvalNewTarget(), dest);
-      break;
     case StackValue::Stack:
       masm.popValue(dest);
       break;
@@ -148,6 +142,8 @@ void CompilerFrameInfo::popRegsAndSync(uint32_t uses) {
     default:
       MOZ_CRASH("Invalid uses");
   }
+  // On arm64, SP may be < PSP now (that's OK).
+  // eg testcase: tests/bug1580246.js
 }
 
 void InterpreterFrameInfo::popRegsAndSync(uint32_t uses) {
@@ -163,6 +159,8 @@ void InterpreterFrameInfo::popRegsAndSync(uint32_t uses) {
     default:
       MOZ_CRASH("Invalid uses");
   }
+  // On arm64, SP may be < PSP now (that's OK).
+  // eg testcase: tests/backup-point-bug1315634.js
 }
 
 void InterpreterFrameInfo::bumpInterpreterICEntry() {
@@ -189,11 +187,6 @@ void CompilerFrameInfo::storeStackValue(int32_t depth, const Address& dest,
       break;
     case StackValue::ThisSlot:
       masm.loadValue(addressOfThis(), scratch);
-      masm.storeValue(scratch, dest);
-      break;
-    case StackValue::EvalNewTargetSlot:
-      MOZ_ASSERT(script->isForEval());
-      masm.loadValue(addressOfEvalNewTarget(), scratch);
       masm.storeValue(scratch, dest);
       break;
     case StackValue::Stack:

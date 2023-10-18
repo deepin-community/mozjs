@@ -7,7 +7,6 @@
 #ifndef jit_RegisterAllocator_h
 #define jit_RegisterAllocator_h
 
-#include "mozilla/Attributes.h"
 #include "mozilla/MathAlgorithms.h"
 
 #include "jit/LIR.h"
@@ -35,12 +34,12 @@ struct AllocationIntegrityState {
 
   // Record all virtual registers in the graph. This must be called before
   // register allocation, to pick up the original LUses.
-  MOZ_MUST_USE bool record();
+  [[nodiscard]] bool record();
 
   // Perform the liveness analysis on the graph, and assert on an invalid
   // allocation. This must be called after register allocation, to pick up
   // all assigned physical values.
-  MOZ_MUST_USE bool check();
+  [[nodiscard]] bool check();
 
  private:
   LIRGraph& graph;
@@ -114,12 +113,12 @@ struct AllocationIntegrityState {
       IntegrityItemSet;
   IntegrityItemSet seen;
 
-  MOZ_MUST_USE bool checkIntegrity(LBlock* block, LInstruction* ins,
-                                   uint32_t vreg, LAllocation alloc);
+  [[nodiscard]] bool checkIntegrity(LBlock* block, LInstruction* ins,
+                                    uint32_t vreg, LAllocation alloc);
   void checkSafepointAllocation(LInstruction* ins, uint32_t vreg,
                                 LAllocation alloc);
-  MOZ_MUST_USE bool addPredecessor(LBlock* block, uint32_t vreg,
-                                   LAllocation alloc);
+  [[nodiscard]] bool addPredecessor(LBlock* block, uint32_t vreg,
+                                    LAllocation alloc);
 
   void dump();
 };
@@ -199,7 +198,7 @@ class InstructionDataMap {
  public:
   InstructionDataMap() : insData_() {}
 
-  MOZ_MUST_USE bool init(MIRGenerator* gen, uint32_t numInstructions) {
+  [[nodiscard]] bool init(MIRGenerator* gen, uint32_t numInstructions) {
     if (!insData_.init(gen->alloc(), numInstructions)) {
       return false;
     }
@@ -214,15 +213,6 @@ class InstructionDataMap {
   LNode*& operator[](uint32_t ins) { return insData_[ins]; }
   LNode* const& operator[](uint32_t ins) const { return insData_[ins]; }
 };
-
-inline void TakeJitRegisters(bool isProfiling, AllocatableRegisterSet* set) {
-#if defined(JS_CODEGEN_X86) || defined(JS_CODEGEN_X64) || \
-    defined(JS_CODEGEN_ARM64)
-  if (isProfiling) {
-    set->take(AnyRegister(FramePointer));
-  }
-#endif
-}
 
 // Common superclass for register allocators.
 class RegisterAllocator {
@@ -245,14 +235,13 @@ class RegisterAllocator {
 
   RegisterAllocator(MIRGenerator* mir, LIRGenerator* lir, LIRGraph& graph)
       : mir(mir), lir(lir), graph(graph), allRegisters_(RegisterSet::All()) {
+    MOZ_ASSERT(!allRegisters_.has(FramePointer));
     if (mir->compilingWasm()) {
       takeWasmRegisters(allRegisters_);
-    } else {
-      TakeJitRegisters(mir->instrumentedProfiling(), &allRegisters_);
     }
   }
 
-  MOZ_MUST_USE bool init();
+  [[nodiscard]] bool init();
 
   TempAllocator& alloc() const { return mir->alloc(); }
 
@@ -310,17 +299,17 @@ class RegisterAllocator {
     return outputOf(ins);
   }
 
-  void dumpInstructions();
+  void dumpInstructions(const char* who);
 
  public:
   template <typename TakeableSet>
   static void takeWasmRegisters(TakeableSet& regs) {
 #if defined(JS_CODEGEN_X64) || defined(JS_CODEGEN_ARM) ||      \
     defined(JS_CODEGEN_ARM64) || defined(JS_CODEGEN_MIPS32) || \
-    defined(JS_CODEGEN_MIPS64)
+    defined(JS_CODEGEN_MIPS64) || defined(JS_CODEGEN_LOONG64)
     regs.take(HeapReg);
 #endif
-    regs.take(FramePointer);
+    MOZ_ASSERT(!regs.has(FramePointer));
   }
 };
 

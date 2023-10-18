@@ -290,19 +290,19 @@ pub mod status_codes {
     /// Is it a 2xx status?
     #[inline]
     pub fn is_success_code(c: u16) -> bool {
-        200 <= c && c < 300
+        (200..300).contains(&c)
     }
 
     /// Is it a 4xx error?
     #[inline]
     pub fn is_client_error_code(c: u16) -> bool {
-        400 <= c && c < 500
+        (400..500).contains(&c)
     }
 
     /// Is it a 5xx error?
     #[inline]
     pub fn is_server_error_code(c: u16) -> bool {
-        500 <= c && c < 600
+        (500..600).contains(&c)
     }
 
     macro_rules! define_status_codes {
@@ -350,6 +350,7 @@ pub mod status_codes {
         (415, UNSUPPORTED_MEDIA_TYPE),
         (416, REQUESTED_RANGE_NOT_SATISFIABLE),
         (417, EXPECTATION_FAILED),
+        (429, TOO_MANY_REQUESTS),
         // 5xx
         (500, INTERNAL_SERVER_ERROR),
         (501, NOT_IMPLEMENTED),

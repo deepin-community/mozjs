@@ -95,21 +95,22 @@
 #include <memory>
 #include <type_traits>  // std::is_same_v
 
-#include "jsapi.h"
 #include "jsnum.h"
 
 #include "builtin/BigInt.h"
 #include "gc/Allocator.h"
 #include "js/BigInt.h"
 #include "js/Conversions.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
 #include "js/Initialization.h"
 #include "js/StableStringChars.h"
 #include "js/Utility.h"
 #include "util/CheckedArithmetic.h"
 #include "vm/JSContext.h"
 #include "vm/SelfHosting.h"
+#include "vm/StaticStrings.h"
 
-#include "gc/FreeOp-inl.h"
+#include "gc/GCContext-inl.h"
 #include "gc/Nursery-inl.h"
 #include "vm/JSContext-inl.h"
 
@@ -143,8 +144,7 @@ static bool HasLeadingZeroes(BigInt* bi) {
 BigInt* BigInt::createUninitialized(JSContext* cx, size_t digitLength,
                                     bool isNegative, gc::InitialHeap heap) {
   if (digitLength > MaxDigitLength) {
-    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
-                              JSMSG_BIGINT_TOO_LARGE);
+    ReportOversizedAllocation(cx, JSMSG_BIGINT_TOO_LARGE);
     return nullptr;
   }
 
@@ -178,11 +178,11 @@ void BigInt::initializeDigitsToZero() {
   std::uninitialized_fill_n(digs.begin(), digs.Length(), 0);
 }
 
-void BigInt::finalize(JSFreeOp* fop) {
+void BigInt::finalize(JS::GCContext* gcx) {
   MOZ_ASSERT(isTenured());
   if (hasHeapDigits()) {
     size_t size = digitLength() * sizeof(Digit);
-    fop->free_(this, heapDigits_, size, js::MemoryUse::BigIntDigits);
+    gcx->free_(this, heapDigits_, size, js::MemoryUse::BigIntDigits);
   }
 }
 
@@ -264,7 +264,7 @@ BigInt* BigInt::neg(JSContext* cx, HandleBigInt x) {
   if (!result) {
     return nullptr;
   }
-  result->header_.toggleFlagBit(SignBit);
+  result->toggleHeaderFlagBit(SignBit);
   return result;
 }
 
@@ -324,7 +324,7 @@ BigInt::Digit BigInt::digitDiv(Digit high, Digit low, Digit divisor,
           : "=a"(quotient), "=d"(rem)
           // Inputs: put `high` into rdx, `low` into rax, and `divisor` into
           // any register or stack slot.
-          : "d"(high), "a"(low), [ divisor ] "rm"(divisor));
+          : "d"(high), "a"(low), [divisor] "rm"(divisor));
   *remainder = rem;
   return quotient;
 #elif defined(__i386__)
@@ -335,7 +335,7 @@ BigInt::Digit BigInt::digitDiv(Digit high, Digit low, Digit divisor,
           : "=a"(quotient), "=d"(rem)
           // Inputs: put `high` into edx, `low` into eax, and `divisor` into
           // any register or stack slot.
-          : "d"(high), "a"(low), [ divisor ] "rm"(divisor));
+          : "d"(high), "a"(low), [divisor] "rm"(divisor));
   *remainder = rem;
   return quotient;
 #else
@@ -1006,8 +1006,9 @@ inline BigInt* BigInt::absoluteBitwiseOp(JSContext* cx, HandleBigInt x,
   }
 
   if (kind != BitwiseOpKind::SymmetricTrim) {
-    BigInt* source =
-        kind == BitwiseOpKind::AsymmetricFill ? x : xLength == i ? y : x;
+    BigInt* source = kind == BitwiseOpKind::AsymmetricFill ? x
+                     : xLength == i                        ? y
+                                                           : x;
     for (; i < resultLength; i++) {
       result->setDigit(i, source->digit(i));
     }
@@ -1218,12 +1219,17 @@ JSLinearString* BigInt::toStringBasePowerOfTwo(JSContext* cx, HandleBigInt x,
   const size_t charsRequired = CeilDiv(bitLength, bitsPerChar) + sign;
 
   if (charsRequired > JSString::MAX_LENGTH) {
-    ReportOutOfMemory(cx);
+    if constexpr (allowGC) {
+      ReportOutOfMemory(cx);
+    }
     return nullptr;
   }
 
   auto resultChars = cx->make_pod_array<char>(charsRequired);
   if (!resultChars) {
+    if constexpr (!allowGC) {
+      cx->recoverFromOutOfMemory();
+    }
     return nullptr;
   }
 
@@ -1451,9 +1457,9 @@ JSLinearString* BigInt::toStringGeneric(JSContext* cx, HandleBigInt x,
 
 static void FreeDigits(JSContext* cx, BigInt* bi, BigInt::Digit* digits,
                        size_t nbytes) {
-  if (cx->isHelperThreadContext()) {
-    js_free(digits);
-  } else if (bi->isTenured()) {
+  MOZ_ASSERT(cx->isMainThreadContext());
+
+  if (bi->isTenured()) {
     MOZ_ASSERT(!cx->nursery().isInside(digits));
     js_free(digits);
   } else {
@@ -1614,17 +1620,12 @@ BigInt* BigInt::parseLiteralDigits(JSContext* cx,
 // BigInt proposal section 7.2
 template <typename CharT>
 BigInt* BigInt::parseLiteral(JSContext* cx, const Range<const CharT> chars,
-                             bool* haveParseError) {
+                             bool* haveParseError, js::gc::InitialHeap heap) {
   RangedPtr<const CharT> start = chars.begin();
   const RangedPtr<const CharT> end = chars.end();
   bool isNegative = false;
 
   MOZ_ASSERT(chars.length());
-
-  // This function is only called from the frontend when parsing BigInts. Parsed
-  // BigInts are stored in the script's data vector and therefore need to be
-  // allocated in the tenured heap.
-  constexpr gc::InitialHeap heap = gc::TenuredHeap;
 
   if (end - start > 2 && start[0] == '0') {
     if (start[1] == 'b' || start[1] == 'B') {
@@ -1797,7 +1798,7 @@ BigInt* BigInt::createFromInt64(JSContext* cx, int64_t n) {
   }
 
   if (n < 0) {
-    res->header_.setFlagBit(SignBit);
+    res->setHeaderFlagBit(SignBit);
   }
   MOZ_ASSERT(res->isNegative() == (n < 0));
 
@@ -2049,8 +2050,7 @@ BigInt* BigInt::pow(JSContext* cx, HandleBigInt x, HandleBigInt y) {
   static_assert(MaxBitLength < std::numeric_limits<Digit>::max(),
                 "unexpectedly large MaxBitLength");
   if (y->digitLength() > 1) {
-    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
-                              JSMSG_BIGINT_TOO_LARGE);
+    ReportOversizedAllocation(cx, JSMSG_BIGINT_TOO_LARGE);
     return nullptr;
   }
   Digit exponent = y->digit(0);
@@ -2058,8 +2058,7 @@ BigInt* BigInt::pow(JSContext* cx, HandleBigInt x, HandleBigInt y) {
     return x;
   }
   if (exponent >= MaxBitLength) {
-    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
-                              JSMSG_BIGINT_TOO_LARGE);
+    ReportOversizedAllocation(cx, JSMSG_BIGINT_TOO_LARGE);
     return nullptr;
   }
 
@@ -2455,9 +2454,9 @@ BigInt* BigInt::bitNot(JSContext* cx, HandleBigInt x) {
   }
 }
 
-int64_t BigInt::toInt64(BigInt* x) { return WrapToSigned(toUint64(x)); }
+int64_t BigInt::toInt64(const BigInt* x) { return WrapToSigned(toUint64(x)); }
 
-uint64_t BigInt::toUint64(BigInt* x) {
+uint64_t BigInt::toUint64(const BigInt* x) {
   if (x->isZero()) {
     return 0;
   }
@@ -2505,6 +2504,43 @@ bool BigInt::isInt64(BigInt* x, int64_t* result) {
   return false;
 }
 
+bool BigInt::isUint64(BigInt* x, uint64_t* result) {
+  MOZ_MAKE_MEM_UNDEFINED(result, sizeof(*result));
+
+  if (!x->absFitsInUint64() || x->isNegative()) {
+    return false;
+  }
+
+  if (x->isZero()) {
+    *result = 0;
+    return true;
+  }
+
+  *result = x->uint64FromAbsNonZero();
+  return true;
+}
+
+bool BigInt::isNumber(BigInt* x, double* result) {
+  MOZ_MAKE_MEM_UNDEFINED(result, sizeof(*result));
+
+  if (!x->absFitsInUint64()) {
+    return false;
+  }
+
+  if (x->isZero()) {
+    *result = 0;
+    return true;
+  }
+
+  uint64_t magnitude = x->uint64FromAbsNonZero();
+  if (magnitude < uint64_t(DOUBLE_INTEGRAL_PRECISION_LIMIT)) {
+    *result = x->isNegative() ? -double(magnitude) : double(magnitude);
+    return true;
+  }
+
+  return false;
+}
+
 // Compute `2**bits - (x & (2**bits - 1))`.  Used when treating BigInt values as
 // arbitrary-precision two's complement signed integers.
 BigInt* BigInt::truncateAndSubFromPowerOfTwo(JSContext* cx, HandleBigInt x,
@@ -2514,8 +2550,7 @@ BigInt* BigInt::truncateAndSubFromPowerOfTwo(JSContext* cx, HandleBigInt x,
   MOZ_ASSERT(!x->isZero());
 
   if (bits > MaxBitLength) {
-    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
-                              JSMSG_BIGINT_TOO_LARGE);
+    ReportOversizedAllocation(cx, JSMSG_BIGINT_TOO_LARGE);
     return nullptr;
   }
 
@@ -2586,7 +2621,11 @@ BigInt* BigInt::asUintN(JSContext* cx, HandleBigInt x, uint64_t bits) {
   if (bits <= 64) {
     uint64_t u64 = toUint64(x);
     uint64_t mask = uint64_t(-1) >> (64 - bits);
-    return createFromUint64(cx, u64 & mask);
+    uint64_t n = u64 & mask;
+    if (u64 == n && x->absFitsInUint64()) {
+      return x;
+    }
+    return createFromUint64(cx, n);
   }
 
   if (bits >= MaxBitLength) {
@@ -2643,7 +2682,11 @@ BigInt* BigInt::asIntN(JSContext* cx, HandleBigInt x, uint64_t bits) {
   }
 
   if (bits == 64) {
-    return createFromInt64(cx, toInt64(x));
+    int64_t n = toInt64(x);
+    if (((n < 0) == x->isNegative()) && x->absFitsInUint64()) {
+      return x;
+    }
+    return createFromInt64(cx, n);
   }
 
   if (bits > MaxBitLength) {
@@ -3571,8 +3614,8 @@ static inline BigInt* ParseStringBigIntLiteral(JSContext* cx,
 }
 
 // Called from BigInt constructor.
-JS::Result<BigInt*, JS::OOM&> js::StringToBigInt(JSContext* cx,
-                                                 HandleString str) {
+JS::Result<BigInt*, JS::OOM> js::StringToBigInt(JSContext* cx,
+                                                HandleString str) {
   JSLinearString* linear = str->ensureLinear(cx);
   if (!linear) {
     return cx->alreadyReportedOOM();
@@ -3602,8 +3645,13 @@ JS::Result<BigInt*, JS::OOM&> js::StringToBigInt(JSContext* cx,
 // Called from parser with already trimmed and validated token.
 BigInt* js::ParseBigIntLiteral(JSContext* cx,
                                const Range<const char16_t>& chars) {
+  // This function is only called from the frontend when parsing BigInts. Parsed
+  // BigInts are stored in the script's data vector and therefore need to be
+  // allocated in the tenured heap.
+  constexpr gc::InitialHeap heap = gc::TenuredHeap;
+
   bool parseError = false;
-  BigInt* res = BigInt::parseLiteral(cx, chars, &parseError);
+  BigInt* res = BigInt::parseLiteral(cx, chars, &parseError, heap);
   if (!res) {
     return nullptr;
   }
@@ -3624,7 +3672,17 @@ JSAtom* js::BigIntToAtom(JSContext* cx, HandleBigInt bi) {
   if (!str) {
     return nullptr;
   }
-  return AtomizeString(cx, str);
+  JSAtom* atom = AtomizeString(cx, str);
+  if (!atom) {
+    if constexpr (!allowGC) {
+      // NOTE: AtomizeString can call ReportAllocationOverflow other than
+      //       ReportOutOfMemory, but ReportAllocationOverflow cannot happen
+      //       because the length is guarded by BigInt::toString.
+      cx->recoverFromOutOfMemory();
+    }
+    return nullptr;
+  }
+  return atom;
 }
 
 template JSAtom* js::BigIntToAtom<js::CanGC>(JSContext* cx, HandleBigInt bi);
@@ -3675,61 +3733,6 @@ JS::ubi::Node::Size JS::ubi::Concrete<BigInt>::size(
   return size;
 }
 
-template <XDRMode mode>
-XDRResult js::XDRBigInt(XDRState<mode>* xdr, MutableHandleBigInt bi) {
-  JSContext* cx = xdr->cx();
-
-  uint8_t sign;
-  uint32_t length;
-
-  if (mode == XDR_ENCODE) {
-    cx->check(bi);
-    sign = static_cast<uint8_t>(bi->isNegative());
-    uint64_t sz = bi->digitLength() * sizeof(BigInt::Digit);
-    // As the maximum source code size is currently UINT32_MAX code units
-    // (see BytecodeCompiler::checkLength), any bigint literal's length in
-    // word-sized digits will be less than UINT32_MAX as well.  That could
-    // change or FoldConstants could start creating these though, so leave
-    // this as a release-enabled assert.
-    MOZ_RELEASE_ASSERT(sz <= UINT32_MAX);
-    length = static_cast<uint32_t>(sz);
-  }
-
-  MOZ_TRY(xdr->codeUint8(&sign));
-  MOZ_TRY(xdr->codeUint32(&length));
-
-  MOZ_RELEASE_ASSERT(length % sizeof(BigInt::Digit) == 0);
-  uint32_t digitLength = length / sizeof(BigInt::Digit);
-  auto buf = cx->make_pod_array<BigInt::Digit>(digitLength);
-  if (!buf) {
-    return xdr->fail(JS::TranscodeResult_Throw);
-  }
-
-  if (mode == XDR_ENCODE) {
-    std::uninitialized_copy_n(bi->digits().Elements(), digitLength, buf.get());
-  }
-
-  MOZ_TRY(xdr->codeBytes(buf.get(), length));
-
-  if (mode == XDR_DECODE) {
-    BigInt* res =
-        BigInt::createUninitialized(cx, digitLength, sign, gc::TenuredHeap);
-    if (!res) {
-      return xdr->fail(JS::TranscodeResult_Throw);
-    }
-    std::uninitialized_copy_n(buf.get(), digitLength, res->digits().Elements());
-    bi.set(res);
-  }
-
-  return Ok();
-}
-
-template XDRResult js::XDRBigInt(XDRState<XDR_ENCODE>* xdr,
-                                 MutableHandleBigInt bi);
-
-template XDRResult js::XDRBigInt(XDRState<XDR_DECODE>* xdr,
-                                 MutableHandleBigInt bi);
-
 // Public API
 
 BigInt* JS::NumberToBigInt(JSContext* cx, double num) {
@@ -3761,7 +3764,7 @@ BigInt* JS::StringToBigInt(JSContext* cx, Range<const char16_t> chars) {
 }
 
 static inline BigInt* SimpleStringToBigIntHelper(
-    JSContext* cx, mozilla::Span<const Latin1Char> chars, unsigned radix,
+    JSContext* cx, mozilla::Span<const Latin1Char> chars, uint8_t radix,
     bool* haveParseError) {
   if (chars.Length() > 1) {
     if (chars[0] == '+') {
@@ -3781,7 +3784,7 @@ static inline BigInt* SimpleStringToBigIntHelper(
 }
 
 BigInt* JS::SimpleStringToBigInt(JSContext* cx, mozilla::Span<const char> chars,
-                                 unsigned radix) {
+                                 uint8_t radix) {
   if (chars.empty()) {
     JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
                               JSMSG_BIGINT_INVALID_SYNTAX);
@@ -3815,6 +3818,24 @@ int64_t JS::ToBigInt64(JS::BigInt* bi) { return BigInt::toInt64(bi); }
 
 uint64_t JS::ToBigUint64(JS::BigInt* bi) { return BigInt::toUint64(bi); }
 
+double JS::BigIntToNumber(JS::BigInt* bi) { return BigInt::numberValue(bi); }
+
+bool JS::BigIntIsNegative(BigInt* bi) {
+  return !bi->isZero() && bi->isNegative();
+}
+
+bool JS::BigIntFitsNumber(BigInt* bi, double* out) {
+  return bi->isNumber(bi, out);
+}
+
+JSString* JS::BigIntToString(JSContext* cx, Handle<BigInt*> bi, uint8_t radix) {
+  if (radix < 2 || radix > 36) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_BAD_RADIX);
+    return nullptr;
+  }
+  return BigInt::toString<CanGC>(cx, bi, radix);
+}
+
 // Semi-public template details
 
 BigInt* JS::detail::BigIntFromInt64(JSContext* cx, int64_t num) {
@@ -3827,4 +3848,12 @@ BigInt* JS::detail::BigIntFromUint64(JSContext* cx, uint64_t num) {
 
 BigInt* JS::detail::BigIntFromBool(JSContext* cx, bool b) {
   return b ? BigInt::one(cx) : BigInt::zero(cx);
+}
+
+bool JS::detail::BigIntIsInt64(BigInt* bi, int64_t* result) {
+  return BigInt::isInt64(bi, result);
+}
+
+bool JS::detail::BigIntIsUint64(BigInt* bi, uint64_t* result) {
+  return BigInt::isUint64(bi, result);
 }

@@ -7,7 +7,9 @@
 #ifndef jit_arm_SharedICRegisters_arm_h
 #define jit_arm_SharedICRegisters_arm_h
 
-#include "jit/MacroAssembler.h"
+#include "jit/arm/Assembler-arm.h"
+#include "jit/Registers.h"
+#include "jit/RegisterSets.h"
 
 namespace js {
 namespace jit {
@@ -17,7 +19,6 @@ namespace jit {
 
 // r13 = stack-pointer
 // r11 = frame-pointer
-static constexpr Register BaselineFrameReg = r11;
 static constexpr Register BaselineStackReg = sp;
 
 // ValueOperands R0, R1, and R2.
@@ -32,9 +33,6 @@ static constexpr ValueOperand R2(r1, r0);
 static constexpr Register ICTailCallReg = r14;
 static constexpr Register ICStubReg = r9;
 
-static constexpr Register ExtractTemp0 = InvalidReg;
-static constexpr Register ExtractTemp1 = InvalidReg;
-
 // Register used internally by MacroAssemblerARM.
 static constexpr Register BaselineSecondScratchReg = r6;
 
@@ -47,6 +45,8 @@ static constexpr Register BaselineSecondScratchReg = r6;
 // FloatReg0 must be equal to ReturnFloatReg.
 static constexpr FloatRegister FloatReg0 = d0;
 static constexpr FloatRegister FloatReg1 = d1;
+static constexpr FloatRegister FloatReg2 = d2;
+static constexpr FloatRegister FloatReg3 = d3;
 
 }  // namespace jit
 }  // namespace js

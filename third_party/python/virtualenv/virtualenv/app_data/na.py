@@ -8,6 +8,9 @@ from .base import AppData, ContentStore
 class AppDataDisabled(AppData):
     """No application cache available (most likely as we don't have write permissions)"""
 
+    transient = True
+    can_update = False
+
     def __init__(self):
         pass
 
@@ -40,12 +43,8 @@ class AppDataDisabled(AppData):
     def wheel_image(self, for_py_version, name):
         raise self.error
 
-    @property
-    def transient(self):
-        return True
-
     def py_info_clear(self):
-        """"""
+        """ """
 
 
 class ContentStoreNA(ContentStore):
@@ -53,14 +52,14 @@ class ContentStoreNA(ContentStore):
         return False
 
     def read(self):
-        """"""
+        """ """
         return None
 
     def write(self, content):
-        """"""
+        """ """
 
     def remove(self):
-        """"""
+        """ """
 
     @contextmanager
     def locked(self):

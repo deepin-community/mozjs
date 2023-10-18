@@ -18,45 +18,7 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.
 
-// Returns (lo, hi).
-#[cfg(not(integer128))]
-#[cfg_attr(feature = "no-panic", inline)]
-pub fn umul128(a: u64, b: u64) -> (u64, u64) {
-    let a_lo = a as u32;
-    let a_hi = (a >> 32) as u32;
-    let b_lo = b as u32;
-    let b_hi = (b >> 32) as u32;
-
-    let b00 = a_lo as u64 * b_lo as u64;
-    let b01 = a_lo as u64 * b_hi as u64;
-    let b10 = a_hi as u64 * b_lo as u64;
-    let b11 = a_hi as u64 * b_hi as u64;
-
-    let b00_lo = b00 as u32;
-    let b00_hi = (b00 >> 32) as u32;
-
-    let mid1 = b10 + b00_hi as u64;
-    let mid1_lo = mid1 as u32;
-    let mid1_hi = (mid1 >> 32) as u32;
-
-    let mid2 = b01 + mid1_lo as u64;
-    let mid2_lo = mid2 as u32;
-    let mid2_hi = (mid2 >> 32) as u32;
-
-    let p_hi = b11 + mid1_hi as u64 + mid2_hi as u64;
-    let p_lo = ((mid2_lo as u64) << 32) | b00_lo as u64;
-
-    (p_lo, p_hi)
-}
-
-#[cfg(not(integer128))]
-#[cfg_attr(feature = "no-panic", inline)]
-pub fn shiftright128(lo: u64, hi: u64, dist: u32) -> u64 {
-    // We don't need to handle the case dist >= 64 here (see above).
-    debug_assert!(dist > 0);
-    debug_assert!(dist < 64);
-    (hi << (64 - dist)) | (lo >> dist)
-}
+use core::ptr;
 
 #[cfg_attr(feature = "no-panic", inline)]
 pub fn div5(x: u64) -> u64 {
@@ -100,6 +62,28 @@ pub fn multiple_of_power_of_5(value: u64, p: u32) -> bool {
 #[cfg_attr(feature = "no-panic", inline)]
 pub fn multiple_of_power_of_2(value: u64, p: u32) -> bool {
     debug_assert!(value != 0);
-    // return __builtin_ctzll(value) >= p;
+    debug_assert!(p < 64);
+    // __builtin_ctzll doesn't appear to be faster here.
     (value & ((1u64 << p) - 1)) == 0
+}
+
+#[cfg_attr(feature = "no-panic", inline)]
+pub fn mul_shift_64(m: u64, mul: &(u64, u64), j: u32) -> u64 {
+    let b0 = m as u128 * mul.0 as u128;
+    let b2 = m as u128 * mul.1 as u128;
+    (((b0 >> 64) + b2) >> (j - 64)) as u64
+}
+
+#[cfg_attr(feature = "no-panic", inline)]
+pub unsafe fn mul_shift_all_64(
+    m: u64,
+    mul: &(u64, u64),
+    j: u32,
+    vp: *mut u64,
+    vm: *mut u64,
+    mm_shift: u32,
+) -> u64 {
+    ptr::write(vp, mul_shift_64(4 * m + 2, mul, j));
+    ptr::write(vm, mul_shift_64(4 * m - 1 - mm_shift as u64, mul, j));
+    mul_shift_64(4 * m, mul, j)
 }

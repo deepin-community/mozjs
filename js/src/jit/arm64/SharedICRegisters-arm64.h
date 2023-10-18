@@ -7,14 +7,12 @@
 #ifndef jit_arm64_SharedICRegisters_arm64_h
 #define jit_arm64_SharedICRegisters_arm64_h
 
-#include "jit/MacroAssembler.h"
+#include "jit/arm64/Assembler-arm64.h"
+#include "jit/Registers.h"
+#include "jit/RegisterSets.h"
 
 namespace js {
 namespace jit {
-
-// Must be a callee-saved register for preservation around generateEnterJIT().
-static constexpr Register BaselineFrameReg = r23;
-static constexpr ARMRegister BaselineFrameReg64 = {BaselineFrameReg, 64};
 
 // BaselineStackReg is intentionally undefined on ARM64.
 // Refer to the comment next to the definition of RealStackPointer.
@@ -35,15 +33,6 @@ static constexpr ValueOperand R2(R2_);
 static constexpr Register ICTailCallReg = r30;
 static constexpr Register ICStubReg = r9;
 
-// ExtractTemps must be callee-save registers:
-// ICSetProp_Native::Compiler::generateStubCode() stores the object
-// in ExtractTemp0, but then calls callTypeUpdateIC(), which clobbers
-// caller-save registers.
-// They should also not be the scratch registers ip0 or ip1,
-// since those get clobbered all the time.
-static constexpr Register ExtractTemp0 = r24;
-static constexpr Register ExtractTemp1 = r25;
-
 // R7 - R9 are generally available for use within stubcode.
 
 // Note that BaselineTailCallReg is actually just the link
@@ -53,6 +42,10 @@ static constexpr Register ExtractTemp1 = r25;
 static constexpr FloatRegister FloatReg0 = {FloatRegisters::d0,
                                             FloatRegisters::Double};
 static constexpr FloatRegister FloatReg1 = {FloatRegisters::d1,
+                                            FloatRegisters::Double};
+static constexpr FloatRegister FloatReg2 = {FloatRegisters::d2,
+                                            FloatRegisters::Double};
+static constexpr FloatRegister FloatReg3 = {FloatRegisters::d3,
                                             FloatRegisters::Double};
 
 }  // namespace jit

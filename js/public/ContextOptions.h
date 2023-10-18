@@ -11,12 +11,15 @@
 
 #include "jstypes.h"  // JS_PUBLIC_API
 
+#include "js/WasmFeatures.h"
+
 struct JS_PUBLIC_API JSContext;
 
 namespace JS {
 
 class JS_PUBLIC_API ContextOptions {
  public:
+  // clang-format off
   ContextOptions()
       : asmJS_(true),
         wasm_(true),
@@ -25,15 +28,18 @@ class JS_PUBLIC_API ContextOptions {
         wasmBaseline_(true),
         wasmIon_(true),
         wasmCranelift_(false),
-        wasmReftypes_(true),
-        wasmGc_(false),
-        wasmMultiValue_(false),
-        wasmSimd_(false),
+#define WASM_DEFAULT_FEATURE(NAME, ...) wasm##NAME##_(true),
+#define WASM_EXPERIMENTAL_FEATURE(NAME, ...) wasm##NAME##_(false),
+        JS_FOR_WASM_FEATURES(WASM_DEFAULT_FEATURE, WASM_DEFAULT_FEATURE, WASM_EXPERIMENTAL_FEATURE)
+#undef WASM_DEFAULT_FEATURE
+#undef WASM_EXPERIMENTAL_FEATURE
+        wasmSimdWormhole_(false),
         testWasmAwaitTier2_(false),
         throwOnAsmJSValidationFailure_(false),
         disableIon_(false),
         disableEvalSecurityChecks_(false),
         asyncStack_(true),
+        asyncStackCaptureDebuggeeOnly_(false),
         sourcePragmas_(true),
         throwOnDebuggeeWouldRun_(true),
         dumpStackOnDebuggeeWouldRun_(false),
@@ -42,8 +48,16 @@ class JS_PUBLIC_API ContextOptions {
         trackNotImplemented_(false),
         trySmoosh_(false),
 #endif
-        fuzzing_(false) {
+        fuzzing_(false),
+#ifdef NIGHTLY_BUILD
+        arrayGrouping_(true),
+#endif
+#ifdef ENABLE_CHANGE_ARRAY_BY_COPY
+        changeArrayByCopy_(false),
+#endif
+        importAssertions_(false) {
   }
+  // clang-format on
 
   bool asmJS() const { return asmJS_; }
   ContextOptions& setAsmJS(bool flag) {
@@ -99,23 +113,18 @@ class JS_PUBLIC_API ContextOptions {
     return *this;
   }
 
-  bool wasmReftypes() const { return wasmReftypes_; }
-  ContextOptions& setWasmReftypes(bool flag) {
-    wasmReftypes_ = flag;
-    return *this;
+#define WASM_FEATURE(NAME, ...)                     \
+  bool wasm##NAME() const { return wasm##NAME##_; } \
+  ContextOptions& setWasm##NAME(bool flag) {        \
+    wasm##NAME##_ = flag;                           \
+    return *this;                                   \
   }
+  JS_FOR_WASM_FEATURES(WASM_FEATURE, WASM_FEATURE, WASM_FEATURE)
+#undef WASM_FEATURE
 
-  bool wasmGc() const { return wasmGc_; }
+  bool wasmSimdWormhole() const { return wasmSimdWormhole_; }
   // Defined out-of-line because it depends on a compile-time option
-  ContextOptions& setWasmGc(bool flag);
-
-  bool wasmMultiValue() const { return wasmMultiValue_; }
-  // Defined out-of-line because it depends on a compile-time option
-  ContextOptions& setWasmMultiValue(bool flag);
-
-  bool wasmSimd() const { return wasmSimd_; }
-  // Defined out-of-line because it depends on a compile-time option
-  ContextOptions& setWasmSimd(bool flag);
+  ContextOptions& setWasmSimdWormhole(bool flag);
 
   bool throwOnAsmJSValidationFailure() const {
     return throwOnAsmJSValidationFailure_;
@@ -138,6 +147,28 @@ class JS_PUBLIC_API ContextOptions {
     return *this;
   }
 
+#ifdef NIGHTLY_BUILD
+  bool arrayGrouping() const { return arrayGrouping_; }
+  ContextOptions& setArrayGrouping(bool enabled) {
+    arrayGrouping_ = enabled;
+    return *this;
+  }
+#endif
+
+#ifdef ENABLE_CHANGE_ARRAY_BY_COPY
+  bool changeArrayByCopy() const { return changeArrayByCopy_; }
+  ContextOptions& setChangeArrayByCopy(bool enabled) {
+    changeArrayByCopy_ = enabled;
+    return *this;
+  }
+#endif
+
+  bool importAssertions() const { return importAssertions_; }
+  ContextOptions& setImportAssertions(bool enabled) {
+    importAssertions_ = enabled;
+    return *this;
+  }
+
   // Override to allow disabling the eval restriction security checks for
   // this context.
   bool disableEvalSecurityChecks() const { return disableEvalSecurityChecks_; }
@@ -149,6 +180,14 @@ class JS_PUBLIC_API ContextOptions {
   bool asyncStack() const { return asyncStack_; }
   ContextOptions& setAsyncStack(bool flag) {
     asyncStack_ = flag;
+    return *this;
+  }
+
+  bool asyncStackCaptureDebuggeeOnly() const {
+    return asyncStackCaptureDebuggeeOnly_;
+  }
+  ContextOptions& setAsyncStackCaptureDebuggeeOnly(bool flag) {
+    asyncStackCaptureDebuggeeOnly_ = flag;
     return *this;
   }
 
@@ -207,12 +246,7 @@ class JS_PUBLIC_API ContextOptions {
 
   void disableOptionsForSafeMode() {
     setAsmJS(false);
-    setWasm(false);
     setWasmBaseline(false);
-    setWasmIon(false);
-    setWasmGc(false);
-    setWasmMultiValue(false);
-    setWasmSimd(false);
   }
 
  private:
@@ -223,15 +257,16 @@ class JS_PUBLIC_API ContextOptions {
   bool wasmBaseline_ : 1;
   bool wasmIon_ : 1;
   bool wasmCranelift_ : 1;
-  bool wasmReftypes_ : 1;
-  bool wasmGc_ : 1;
-  bool wasmMultiValue_ : 1;
-  bool wasmSimd_ : 1;
+#define WASM_FEATURE(NAME, ...) bool wasm##NAME##_ : 1;
+  JS_FOR_WASM_FEATURES(WASM_FEATURE, WASM_FEATURE, WASM_FEATURE)
+#undef WASM_FEATURE
+  bool wasmSimdWormhole_ : 1;
   bool testWasmAwaitTier2_ : 1;
   bool throwOnAsmJSValidationFailure_ : 1;
   bool disableIon_ : 1;
   bool disableEvalSecurityChecks_ : 1;
   bool asyncStack_ : 1;
+  bool asyncStackCaptureDebuggeeOnly_ : 1;
   bool sourcePragmas_ : 1;
   bool throwOnDebuggeeWouldRun_ : 1;
   bool dumpStackOnDebuggeeWouldRun_ : 1;
@@ -241,6 +276,13 @@ class JS_PUBLIC_API ContextOptions {
   bool trySmoosh_ : 1;
 #endif
   bool fuzzing_ : 1;
+#ifdef NIGHTLY_BUILD
+  bool arrayGrouping_ : 1;
+#endif
+#ifdef ENABLE_CHANGE_ARRAY_BY_COPY
+  bool changeArrayByCopy_ : 1;
+#endif
+  bool importAssertions_ : 1;
 };
 
 JS_PUBLIC_API ContextOptions& ContextOptionsRef(JSContext* cx);

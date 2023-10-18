@@ -9,9 +9,6 @@
 
 #include "js/Promise.h"
 
-#include "mozilla/Attributes.h"  // MOZ_MUST_USE
-
-#include "jsapi.h"    // js::CompletionKind
 #include "jstypes.h"  // JS_PUBLIC_API
 
 #include "js/CallArgs.h"    // JS::CallArgs
@@ -27,6 +24,57 @@ namespace js {
 class AsyncFunctionGeneratorObject;
 class AsyncGeneratorObject;
 class PromiseObject;
+class SavedFrame;
+
+enum class CompletionKind;
+
+enum class PromiseHandler : uint32_t {
+  Identity = 0,
+  Thrower,
+
+  // ES2022 draft rev d03c1ec6e235a5180fa772b6178727c17974cb14
+  //
+  // Await in async function
+  // https://tc39.es/ecma262/#await
+  //
+  // Step 3. fulfilledClosure Abstract Closure.
+  // Step 5. rejectedClosure Abstract Closure.
+  AsyncFunctionAwaitedFulfilled,
+  AsyncFunctionAwaitedRejected,
+
+  // Await in async generator
+  // https://tc39.es/ecma262/#await
+  //
+  // Step 3. fulfilledClosure Abstract Closure.
+  // Step 5. rejectedClosure Abstract Closure.
+  AsyncGeneratorAwaitedFulfilled,
+  AsyncGeneratorAwaitedRejected,
+
+  // AsyncGeneratorAwaitReturn ( generator )
+  // https://tc39.es/ecma262/#sec-asyncgeneratorawaitreturn
+  //
+  // Step 7. fulfilledClosure Abstract Closure.
+  // Step 9. rejectedClosure Abstract Closure.
+  AsyncGeneratorAwaitReturnFulfilled,
+  AsyncGeneratorAwaitReturnRejected,
+
+  // AsyncGeneratorUnwrapYieldResumption
+  // https://tc39.es/ecma262/#sec-asyncgeneratorunwrapyieldresumption
+  //
+  // Steps 3-5 for awaited.[[Type]] handling.
+  AsyncGeneratorYieldReturnAwaitedFulfilled,
+  AsyncGeneratorYieldReturnAwaitedRejected,
+
+  // AsyncFromSyncIteratorContinuation ( result, promiseCapability )
+  // https://tc39.es/ecma262/#sec-asyncfromsynciteratorcontinuation
+  //
+  // Steps 7. unwrap Abstract Closure.
+  AsyncFromSyncIteratorValueUnwrapDone,
+  AsyncFromSyncIteratorValueUnwrapNotDone,
+
+  // One past the maximum allowed PromiseHandler value.
+  Limit
+};
 
 // Promise.prototype.then.
 extern bool Promise_then(JSContext* cx, unsigned argc, JS::Value* vp);
@@ -48,15 +96,15 @@ extern bool Promise_static_resolve(JSContext* cx, unsigned argc, JS::Value* vp);
  * Asserts that all objects in the `promises` vector are, maybe wrapped,
  * instances of `Promise` or a subclass of `Promise`.
  */
-MOZ_MUST_USE JSObject* GetWaitForAllPromise(JSContext* cx,
-                                            JS::HandleObjectVector promises);
+[[nodiscard]] JSObject* GetWaitForAllPromise(JSContext* cx,
+                                             JS::HandleObjectVector promises);
 
 /**
  * Enqueues resolve/reject reactions in the given Promise's reactions lists
  * as though by calling the original value of Promise.prototype.then, and
  * without regard to any Promise subclassing used in `promiseObj` itself.
  */
-MOZ_MUST_USE PromiseObject* OriginalPromiseThen(
+[[nodiscard]] PromiseObject* OriginalPromiseThen(
     JSContext* cx, JS::Handle<JSObject*> promiseObj,
     JS::Handle<JSObject*> onFulfilled, JS::Handle<JSObject*> onRejected);
 
@@ -84,7 +132,7 @@ enum class UnhandledRejectionBehavior { Ignore, Report };
  * 0. The sense of "react" here is the sense of the term as defined by Web IDL:
  *    https://heycam.github.io/webidl/#dfn-perform-steps-once-promise-is-settled
  */
-extern MOZ_MUST_USE bool ReactToUnwrappedPromise(
+[[nodiscard]] extern bool ReactToUnwrappedPromise(
     JSContext* cx, JS::Handle<PromiseObject*> unwrappedPromise,
     JS::Handle<JSObject*> onFulfilled_, JS::Handle<JSObject*> onRejected_,
     UnhandledRejectionBehavior behavior);
@@ -95,9 +143,9 @@ extern MOZ_MUST_USE bool ReactToUnwrappedPromise(
  * The abstract operation PromiseResolve, given a constructor and a value,
  * returns a new promise resolved with that value.
  */
-MOZ_MUST_USE JSObject* PromiseResolve(JSContext* cx,
-                                      JS::Handle<JSObject*> constructor,
-                                      JS::Handle<JS::Value> value);
+[[nodiscard]] JSObject* PromiseResolve(JSContext* cx,
+                                       JS::Handle<JSObject*> constructor,
+                                       JS::Handle<JS::Value> value);
 
 /**
  * Reject |promise| with the value of the current pending exception.
@@ -105,59 +153,42 @@ MOZ_MUST_USE JSObject* PromiseResolve(JSContext* cx,
  * |promise| must be from the current realm.  Callers must enter the realm of
  * |promise| if they are not already in it.
  */
-MOZ_MUST_USE bool RejectPromiseWithPendingError(
+[[nodiscard]] bool RejectPromiseWithPendingError(
     JSContext* cx, JS::Handle<PromiseObject*> promise);
 
 /**
  * Create the promise object which will be used as the return value of an async
  * function.
  */
-MOZ_MUST_USE PromiseObject* CreatePromiseObjectForAsync(JSContext* cx);
+[[nodiscard]] PromiseObject* CreatePromiseObjectForAsync(JSContext* cx);
 
 /**
  * Returns true if the given object is a promise created by
  * either CreatePromiseObjectForAsync function or async generator's method.
  */
-MOZ_MUST_USE bool IsPromiseForAsyncFunctionOrGenerator(JSObject* promise);
+[[nodiscard]] bool IsPromiseForAsyncFunctionOrGenerator(JSObject* promise);
 
-MOZ_MUST_USE bool AsyncFunctionReturned(
+[[nodiscard]] bool AsyncFunctionReturned(
     JSContext* cx, JS::Handle<PromiseObject*> resultPromise,
     JS::Handle<JS::Value> value);
 
-MOZ_MUST_USE bool AsyncFunctionThrown(JSContext* cx,
-                                      JS::Handle<PromiseObject*> resultPromise,
-                                      JS::Handle<JS::Value> reason);
+[[nodiscard]] bool AsyncFunctionThrown(JSContext* cx,
+                                       JS::Handle<PromiseObject*> resultPromise,
+                                       JS::Handle<JS::Value> reason);
 
 // Start awaiting `value` in an async function (, but doesn't suspend the
 // async function's execution!). Returns the async function's result promise.
-MOZ_MUST_USE JSObject* AsyncFunctionAwait(
+[[nodiscard]] JSObject* AsyncFunctionAwait(
     JSContext* cx, JS::Handle<AsyncFunctionGeneratorObject*> genObj,
     JS::Handle<JS::Value> value);
 
 // If the await operation can be skipped and the resolution value for `val` can
 // be acquired, stored the resolved value to `resolved` and `true` to
 // `*canSkip`.  Otherwise, stores `false` to `*canSkip`.
-MOZ_MUST_USE bool TrySkipAwait(JSContext* cx, JS::Handle<JS::Value> val,
-                               bool* canSkip,
-                               JS::MutableHandle<JS::Value> resolved);
-
-MOZ_MUST_USE bool AsyncGeneratorAwait(
-    JSContext* cx, JS::Handle<AsyncGeneratorObject*> asyncGenObj,
-    JS::Handle<JS::Value> value);
-
-MOZ_MUST_USE bool AsyncGeneratorResolve(
-    JSContext* cx, JS::Handle<AsyncGeneratorObject*> asyncGenObj,
-    JS::Handle<JS::Value> value, bool done);
-
-MOZ_MUST_USE bool AsyncGeneratorReject(
-    JSContext* cx, JS::Handle<AsyncGeneratorObject*> asyncGenObj,
-    JS::Handle<JS::Value> exception);
-
-MOZ_MUST_USE bool AsyncGeneratorEnqueue(JSContext* cx,
-                                        JS::Handle<JS::Value> asyncGenVal,
-                                        CompletionKind completionKind,
-                                        JS::Handle<JS::Value> completionValue,
-                                        JS::MutableHandle<JS::Value> result);
+[[nodiscard]] bool CanSkipAwait(JSContext* cx, JS::Handle<JS::Value> val,
+                                bool* canSkip);
+[[nodiscard]] bool ExtractAwaitValue(JSContext* cx, JS::Handle<JS::Value> val,
+                                     JS::MutableHandle<JS::Value> resolved);
 
 bool AsyncFromSyncIteratorMethod(JSContext* cx, JS::CallArgs& args,
                                  CompletionKind completionKind);
@@ -177,9 +208,9 @@ struct PromiseReactionRecordBuilder {
   // Some reaction records refer to internal resolution or rejection functions
   // that are not naturally represented as debuggee JavaScript functions. In
   // this case, resolve and reject may be nullptr.
-  virtual MOZ_MUST_USE bool then(JSContext* cx, JS::Handle<JSObject*> resolve,
-                                 JS::Handle<JSObject*> reject,
-                                 JS::Handle<JSObject*> result) = 0;
+  [[nodiscard]] virtual bool then(JSContext* cx, JS::Handle<JSObject*> resolve,
+                                  JS::Handle<JSObject*> reject,
+                                  JS::Handle<JSObject*> result) = 0;
 
   // A reaction record created when one native promise is resolved to another.
   // The 'promise' argument is the promise that will be settled in the same way
@@ -187,7 +218,7 @@ struct PromiseReactionRecordBuilder {
   //
   // Note that promise may not be same-compartment with cx. This function
   // presents the promise exactly as it appears in the reaction record.
-  virtual MOZ_MUST_USE bool direct(
+  [[nodiscard]] virtual bool direct(
       JSContext* cx, JS::Handle<PromiseObject*> unwrappedPromise) = 0;
 
   // A reaction record that resumes an asynchronous function suspended at an
@@ -196,7 +227,7 @@ struct PromiseReactionRecordBuilder {
   //
   // Note that generator may not be same-compartment with cx. This function
   // presents the generator exactly as it appears in the reaction record.
-  virtual MOZ_MUST_USE bool asyncFunction(
+  [[nodiscard]] virtual bool asyncFunction(
       JSContext* cx,
       JS::Handle<AsyncFunctionGeneratorObject*> unwrappedGenerator) = 0;
 
@@ -206,9 +237,25 @@ struct PromiseReactionRecordBuilder {
   //
   // Note that generator may not be same-compartment with cx. This function
   // presents the generator exactly as it appears in the reaction record.
-  virtual MOZ_MUST_USE bool asyncGenerator(
+  [[nodiscard]] virtual bool asyncGenerator(
       JSContext* cx, JS::Handle<AsyncGeneratorObject*> unwrappedGenerator) = 0;
 };
+
+[[nodiscard]] PromiseObject* CreatePromiseObjectForAsyncGenerator(
+    JSContext* cx);
+
+[[nodiscard]] bool ResolvePromiseInternal(JSContext* cx,
+                                          JS::Handle<JSObject*> promise,
+                                          JS::Handle<JS::Value> resolutionVal);
+[[nodiscard]] bool RejectPromiseInternal(
+    JSContext* cx, JS::Handle<PromiseObject*> promise,
+    JS::Handle<JS::Value> reason,
+    JS::Handle<SavedFrame*> unwrappedRejectionStack = nullptr);
+
+[[nodiscard]] bool InternalAsyncGeneratorAwait(
+    JSContext* cx, JS::Handle<AsyncGeneratorObject*> generator,
+    JS::Handle<JS::Value> value, PromiseHandler onFulfilled,
+    PromiseHandler onRejected);
 
 }  // namespace js
 

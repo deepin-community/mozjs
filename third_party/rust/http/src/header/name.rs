@@ -397,7 +397,7 @@ standard_headers! {
     /// media types and not only to textual documents.
     (ContentLanguage, CONTENT_LANGUAGE, "content-language");
 
-    /// Indicates the size fo the entity-body.
+    /// Indicates the size of the entity-body.
     ///
     /// The header value must be a decimal indicating the number of octets sent
     /// to the recipient.
@@ -1116,10 +1116,6 @@ fn parse_hdr<'a>(
         ($d:ident, $src:ident, 35) => { to_lower!($d, $src, 34); $d[34] = table[$src[34] as usize]; };
     }
 
-    assert!(len < super::MAX_HEADER_NAME_LEN,
-            "header name too long -- max length is {}",
-            super::MAX_HEADER_NAME_LEN);
-
     match len {
         0 => Err(InvalidHeaderName::new()),
         2 => {
@@ -1509,17 +1505,16 @@ fn parse_hdr<'a>(
                 validate(b, len)
             }
         }
-        _ => {
-            if len < 64 {
-                for i in 0..len {
-                    b[i] = table[data[i] as usize];
-                }
-
-                validate(b, len)
-            } else {
-                Ok(HdrName::custom(data, false))
+        len if len < 64 => {
+            for i in 0..len {
+                b[i] = table[data[i] as usize];
             }
+            validate(b, len)
         }
+        len if len <= super::MAX_HEADER_NAME_LEN => {
+            Ok(HdrName::custom(data, false))
+        }
+        _ => Err(InvalidHeaderName::new()),
     }
 }
 
@@ -1733,11 +1728,11 @@ impl HeaderName {
     /// Converts a static string to a HTTP header name.
     ///
     /// This function panics when the static string is a invalid header.
-    /// 
-    /// This function requires the static string to only contain lowercase 
-    /// characters, numerals and symbols, as per the HTTP/2.0 specification 
+    ///
+    /// This function requires the static string to only contain lowercase
+    /// characters, numerals and symbols, as per the HTTP/2.0 specification
     /// and header names internal representation within this library.
-    /// 
+    ///
     ///
     /// # Examples
     ///
@@ -1746,21 +1741,21 @@ impl HeaderName {
     /// // Parsing a standard header
     /// let hdr = HeaderName::from_static("content-length");
     /// assert_eq!(CONTENT_LENGTH, hdr);
-    /// 
+    ///
     /// // Parsing a custom header
     /// let CUSTOM_HEADER: &'static str = "custom-header";
-    /// 
+    ///
     /// let a = HeaderName::from_lowercase(b"custom-header").unwrap();
     /// let b = HeaderName::from_static(CUSTOM_HEADER);
     /// assert_eq!(a, b);
     /// ```
-    /// 
+    ///
     /// ```should_panic
     /// # use http::header::*;
     /// #
     /// // Parsing a header that contains invalid symbols(s):
     /// HeaderName::from_static("content{}{}length"); // This line panics!
-    /// 
+    ///
     /// // Parsing a header that contains invalid uppercase characters.
     /// let a = HeaderName::from_static("foobar");
     /// let b = HeaderName::from_static("FOOBAR"); // This line panics!
@@ -1905,6 +1900,24 @@ impl<'a> TryFrom<&'a [u8]> for HeaderName {
     }
 }
 
+impl TryFrom<String> for HeaderName {
+    type Error = InvalidHeaderName;
+
+    #[inline]
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::from_bytes(s.as_bytes())
+    }
+}
+
+impl TryFrom<Vec<u8>> for HeaderName {
+    type Error = InvalidHeaderName;
+
+    #[inline]
+    fn try_from(vec: Vec<u8>) -> Result<Self, Self::Error> {
+        Self::from_bytes(&vec)
+    }
+}
+
 #[doc(hidden)]
 impl From<StandardHeader> for HeaderName {
     fn from(src: StandardHeader) -> HeaderName {
@@ -2003,15 +2016,11 @@ impl fmt::Debug for InvalidHeaderName {
 
 impl fmt::Display for InvalidHeaderName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.description().fmt(f)
+        f.write_str("invalid HTTP header name")
     }
 }
 
-impl Error for InvalidHeaderName {
-    fn description(&self) -> &str {
-        "invalid HTTP header name"
-    }
-}
+impl Error for InvalidHeaderName {}
 
 // ===== HdrName =====
 
@@ -2161,6 +2170,24 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_name_lengths() {
+        assert!(
+            HeaderName::from_bytes(&[]).is_err(),
+            "zero-length header name is an error",
+        );
+        let mut long = vec![b'a'; super::super::MAX_HEADER_NAME_LEN];
+        assert!(
+            HeaderName::from_bytes(long.as_slice()).is_ok(),
+            "max header name length is ok",
+        );
+        long.push(b'a');
+        assert!(
+            HeaderName::from_bytes(long.as_slice()).is_err(),
+            "longer than max header name length is an error",
+        );
+    }
+
+    #[test]
     fn test_from_hdr_name() {
         use self::StandardHeader::Vary;
 
@@ -2229,7 +2256,7 @@ mod tests {
     #[test]
     fn test_from_static_std() {
         let a = HeaderName { inner: Repr::Standard(Vary) };
-        
+
         let b = HeaderName::from_static("vary");
         assert_eq!(a, b);
 
@@ -2241,13 +2268,13 @@ mod tests {
     #[should_panic]
     fn test_from_static_std_uppercase() {
         HeaderName::from_static("Vary");
-    } 
+    }
 
     #[test]
     #[should_panic]
     fn test_from_static_std_symbol() {
         HeaderName::from_static("vary{}");
-    } 
+    }
 
     // MaybeLower { lower: true }
     #[test]

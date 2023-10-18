@@ -1,4 +1,6 @@
-use serde_bytes::{Bytes, ByteBuf};
+#![allow(clippy::needless_pass_by_value)]
+
+use serde_bytes::{ByteBuf, Bytes};
 
 fn _bytes_eq_slice(bytes: &Bytes, slice: &[u8]) -> bool {
     bytes == slice

@@ -66,6 +66,7 @@ class MatchPairs {
 
   void forgetArray() { pairs_ = nullptr; }
 
+ public:
   void checkAgainst(size_t inputLength) {
 #ifdef DEBUG
     for (size_t i = 0; i < pairCount_; i++) {
@@ -79,7 +80,6 @@ class MatchPairs {
 #endif
   }
 
- public:
   /* Querying functions in the style of RegExpStatics. */
   bool empty() const { return pairCount_ == 0; }
   size_t pairCount() const {
@@ -116,6 +116,10 @@ class VectorMatchPairs : public MatchPairs {
   bool allocOrExpandArray(size_t pairCount);
 
   bool initArrayFrom(VectorMatchPairs& copyFrom);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return vec_.sizeOfExcludingThis(mallocSizeOf);
+  }
 };
 
 } /* namespace js */

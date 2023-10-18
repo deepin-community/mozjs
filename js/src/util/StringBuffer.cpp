@@ -8,9 +8,12 @@
 
 #include "mozilla/Latin1.h"
 #include "mozilla/Range.h"
-#include "mozilla/Unused.h"
 
 #include <algorithm>
+
+#include "frontend/ParserAtom.h"  // frontend::{ParserAtomsTable, TaggedParserAtomIndex
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "vm/StaticStrings.h"
 
 #include "vm/JSObject-inl.h"
 #include "vm/StringType-inl.h"
@@ -74,6 +77,11 @@ bool StringBuffer::inflateChars() {
   return true;
 }
 
+bool StringBuffer::append(const frontend::ParserAtomsTable& parserAtoms,
+                          frontend::TaggedParserAtomIndex atom) {
+  return parserAtoms.appendTo(*this, atom);
+}
+
 template <typename CharT>
 JSLinearString* StringBuffer::finishStringInternal(JSContext* cx) {
   size_t len = length();
@@ -108,7 +116,7 @@ JSLinearString* JSStringBuilder::finishString() {
     return cx_->names().empty;
   }
 
-  if (!JSString::validateLength(cx_, len)) {
+  if (MOZ_UNLIKELY(!JSString::validateLength(cx_, len))) {
     return nullptr;
   }
 
@@ -136,6 +144,24 @@ JSAtom* StringBuffer::finishAtom() {
   JSAtom* atom = AtomizeChars(cx_, twoByteChars().begin(), len);
   twoByteChars().clear();
   return atom;
+}
+
+frontend::TaggedParserAtomIndex StringBuffer::finishParserAtom(
+    frontend::ParserAtomsTable& parserAtoms) {
+  size_t len = length();
+  if (len == 0) {
+    return frontend::TaggedParserAtomIndex::WellKnown::empty();
+  }
+
+  if (isLatin1()) {
+    auto result = parserAtoms.internLatin1(cx_, latin1Chars().begin(), len);
+    latin1Chars().clear();
+    return result;
+  }
+
+  auto result = parserAtoms.internChar16(cx_, twoByteChars().begin(), len);
+  twoByteChars().clear();
+  return result;
 }
 
 bool js::ValueToStringBufferSlow(JSContext* cx, const Value& arg,
