@@ -11,11 +11,13 @@
 #include "mozilla/Maybe.h"
 #include "mozilla/Sprintf.h"
 
+#include <type_traits>
+
 #include "gc/Marking.h"
 #include "jit/arm/disasm/Disasm-arm.h"
 #include "jit/arm/MacroAssembler-arm.h"
+#include "jit/AutoWritableJitCode.h"
 #include "jit/ExecutableAllocator.h"
-#include "jit/JitRealm.h"
 #include "jit/MacroAssembler.h"
 #include "vm/Realm.h"
 
@@ -1899,14 +1901,14 @@ enum vfp_tags { VfpTag = 0x0C000A00, VfpArith = 0x02000000 };
 BufferOffset Assembler::writeVFPInst(vfp_size sz, uint32_t blob) {
   MOZ_ASSERT((sz & blob) == 0);
   MOZ_ASSERT((VfpTag & blob) == 0);
-  return writeInst(VfpTag | sz | blob);
+  return writeInst(VfpTag | std::underlying_type_t<vfp_size>(sz) | blob);
 }
 
 /* static */
 void Assembler::WriteVFPInstStatic(vfp_size sz, uint32_t blob, uint32_t* dest) {
   MOZ_ASSERT((sz & blob) == 0);
   MOZ_ASSERT((VfpTag & blob) == 0);
-  WriteInstStatic(VfpTag | sz | blob, dest);
+  WriteInstStatic(VfpTag | std::underlying_type_t<vfp_size>(sz) | blob, dest);
 }
 
 // Unityped variants: all registers hold the same (ieee754 single/double)
@@ -2009,13 +2011,17 @@ BufferOffset Assembler::as_vxfer(Register vt1, Register vt2, VFPRegister vm,
   }
 
   if (vt2 == InvalidReg) {
-    return writeVFPInst(
-        sz, WordTransfer | f2c | c | RT(vt1) | maybeRN(vt2) | VN(vm) | idx);
+    return writeVFPInst(sz, WordTransfer |
+                                std::underlying_type_t<FloatToCore_>(f2c) |
+                                std::underlying_type_t<Condition>(c) | RT(vt1) |
+                                maybeRN(vt2) | VN(vm) | idx);
   }
 
   // We are doing a 64 bit transfer.
-  return writeVFPInst(
-      sz, DoubleTransfer | f2c | c | RT(vt1) | maybeRN(vt2) | VM(vm) | idx);
+  return writeVFPInst(sz, DoubleTransfer |
+                              std::underlying_type_t<FloatToCore_>(f2c) |
+                              std::underlying_type_t<Condition>(c) | RT(vt1) |
+                              maybeRN(vt2) | VM(vm) | idx);
 }
 
 enum vcvt_destFloatness { VcvtToInteger = 1 << 18, VcvtToFloat = 0 << 18 };
@@ -2116,6 +2122,30 @@ BufferOffset Assembler::as_vdtm(LoadStore st, Register rn, VFPRegister vd,
 
   return writeVFPInst(sz, dtmLoadStore | RN(rn) | VD(vd) | length | dtmMode |
                               dtmUpdate | dtmCond);
+}
+
+BufferOffset Assembler::as_vldr_unaligned(VFPRegister vd, Register rn) {
+  MOZ_ASSERT(HasNEON());
+  if (vd.isDouble()) {
+    // vld1 (multiple single elements) with align=0, size=3, numregs=1
+    return writeInst(0xF42007CF | RN(rn) | VD(vd));
+  }
+  // vld1 (single element to single lane) with index=0, size=2
+  MOZ_ASSERT(vd.isFloat());
+  MOZ_ASSERT((vd.code() & 1) == 0);
+  return writeInst(0xF4A0080F | RN(rn) | VD(vd.asDouble()));
+}
+
+BufferOffset Assembler::as_vstr_unaligned(VFPRegister vd, Register rn) {
+  MOZ_ASSERT(HasNEON());
+  if (vd.isDouble()) {
+    // vst1 (multiple single elements) with align=0, size=3, numregs=1
+    return writeInst(0xF40007CF | RN(rn) | VD(vd));
+  }
+  // vst1 (single element from one lane) with index=0, size=2
+  MOZ_ASSERT(vd.isFloat());
+  MOZ_ASSERT((vd.code() & 1) == 0);
+  return writeInst(0xF480080F | RN(rn) | VD(vd.asDouble()));
 }
 
 BufferOffset Assembler::as_vimm(VFPRegister vd, VFPImm imm, Condition c) {

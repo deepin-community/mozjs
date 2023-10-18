@@ -10,7 +10,9 @@
 #include "mozilla/Atomics.h"
 
 #if defined(XP_WIN)
-#  include "util/Windows.h"
+#  include "util/WindowsWrapper.h"
+#elif defined(__wasi__)
+// Nothing.
 #elif defined(XP_UNIX) && !defined(XP_DARWIN)
 #  include <signal.h>
 #  include <sys/types.h>
@@ -65,7 +67,7 @@ class ProtectedRegionTree {
     }
   };
 
-  Mutex lock;
+  Mutex lock MOZ_UNANNOTATED;
   LifoAlloc alloc;
   SplayTree<Region, Region> tree;
 
@@ -120,6 +122,8 @@ bool MemoryProtectionExceptionHandler::isDisabled() {
   return true;
 #elif !defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
   // Disable the exception handler for Beta and Release builds.
+  return true;
+#elif defined(__wasi__)
   return true;
 #else
   return false;
@@ -231,6 +235,12 @@ void MemoryProtectionExceptionHandler::uninstall() {
     sExceptionHandlerInstalled = false;
   }
 }
+
+#elif defined(__wasi__)
+
+bool MemoryProtectionExceptionHandler::install() { return true; }
+
+void MemoryProtectionExceptionHandler::uninstall() {}
 
 #elif defined(XP_UNIX) && !defined(XP_DARWIN)
 

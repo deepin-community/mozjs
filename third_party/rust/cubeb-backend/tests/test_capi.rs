@@ -3,13 +3,15 @@
 // This program is made available under an ISC-style license.  See the
 // accompanying file LICENSE for details
 
-#![cfg_attr(feature = "cargo-clippy", allow(float_cmp))]
+#![cfg_attr(feature = "cargo-clippy", allow(clippy::float_cmp))]
 
 #[macro_use]
 extern crate cubeb_backend;
 
-use cubeb_backend::{ffi, Context, ContextOps, DeviceCollectionRef, DeviceId, DeviceRef,
-                    DeviceType, Ops, Result, Stream, StreamOps, StreamParams, StreamParamsRef};
+use cubeb_backend::{
+    ffi, Context, ContextOps, DeviceCollectionRef, DeviceId, DeviceRef, DeviceType, Ops, Result,
+    Stream, StreamOps, StreamParams, StreamParamsRef,
+};
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::ptr;
@@ -91,9 +93,6 @@ impl StreamOps for TestStream {
     fn stop(&mut self) -> Result<()> {
         Ok(())
     }
-    fn reset_default_device(&mut self) -> Result<()> {
-        Ok(())
-    }
     fn position(&mut self) -> Result<u64> {
         Ok(0u64)
     }
@@ -105,6 +104,10 @@ impl StreamOps for TestStream {
     }
     fn set_volume(&mut self, volume: f32) -> Result<()> {
         assert_eq!(volume, 0.5);
+        Ok(())
+    }
+    fn set_name(&mut self, name: &CStr) -> Result<()> {
+        assert_eq!(name, CStr::from_bytes_with_nul(b"test\0").unwrap());
         Ok(())
     }
     fn current_device(&mut self) -> Result<&DeviceRef> {
@@ -218,6 +221,14 @@ fn test_ops_stream_set_volume() {
     let s: *mut ffi::cubeb_stream = ptr::null_mut();
     unsafe {
         OPS.stream_set_volume.unwrap()(s, 0.5);
+    }
+}
+
+#[test]
+fn test_ops_stream_set_name() {
+    let s: *mut ffi::cubeb_stream = ptr::null_mut();
+    unsafe {
+        OPS.stream_set_name.unwrap()(s, CStr::from_bytes_with_nul(b"test\0").unwrap().as_ptr());
     }
 }
 

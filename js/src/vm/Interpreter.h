@@ -13,21 +13,21 @@
 
 #include "jspubtd.h"
 
+#include "vm/BuiltinObjectKind.h"
 #include "vm/CheckIsObjectKind.h"  // CheckIsObjectKind
-#include "vm/Iteration.h"
 #include "vm/Stack.h"
 
 namespace js {
 
+class WithScope;
 class EnvironmentIter;
 class PlainObject;
 
 /*
- * Convert null/undefined |thisv| into the current global object for the
- * compartment, and replace other primitives with boxed versions.
+ * Convert null/undefined |thisv| into the global lexical's |this| object, and
+ * replace other primitives with boxed versions.
  */
-extern bool BoxNonStrictThis(JSContext* cx, HandleValue thisv,
-                             MutableHandleValue vp);
+extern JSObject* BoxNonStrictThis(JSContext* cx, HandleValue thisv);
 
 extern bool GetFunctionThis(JSContext* cx, AbstractFramePtr frame,
                             MutableHandleValue res);
@@ -185,7 +185,7 @@ extern bool InternalConstructWithProvidedThis(JSContext* cx, HandleValue fval,
  * stack to simulate executing an eval in that frame.
  */
 extern bool ExecuteKernel(JSContext* cx, HandleScript script,
-                          HandleObject envChainArg, HandleValue newTargetValue,
+                          HandleObject envChainArg,
                           AbstractFramePtr evalInFrame,
                           MutableHandleValue result);
 
@@ -236,24 +236,18 @@ class MOZ_RAII RunState {
 
 // Eval or global script.
 class MOZ_RAII ExecuteState : public RunState {
-  RootedValue newTargetValue_;
   HandleObject envChain_;
 
   AbstractFramePtr evalInFrame_;
   MutableHandleValue result_;
 
  public:
-  ExecuteState(JSContext* cx, JSScript* script, HandleValue newTargetValue,
-               HandleObject envChain, AbstractFramePtr evalInFrame,
-               MutableHandleValue result)
+  ExecuteState(JSContext* cx, JSScript* script, HandleObject envChain,
+               AbstractFramePtr evalInFrame, MutableHandleValue result)
       : RunState(cx, Execute, script),
-        newTargetValue_(cx, newTargetValue),
         envChain_(envChain),
         evalInFrame_(evalInFrame),
         result_(result) {}
-
-  Value newTarget() const { return newTargetValue_; }
-  Value* addressOfNewTarget() { return newTargetValue_.address(); }
 
   JSObject* environmentChain() const { return envChain_; }
   bool isDebuggerEval() const { return !!evalInFrame_; }
@@ -296,8 +290,10 @@ extern JSType TypeOfObject(JSObject* obj);
 
 extern JSType TypeOfValue(const Value& v);
 
-extern bool HasInstance(JSContext* cx, HandleObject obj, HandleValue v,
-                        bool* bp);
+// Implementation of
+// https://www.ecma-international.org/ecma-262/6.0/#sec-instanceofoperator
+extern bool InstanceofOperator(JSContext* cx, HandleObject obj, HandleValue v,
+                               bool* bp);
 
 // Unwind environment chain and iterator to match the scope corresponding to
 // the given bytecode position.
@@ -410,7 +406,7 @@ class MOZ_STACK_CLASS BaseTryNoteIter {
        * handler. This is possible when the executed bytecode implements
        * break or return from inside a for-in loop.
        *
-       * In this case the emitter generates additional [enditer] and [gosub]
+       * In this case the emitter generates additional [enditer] and [goto]
        * opcodes to close all outstanding iterators and execute the finally
        * blocks. If such an [enditer] throws an exception, its pc can still
        * be inside several nested for-in loops and try-finally statements
@@ -419,7 +415,7 @@ class MOZ_STACK_CLASS BaseTryNoteIter {
        *
        * To address this, we make [enditer] always decrease the stack even
        * when its implementation throws an exception. Thus already executed
-       * [enditer] and [gosub] opcodes will have try notes with the stack
+       * [enditer] and [goto] opcodes will have try notes with the stack
        * depth exceeding the current one and this condition is what we use to
        * filter them out.
        */
@@ -504,13 +500,7 @@ bool ThrowOperation(JSContext* cx, HandleValue v);
 bool GetProperty(JSContext* cx, HandleValue value, HandlePropertyName name,
                  MutableHandleValue vp);
 
-bool GetValueProperty(JSContext* cx, HandleValue value, HandlePropertyName name,
-                      MutableHandleValue vp);
-
 JSObject* Lambda(JSContext* cx, HandleFunction fun, HandleObject parent);
-
-JSObject* LambdaArrow(JSContext* cx, HandleFunction fun, HandleObject parent,
-                      HandleValue newTargetv);
 
 bool SetObjectElement(JSContext* cx, HandleObject obj, HandleValue index,
                       HandleValue value, bool strict);
@@ -518,12 +508,6 @@ bool SetObjectElement(JSContext* cx, HandleObject obj, HandleValue index,
 bool SetObjectElementWithReceiver(JSContext* cx, HandleObject obj,
                                   HandleValue index, HandleValue value,
                                   HandleValue receiver, bool strict);
-bool SetObjectElement(JSContext* cx, HandleObject obj, HandleValue index,
-                      HandleValue value, HandleValue receiver, bool strict,
-                      HandleScript script, jsbytecode* pc);
-
-bool InitElementArray(JSContext* cx, jsbytecode* pc, HandleObject obj,
-                      uint32_t index, HandleValue value);
 
 bool AddValues(JSContext* cx, MutableHandleValue lhs, MutableHandleValue rhs,
                MutableHandleValue res);
@@ -587,21 +571,9 @@ bool DelElemOperation(JSContext* cx, HandleValue val, HandleValue index,
 
 JSObject* BindVarOperation(JSContext* cx, JSObject* envChain);
 
-bool DefVarOperation(JSContext* cx, HandleObject envChain, HandleScript script,
-                     jsbytecode* pc);
-
-bool DefLexicalOperation(JSContext* cx, HandleObject envChain,
-                         HandleScript script, jsbytecode* pc);
-
-bool DefFunOperation(JSContext* cx, HandleScript script, HandleObject envChain,
-                     HandleFunction funArg);
-
-JSObject* SingletonObjectLiteralOperation(JSContext* cx, HandleScript script,
-                                          jsbytecode* pc);
-
 JSObject* ImportMetaOperation(JSContext* cx, HandleScript script);
 
-JSObject* FunctionProtoOperation(JSContext* cx);
+JSObject* BuiltinObjectOperation(JSContext* cx, BuiltinObjectKind kind);
 
 bool ThrowMsgOperation(JSContext* cx, const unsigned throwMsgKind);
 
@@ -633,28 +605,37 @@ bool SpreadCallOperation(JSContext* cx, HandleScript script, jsbytecode* pc,
                          HandleValue thisv, HandleValue callee, HandleValue arr,
                          HandleValue newTarget, MutableHandleValue res);
 
-bool OptimizeSpreadCall(JSContext* cx, HandleValue arg, bool* optimized);
+bool OptimizeSpreadCall(JSContext* cx, HandleValue arg,
+                        MutableHandleValue result);
 
-JSObject* NewObjectOperation(JSContext* cx, HandleScript script, jsbytecode* pc,
-                             NewObjectKind newKind = GenericObject);
+ArrayObject* ArrayFromArgumentsObject(JSContext* cx,
+                                      Handle<ArgumentsObject*> args);
 
-JSObject* NewObjectOperationWithTemplate(JSContext* cx,
-                                         HandleObject templateObject);
-JSObject* CreateThisWithTemplate(JSContext* cx, HandleObject templateObject);
+JSObject* NewObjectOperation(JSContext* cx, HandleScript script,
+                             const jsbytecode* pc);
 
-ArrayObject* NewArrayOperation(JSContext* cx, HandleScript script,
-                               jsbytecode* pc, uint32_t length,
+JSObject* NewPlainObjectBaselineFallback(JSContext* cx, HandleShape shape,
+                                         gc::AllocKind allocKind,
+                                         gc::AllocSite* site);
+
+JSObject* NewPlainObjectOptimizedFallback(JSContext* cx, HandleShape shape,
+                                          gc::AllocKind allocKind,
+                                          gc::InitialHeap initialHeap);
+
+ArrayObject* NewArrayOperation(JSContext* cx, uint32_t length,
                                NewObjectKind newKind = GenericObject);
 
-ArrayObject* NewArrayOperationWithTemplate(JSContext* cx,
-                                           HandleObject templateObject);
+// Called from JIT code when inline array allocation fails.
+ArrayObject* NewArrayObjectBaselineFallback(JSContext* cx, uint32_t length,
+                                            gc::AllocKind allocKind,
+                                            gc::AllocSite* site);
+ArrayObject* NewArrayObjectOptimizedFallback(JSContext* cx, uint32_t length,
+                                             gc::AllocKind allocKind,
+                                             NewObjectKind newKind);
 
-ArrayObject* NewArrayCopyOnWriteOperation(JSContext* cx, HandleScript script,
-                                          jsbytecode* pc);
-
-MOZ_MUST_USE bool GetImportOperation(JSContext* cx, HandleObject envChain,
-                                     HandleScript script, jsbytecode* pc,
-                                     MutableHandleValue vp);
+[[nodiscard]] bool GetImportOperation(JSContext* cx, HandleObject envChain,
+                                      HandleScript script, jsbytecode* pc,
+                                      MutableHandleValue vp);
 
 void ReportRuntimeLexicalError(JSContext* cx, unsigned errorNumber,
                                HandleId id);
@@ -665,12 +646,11 @@ void ReportRuntimeLexicalError(JSContext* cx, unsigned errorNumber,
 void ReportRuntimeLexicalError(JSContext* cx, unsigned errorNumber,
                                HandleScript script, jsbytecode* pc);
 
-void ReportInNotObjectError(JSContext* cx, HandleValue lref, int lindex,
-                            HandleValue rref, int rindex);
+void ReportInNotObjectError(JSContext* cx, HandleValue lref, HandleValue rref);
 
 // The parser only reports redeclarations that occurs within a single
 // script. Due to the extensibility of the global lexical scope, we also check
-// for redeclarations during runtime in JSOp::Def{Var,Let,Const}.
+// for redeclarations during runtime in JSOp::GlobalOrEvalDeclInstantation.
 void ReportRuntimeRedeclaration(JSContext* cx, HandlePropertyName name,
                                 const char* redeclKind);
 
@@ -679,8 +659,6 @@ bool ThrowCheckIsObject(JSContext* cx, CheckIsObjectKind kind);
 bool ThrowUninitializedThis(JSContext* cx);
 
 bool ThrowInitializedThis(JSContext* cx);
-
-bool ThrowHomeObjectNotObject(JSContext* cx);
 
 bool ThrowObjectCoercible(JSContext* cx, HandleValue value);
 
@@ -695,12 +673,14 @@ PlainObject* ObjectWithProtoOperation(JSContext* cx, HandleValue proto);
 JSObject* FunWithProtoOperation(JSContext* cx, HandleFunction fun,
                                 HandleObject parent, HandleObject proto);
 
-JSFunction* MakeDefaultConstructor(JSContext* cx, HandleScript script,
-                                   jsbytecode* pc, HandleObject proto);
+bool SetPropertySuper(JSContext* cx, HandleValue lval, HandleValue receiver,
+                      HandlePropertyName name, HandleValue rval, bool strict);
 
-bool SetPropertySuper(JSContext* cx, HandleObject obj, HandleValue receiver,
-                      HandlePropertyName id, HandleValue rval, bool strict);
+bool SetElementSuper(JSContext* cx, HandleValue lval, HandleValue receiver,
+                     HandleValue index, HandleValue rval, bool strict);
 
+bool LoadAliasedDebugVar(JSContext* cx, JSObject* env, jsbytecode* pc,
+                         MutableHandleValue result);
 } /* namespace js */
 
 #endif /* vm_Interpreter_h */

@@ -77,30 +77,6 @@
 //! [read]: https://doc.rust-lang.org/std/io/trait.Read.html
 //! [write]: https://doc.rust-lang.org/std/io/trait.Write.html
 //! [bufread]: https://doc.rust-lang.org/std/io/trait.BufRead.html
-//!
-//! # Async I/O
-//!
-//! This crate optionally can support async I/O streams with the [Tokio stack] via
-//! the `tokio` feature of this crate:
-//!
-//! [Tokio stack]: https://tokio.rs/
-//!
-//! ```toml
-//! flate2 = { version = "0.2", features = ["tokio"] }
-//! ```
-//!
-//! All methods are internally capable of working with streams that may return
-//! [`ErrorKind::WouldBlock`] when they're not ready to perform the particular
-//! operation.
-//!
-//! [`ErrorKind::WouldBlock`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html
-//!
-//! Note that care needs to be taken when using these objects, however. The
-//! Tokio runtime, in particular, requires that data is fully flushed before
-//! dropping streams. For compatibility with blocking streams all streams are
-//! flushed/written when they are dropped, and this is not always a suitable
-//! time to perform I/O. If I/O streams are flushed before drop, however, then
-//! these operations will be a noop.
 #![doc(html_root_url = "https://docs.rs/flate2/0.2")]
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
@@ -192,23 +168,23 @@ impl Compression {
     ///
     /// The integer here is typically on a scale of 0-9 where 0 means "no
     /// compression" and 9 means "take as long as you'd like".
-    pub fn new(level: u32) -> Compression {
+    pub const fn new(level: u32) -> Compression {
         Compression(level)
     }
 
     /// No compression is to be performed, this may actually inflate data
     /// slightly when encoding.
-    pub fn none() -> Compression {
+    pub const fn none() -> Compression {
         Compression(0)
     }
 
     /// Optimize for the best speed of encoding.
-    pub fn fast() -> Compression {
+    pub const fn fast() -> Compression {
         Compression(1)
     }
 
     /// Optimize for the size of data being encoded.
-    pub fn best() -> Compression {
+    pub const fn best() -> Compression {
         Compression(9)
     }
 

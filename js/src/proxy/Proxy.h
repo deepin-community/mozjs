@@ -27,7 +27,7 @@ class Proxy {
   /* Standard internal methods. */
   static bool getOwnPropertyDescriptor(
       JSContext* cx, HandleObject proxy, HandleId id,
-      MutableHandle<JS::PropertyDescriptor> desc);
+      MutableHandle<mozilla::Maybe<JS::PropertyDescriptor>> desc);
   static bool defineProperty(JSContext* cx, HandleObject proxy, HandleId id,
                              Handle<JS::PropertyDescriptor> desc,
                              ObjectOpResult& result);
@@ -70,8 +70,6 @@ class Proxy {
                                            MutableHandleIdVector props);
   static bool nativeCall(JSContext* cx, IsAcceptableThis test, NativeImpl impl,
                          const CallArgs& args);
-  static bool hasInstance(JSContext* cx, HandleObject proxy,
-                          MutableHandleValue v, bool* bp);
   static bool getBuiltinClass(JSContext* cx, HandleObject proxy, ESClass* cls);
   static bool isArray(JSContext* cx, HandleObject proxy,
                       JS::IsArrayAnswer* answer);
@@ -109,7 +107,6 @@ bool ProxySetProperty(JSContext* cx, HandleObject proxy, HandleId id,
 
 bool ProxySetPropertyByValue(JSContext* cx, HandleObject proxy,
                              HandleValue idVal, HandleValue val, bool strict);
-
 } /* namespace js */
 
 #endif /* proxy_Proxy_h */

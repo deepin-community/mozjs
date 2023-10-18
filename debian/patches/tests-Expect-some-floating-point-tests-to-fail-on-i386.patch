@@ -14,12 +14,12 @@ Forwarded: not-needed, Debian-specific
  1 file changed, 11 insertions(+)
 
 diff --git a/js/src/tests/jstests.list b/js/src/tests/jstests.list
-index 4085ce3..4c73952 100644
+index 2a2a3ef..fd772f3 100644
 --- a/js/src/tests/jstests.list
 +++ b/js/src/tests/jstests.list
-@@ -654,6 +654,17 @@ fails-if(!xulRuntime.shell) script test262/built-ins/TypedArray/prototype/set/ty
- skip script test262/intl402/DisplayNames/proto-from-ctor-realm.js
- skip script test262/intl402/DisplayNames/prototype/resolvedOptions/return-object.js
+@@ -612,6 +612,17 @@ skip script test262/built-ins/TypedArrayConstructors/ctors/no-species.js
+ # https://bugzilla.mozilla.org/show_bug.cgi?id=1763606
+ skip script test262/built-ins/TypedArray/prototype/sort/sort-tonumber.js
  
 +############################
 +# Tests disabled by Debian #

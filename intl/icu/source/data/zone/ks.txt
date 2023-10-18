@@ -1,7 +1,7 @@
 ﻿// © 2016 and later: Unicode, Inc. and others.
-// License & terms of use: http://www.unicode.org/copyright.html#License
+// License & terms of use: http://www.unicode.org/copyright.html
+// Generated using tools/cldr/cldr-to-icu/build-icu-data.xml
 ks{
-    Version{"37"}
     zoneStrings{
         "Africa:Abidjan"{
             ec{"عابِدجان"}
@@ -845,6 +845,9 @@ ks{
         }
         "Australia:Sydney"{
             ec{"سِڑنی"}
+        }
+        "Etc:UTC"{
+            ls{"کوآرڈنیٹڈ یونیورسل وَکھ"}
         }
         "Etc:Unknown"{
             ec{"غٲر زان"}
@@ -1739,5 +1742,8 @@ ks{
         }
         gmtFormat{"GMT{0}"}
         hourFormat{"+HH:mm;-HH:mm"}
+        regionFormat{"{0} وَکھ"}
+        regionFormatDaylight{"{0} ڈے لائٹ وَکھ"}
+        regionFormatStandard{"{0} معیٲری وَکھ"}
     }
 }

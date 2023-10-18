@@ -3,10 +3,11 @@
 // This program is made available under an ISC-style license.  See the
 // accompanying file LICENSE for details.
 
-use {ChannelLayout, DeviceRef, Result, SampleFormat};
 use ffi;
+use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::ptr;
+use {ChannelLayout, DeviceRef, Result, SampleFormat};
 
 /// Stream states signaled via `state_callback`.
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
@@ -33,10 +34,10 @@ impl From<ffi::cubeb_state> for State {
     }
 }
 
-impl Into<ffi::cubeb_state> for State {
-    fn into(self) -> ffi::cubeb_state {
+impl From<State> for ffi::cubeb_state {
+    fn from(x: State) -> Self {
         use State::*;
-        match self {
+        match x {
             Started => ffi::CUBEB_STATE_STARTED,
             Stopped => ffi::CUBEB_STATE_STOPPED,
             Drained => ffi::CUBEB_STATE_DRAINED,
@@ -55,7 +56,7 @@ bitflags! {
     }
 }
 
-ffi_type_stack!{
+ffi_type_stack! {
     /// Stream format initialization parameters.
     type CType = ffi::cubeb_stream_params;
     #[derive(Debug)]
@@ -118,11 +119,6 @@ impl StreamRef {
         unsafe { call!(ffi::cubeb_stream_stop(self.as_ptr())) }
     }
 
-    /// Reset stream to the default device.
-    pub fn reset_default_device(&self) -> Result<()> {
-        unsafe { call!(ffi::cubeb_stream_reset_default_device(self.as_ptr())) }
-    }
-
     /// Get the current stream playback position.
     pub fn position(&self) -> Result<u64> {
         let mut position = 0u64;
@@ -149,7 +145,10 @@ impl StreamRef {
     pub fn input_latency(&self) -> Result<u32> {
         let mut latency = 0u32;
         unsafe {
-            let _ = try_call!(ffi::cubeb_stream_get_input_latency(self.as_ptr(), &mut latency));
+            let _ = try_call!(ffi::cubeb_stream_get_input_latency(
+                self.as_ptr(),
+                &mut latency
+            ));
         }
         Ok(latency)
     }
@@ -157,6 +156,11 @@ impl StreamRef {
     /// Set the volume for a stream.
     pub fn set_volume(&self, volume: f32) -> Result<()> {
         unsafe { call!(ffi::cubeb_stream_set_volume(self.as_ptr(), volume)) }
+    }
+
+    /// Change a stream's name
+    pub fn set_name(&self, name: &CStr) -> Result<()> {
+        unsafe { call!(ffi::cubeb_stream_set_name(self.as_ptr(), name.as_ptr())) }
     }
 
     /// Get the current output device for this stream.
@@ -201,8 +205,8 @@ impl StreamRef {
 
 #[cfg(test)]
 mod tests {
-    use {StreamParams, StreamParamsRef, StreamPrefs};
     use std::mem;
+    use {StreamParams, StreamParamsRef, StreamPrefs};
 
     #[test]
     fn stream_params_default() {

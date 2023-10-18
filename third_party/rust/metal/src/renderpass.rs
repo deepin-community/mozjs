@@ -7,10 +7,8 @@
 
 use super::*;
 
-use cocoa::foundation::NSUInteger;
-
 #[repr(u64)]
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub enum MTLLoadAction {
     DontCare = 0,
     Load = 1,
@@ -18,7 +16,7 @@ pub enum MTLLoadAction {
 }
 
 #[repr(u64)]
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub enum MTLStoreAction {
     DontCare = 0,
     Store = 1,
@@ -29,18 +27,18 @@ pub enum MTLStoreAction {
 }
 
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct MTLClearColor {
-    red: f64,
-    green: f64,
-    blue: f64,
-    alpha: f64,
+    pub red: f64,
+    pub green: f64,
+    pub blue: f64,
+    pub alpha: f64,
 }
 
 impl MTLClearColor {
     #[inline]
     pub fn new(red: f64, green: f64, blue: f64, alpha: f64) -> Self {
-        MTLClearColor {
+        Self {
             red,
             green,
             blue,
@@ -257,11 +255,9 @@ foreign_obj_type! {
 }
 
 impl RenderPassDescriptor {
+    /// Creates a default render pass descriptor with no attachments.
     pub fn new<'a>() -> &'a RenderPassDescriptorRef {
-        unsafe {
-            let class = class!(MTLRenderPassDescriptorInternal);
-            msg_send![class, renderPassDescriptor]
-        }
+        unsafe { msg_send![class!(MTLRenderPassDescriptor), renderPassDescriptor] }
     }
 }
 

@@ -48,6 +48,11 @@ Symbol* Symbol::new_(JSContext* cx, JS::SymbolCode code,
   return sym;
 }
 
+Symbol* Symbol::newWellKnown(JSContext* cx, JS::SymbolCode code,
+                             HandlePropertyName description) {
+  return newInternal(cx, code, cx->runtime()->randomHashCode(), description);
+}
+
 Symbol* Symbol::for_(JSContext* cx, HandleString description) {
   RootedAtom atom(cx, AtomizeString(cx, description));
   if (!atom) {
@@ -103,6 +108,11 @@ void Symbol::dump(js::GenericPrinter& out) {
     if (code_ == SymbolCode::UniqueSymbol) {
       out.printf("@%p", (void*)this);
     }
+  } else if (code_ == SymbolCode::PrivateNameSymbol) {
+    MOZ_ASSERT(description());
+    out.putChar('#');
+    description()->dumpCharsNoNewline(out);
+    out.printf("@%p", (void*)this);
   } else {
     out.printf("<Invalid Symbol code=%u>", unsigned(code_));
   }

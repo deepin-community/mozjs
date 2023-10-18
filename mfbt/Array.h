@@ -11,12 +11,13 @@
 
 #include <stddef.h>
 
+#include <iterator>
 #include <ostream>
 #include <utility>
 
 #include "mozilla/Assertions.h"
 #include "mozilla/Attributes.h"
-#include "mozilla/ReverseIterator.h"
+#include "mozilla/Likely.h"
 
 namespace mozilla {
 
@@ -28,7 +29,7 @@ class Array {
   using ElementType = T;
   static constexpr size_t Length = _Length;
 
-  Array() = default;
+  constexpr Array() = default;
 
   template <typename... Args>
   MOZ_IMPLICIT constexpr Array(Args&&... aArgs)
@@ -39,12 +40,16 @@ class Array {
   }
 
   T& operator[](size_t aIndex) {
-    MOZ_ASSERT(aIndex < Length);
+    if (MOZ_UNLIKELY(aIndex >= Length)) {
+      detail::InvalidArrayIndex_CRASH(aIndex, Length);
+    }
     return mArr[aIndex];
   }
 
   const T& operator[](size_t aIndex) const {
-    MOZ_ASSERT(aIndex < Length);
+    if (MOZ_UNLIKELY(aIndex >= Length)) {
+      detail::InvalidArrayIndex_CRASH(aIndex, Length);
+    }
     return mArr[aIndex];
   }
 
@@ -59,8 +64,8 @@ class Array {
 
   typedef T* iterator;
   typedef const T* const_iterator;
-  typedef ReverseIterator<T*> reverse_iterator;
-  typedef ReverseIterator<const T*> const_reverse_iterator;
+  typedef std::reverse_iterator<T*> reverse_iterator;
+  typedef std::reverse_iterator<const T*> const_reverse_iterator;
 
   // Methods for range-based for loops.
   iterator begin() { return mArr; }
@@ -97,7 +102,7 @@ class Array<T, 0> {
 
 template <typename T, size_t Length>
 std::ostream& operator<<(std::ostream& aOut, const Array<T, Length>& aArray) {
-  return aOut << MakeSpan(aArray);
+  return aOut << Span(aArray);
 }
 
 } /* namespace mozilla */

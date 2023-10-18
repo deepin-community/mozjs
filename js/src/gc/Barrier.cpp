@@ -6,15 +6,17 @@
 
 #include "gc/Barrier.h"
 
-#include "builtin/TypedObject.h"
 #include "gc/Policy.h"
-#include "jit/Ion.h"
+#include "jit/JitContext.h"
 #include "js/HashTable.h"
+#include "js/shadow/Zone.h"  // JS::shadow::Zone
 #include "js/Value.h"
 #include "vm/BigIntType.h"  // JS::BigInt
 #include "vm/EnvironmentObject.h"
 #include "vm/GeneratorObject.h"
+#include "vm/GetterSetter.h"
 #include "vm/JSObject.h"
+#include "vm/PropMap.h"
 #include "vm/Realm.h"
 #include "vm/SharedArrayObject.h"
 #include "vm/SymbolType.h"
@@ -45,7 +47,7 @@ bool HeapSlot::preconditionForSet(NativeObject* owner, Kind kind,
   return &owner->getDenseElement(slot - numShifted) == (const Value*)this;
 }
 
-void HeapSlot::assertPreconditionForWriteBarrierPost(
+void HeapSlot::assertPreconditionForPostWriteBarrier(
     NativeObject* obj, Kind kind, uint32_t slot, const Value& target) const {
   if (kind == Slot) {
     MOZ_ASSERT(obj->getSlotAddressUnchecked(slot)->get() == target);
@@ -65,50 +67,7 @@ bool CurrentThreadIsIonCompiling() {
   return jcx && jcx->inIonBackend();
 }
 
-bool CurrentThreadIsIonCompilingSafeForMinorGC() {
-  jit::JitContext* jcx = jit::MaybeGetJitContext();
-  return jcx && jcx->inIonBackendSafeForMinorGC();
-}
-
-bool CurrentThreadIsGCMarking() {
-  return TlsContext.get()->gcUse == JSContext::GCUse::Marking;
-}
-
-bool CurrentThreadIsGCSweeping() {
-  return TlsContext.get()->gcUse == JSContext::GCUse::Sweeping;
-}
-
-bool CurrentThreadIsGCFinalizing() {
-  return TlsContext.get()->gcUse == JSContext::GCUse::Finalizing;
-}
-
-bool CurrentThreadIsTouchingGrayThings() {
-  return TlsContext.get()->isTouchingGrayThings;
-}
-
-AutoTouchingGrayThings::AutoTouchingGrayThings() {
-  TlsContext.get()->isTouchingGrayThings++;
-}
-
-AutoTouchingGrayThings::~AutoTouchingGrayThings() {
-  JSContext* cx = TlsContext.get();
-  MOZ_ASSERT(cx->isTouchingGrayThings);
-  cx->isTouchingGrayThings--;
-}
-
 #endif  // DEBUG
-
-/* static */ void InternalBarrierMethods<Value>::readBarrier(const Value& v) {
-  ApplyGCThingTyped(v, [](auto t) { t->readBarrier(t); });
-}
-
-/* static */ void InternalBarrierMethods<Value>::preBarrier(const Value& v) {
-  ApplyGCThingTyped(v, [](auto t) { t->writeBarrierPre(t); });
-}
-
-/* static */ void InternalBarrierMethods<jsid>::preBarrier(jsid id) {
-  ApplyGCThingTyped(id, [](auto t) { t->writeBarrierPre(t); });
-}
 
 template <typename T>
 /* static */ bool MovableCellHasher<T>::hasHash(const Lookup& l) {
@@ -140,7 +99,6 @@ template <typename T>
   // into another runtime. The zone's uid lock will protect against multiple
   // workers doing this simultaneously.
   MOZ_ASSERT(CurrentThreadCanAccessZone(l->zoneFromAnyThread()) ||
-             l->zoneFromAnyThread()->isSelfHostingZone() ||
              CurrentThreadIsPerformingGC());
 
   return l->zoneFromAnyThread()->getHashCodeInfallible(l);
@@ -158,8 +116,7 @@ template <typename T>
 
   MOZ_ASSERT(k);
   MOZ_ASSERT(l);
-  MOZ_ASSERT(CurrentThreadCanAccessZone(l->zoneFromAnyThread()) ||
-             l->zoneFromAnyThread()->isSelfHostingZone());
+  MOZ_ASSERT(CurrentThreadCanAccessZone(l->zoneFromAnyThread()));
 
   Zone* zone = k->zoneFromAnyThread();
   if (zone != l->zoneFromAnyThread()) {
@@ -172,7 +129,7 @@ template <typename T>
   // removed from the table later on.
   if (!zone->hasUniqueId(k)) {
     Key key = k;
-    MOZ_ASSERT(IsAboutToBeFinalizedUnbarriered(&key));
+    MOZ_ASSERT(IsAboutToBeFinalizedUnbarriered(key));
   }
   MOZ_ASSERT(zone->hasUniqueId(l));
 #endif
@@ -195,6 +152,7 @@ template struct JS_PUBLIC_API MovableCellHasher<EnvironmentObject*>;
 template struct JS_PUBLIC_API MovableCellHasher<GlobalObject*>;
 template struct JS_PUBLIC_API MovableCellHasher<JSScript*>;
 template struct JS_PUBLIC_API MovableCellHasher<BaseScript*>;
+template struct JS_PUBLIC_API MovableCellHasher<PropMap*>;
 template struct JS_PUBLIC_API MovableCellHasher<ScriptSourceObject*>;
 template struct JS_PUBLIC_API MovableCellHasher<SavedFrame*>;
 template struct JS_PUBLIC_API MovableCellHasher<WasmInstanceObject*>;

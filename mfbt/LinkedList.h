@@ -64,6 +64,7 @@
 #ifndef mozilla_LinkedList_h
 #define mozilla_LinkedList_h
 
+#include <algorithm>
 #include <utility>
 
 #include "mozilla/Assertions.h"
@@ -313,7 +314,7 @@ class LinkedListElement {
    */
   void setNextUnsafe(RawType aElem) {
     LinkedListElement* listElem = static_cast<LinkedListElement*>(aElem);
-    MOZ_ASSERT(!listElem->isInList());
+    MOZ_RELEASE_ASSERT(!listElem->isInList());
 
     listElem->mNext = this->mNext;
     listElem->mPrev = this;
@@ -329,7 +330,7 @@ class LinkedListElement {
    */
   void setPreviousUnsafe(RawType aElem) {
     LinkedListElement<T>* listElem = static_cast<LinkedListElement<T>*>(aElem);
-    MOZ_ASSERT(!listElem->isInList());
+    MOZ_RELEASE_ASSERT(!listElem->isInList());
 
     listElem->mNext = this;
     listElem->mPrev = this->mPrev;
@@ -337,6 +338,28 @@ class LinkedListElement {
     this->mPrev = listElem;
 
     Traits::enterList(aElem);
+  }
+
+  /*
+   * Transfers the elements [aBegin, aEnd) before the "this" list element.
+   */
+  void transferBeforeUnsafe(LinkedListElement<T>& aBegin,
+                            LinkedListElement<T>& aEnd) {
+    MOZ_RELEASE_ASSERT(!aBegin.mIsSentinel);
+    if (!aBegin.isInList() || !aEnd.isInList()) {
+      return;
+    }
+
+    auto otherPrev = aBegin.mPrev;
+
+    aBegin.mPrev = this->mPrev;
+    this->mPrev->mNext = &aBegin;
+    this->mPrev = aEnd.mPrev;
+    aEnd.mPrev->mNext = this;
+
+    // Patch the gap in the source list
+    otherPrev->mNext = &aEnd;
+    aEnd.mPrev = otherPrev;
   }
 
   /*
@@ -434,10 +457,15 @@ class LinkedList {
   }
 
   ~LinkedList() {
-    MOZ_ASSERT(isEmpty(),
-               "failing this assertion means this LinkedList's creator is "
-               "buggy: it should have removed all this list's elements before "
-               "the list's destruction");
+#  ifdef DEBUG
+    if (!isEmpty()) {
+      MOZ_CRASH_UNSAFE_PRINTF(
+          "%s has a buggy user: "
+          "it should have removed all this list's elements before "
+          "the list's destruction",
+          __PRETTY_FUNCTION__);
+    }
+#  endif
   }
 
   /*
@@ -452,6 +480,50 @@ class LinkedList {
    * Add aElem to the back of the list.
    */
   void insertBack(RawType aElem) { sentinel.setPreviousUnsafe(aElem); }
+
+  /*
+   * Move all elements from another list to the back
+   */
+  void extendBack(LinkedList<T>&& aOther) {
+    MOZ_RELEASE_ASSERT(this != &aOther);
+    if (aOther.isEmpty()) {
+      return;
+    }
+    sentinel.transferBeforeUnsafe(**aOther.begin(), aOther.sentinel);
+  }
+
+  /*
+   * Move elements from another list to the specified position
+   */
+  void splice(size_t aDestinationPos, LinkedList<T>& aListFrom,
+              size_t aSourceStart, size_t aSourceLen) {
+    MOZ_RELEASE_ASSERT(this != &aListFrom);
+    if (aListFrom.isEmpty() || !aSourceLen) {
+      return;
+    }
+
+    const auto safeForward = [](LinkedList<T>& aList,
+                                LinkedListElement<T>& aBegin,
+                                size_t aPos) -> LinkedListElement<T>& {
+      auto* iter = &aBegin;
+      for (size_t i = 0; i < aPos; ++i, (iter = iter->mNext)) {
+        if (iter->mIsSentinel) {
+          break;
+        }
+      }
+      return *iter;
+    };
+
+    auto& sourceBegin =
+        safeForward(aListFrom, *aListFrom.sentinel.mNext, aSourceStart);
+    if (sourceBegin.mIsSentinel) {
+      return;
+    }
+    auto& sourceEnd = safeForward(aListFrom, sourceBegin, aSourceLen);
+    auto& destination = safeForward(*this, *sentinel.mNext, aDestinationPos);
+
+    destination.transferBeforeUnsafe(sourceBegin, sourceEnd);
+  }
 
   /*
    * Get the first element of the list, or nullptr if the list is empty.
@@ -515,15 +587,7 @@ class LinkedList {
   /**
    * Return the length of elements in the list.
    */
-  size_t length() const {
-    size_t length = 0;
-    ConstRawType element = getFirst();
-    while (element) {
-      length++;
-      element = element->getNext();
-    }
-    return length;
-  }
+  size_t length() const { return std::distance(begin(), end()); }
 
   /*
    * Allow range-based iteration:
@@ -638,12 +702,34 @@ class LinkedList {
 };
 
 template <typename T>
+inline void ImplCycleCollectionUnlink(LinkedList<RefPtr<T>>& aField) {
+  aField.clear();
+}
+
+template <typename T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    LinkedList<RefPtr<T>>& aField, const char* aName, uint32_t aFlags = 0) {
+  typedef typename detail::LinkedListElementTraits<T> Traits;
+  typedef typename Traits::RawType RawType;
+  for (RawType element : aField) {
+    // RefPtr is stored as a raw pointer in LinkedList.
+    // So instead of creating a new RefPtr from the raw
+    // pointer (which is not allowed), we simply call
+    // CycleCollectionNoteChild against the raw pointer
+    CycleCollectionNoteChild(aCallback, element, aName, aFlags);
+  }
+}
+
+template <typename T>
 class AutoCleanLinkedList : public LinkedList<T> {
  private:
   using Traits = detail::LinkedListElementTraits<T>;
   using ClientType = typename detail::LinkedListElementTraits<T>::ClientType;
 
  public:
+  AutoCleanLinkedList() = default;
+  AutoCleanLinkedList(AutoCleanLinkedList&&) = default;
   ~AutoCleanLinkedList() { clear(); }
 
   AutoCleanLinkedList& operator=(AutoCleanLinkedList&& aOther) = default;

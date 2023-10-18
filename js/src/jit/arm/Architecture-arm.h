@@ -9,6 +9,7 @@
 
 #include "mozilla/MathAlgorithms.h"
 
+#include <algorithm>
 #include <limits.h>
 #include <stdint.h>
 
@@ -25,12 +26,6 @@
 
 namespace js {
 namespace jit {
-
-// In bytes: slots needed for potential memory->memory move spills.
-//   +8 for cycles
-//   +4 for gpr spills
-//   +8 for double spills
-static const uint32_t ION_FRAME_SLACK_SIZE = 20;
 
 // These offsets are specific to nunboxing, and capture offsets into the
 // components of a js::Value.
@@ -60,16 +55,15 @@ class Registers {
     r1,
     r2,
     r3,
-    S0 = r3,
     r4,
     r5,
     r6,
     r7,
     r8,
-    S1 = r8,
     r9,
     r10,
     r11,
+    fp = r11,
     r12,
     ip = r12,
     r13,
@@ -138,7 +132,7 @@ class Registers {
 
   static const SetType NonAllocatableMask =
       (1 << Registers::sp) | (1 << Registers::r12) |  // r12 = ip = scratch
-      (1 << Registers::lr) | (1 << Registers::pc);
+      (1 << Registers::lr) | (1 << Registers::pc) | (1 << Registers::fp);
 
   // Registers returned from a JS -> JS call.
   static const SetType JSCallMask = (1 << Registers::r2) | (1 << Registers::r3);
@@ -334,6 +328,10 @@ class FloatRegisters {
 
   static const SetType AllocatableMask = AllMask & ~NonAllocatableMask;
 };
+
+static const uint32_t SpillSlotSize =
+    std::max(sizeof(Registers::RegisterContent),
+             sizeof(FloatRegisters::RegisterContent));
 
 template <typename T>
 class TypedRegisterSet;
@@ -656,6 +654,7 @@ bool HasVFPv3();
 bool HasVFP();
 bool Has32DP();
 bool HasIDIV();
+bool HasNEON();
 
 extern volatile uint32_t armHwCapFlags;
 
@@ -704,8 +703,22 @@ inline bool hasUnaliasedDouble() { return Has32DP(); }
 // a double as a temporary, you need a temporary double register.
 inline bool hasMultiAlias() { return true; }
 
-bool ParseARMHwCapFlags(const char* armHwCap);
+// InitARMFlags is called from the JitContext constructor to read the hardware
+// flags.  The call is a no-op after the first call, or if the JS shell has
+// already set the flags (it has a command line switch for this, see
+// ParseARMHwCapFlags).
+//
+// If the environment variable ARMHWCAP is set then the flags are read from it
+// instead; see ParseARMHwCapFlags.
 void InitARMFlags();
+
+// Register a string denoting ARM hardware flags. During engine initialization,
+// these flags will then be used instead of the actual hardware capabilities.
+// This must be called before JS_Init and the passed string's buffer must
+// outlive the JS_Init call.
+void SetARMHwCapFlagsString(const char* armHwCap);
+
+// Retrive the ARM hardware flags at a bitmask.  They must have been set.
 uint32_t GetARMFlags();
 
 // If the simulator is used then the ABI choice is dynamic. Otherwise the ABI is

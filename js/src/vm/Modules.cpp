@@ -13,13 +13,14 @@
 
 #include <stdint.h>  // uint32_t
 
-#include "jsapi.h"    // js::AssertHeapIsIdle
 #include "jstypes.h"  // JS_PUBLIC_API
 
 #include "builtin/ModuleObject.h"  // js::FinishDynamicModuleImport, js::{,Requested}ModuleObject
 #include "frontend/BytecodeCompiler.h"  // js::frontend::CompileModule
+#include "js/Context.h"                 // js::AssertHeapIsIdle
 #include "js/RootingAPI.h"              // JS::MutableHandle
 #include "js/Value.h"                   // JS::Value
+#include "vm/EnvironmentObject.h"       // js::ModuleEnvironmentObject
 #include "vm/JSContext.h"               // CHECK_THREAD, JSContext
 #include "vm/JSObject.h"                // JSObject
 #include "vm/Runtime.h"                 // JSRuntime
@@ -31,6 +32,20 @@ using mozilla::Utf8Unit;
 using js::AssertHeapIsIdle;
 using js::ModuleObject;
 using js::RequestedModuleObject;
+
+JS_PUBLIC_API JS::SupportedAssertionsHook JS::GetSupportedAssertionsHook(
+    JSRuntime* rt) {
+  AssertHeapIsIdle();
+
+  return rt->supportedAssertionsHook;
+}
+
+JS_PUBLIC_API void JS::SetSupportedAssertionsHook(
+    JSRuntime* rt, SupportedAssertionsHook func) {
+  AssertHeapIsIdle();
+
+  rt->supportedAssertionsHook = func;
+}
 
 JS_PUBLIC_API JS::ModuleResolveHook JS::GetModuleResolveHook(JSRuntime* rt) {
   AssertHeapIsIdle();
@@ -73,14 +88,15 @@ JS_PUBLIC_API void JS::SetModuleDynamicImportHook(
 }
 
 JS_PUBLIC_API bool JS::FinishDynamicModuleImport(
-    JSContext* cx, Handle<Value> referencingPrivate,
-    Handle<JSString*> specifier, Handle<JSObject*> promise) {
+    JSContext* cx, Handle<JSObject*> evaluationPromise,
+    Handle<Value> referencingPrivate, Handle<JSObject*> moduleRequest,
+    Handle<JSObject*> promise) {
   AssertHeapIsIdle();
   CHECK_THREAD(cx);
   cx->check(referencingPrivate, promise);
 
-  return js::FinishDynamicModuleImport(cx, referencingPrivate, specifier,
-                                       promise);
+  return js::FinishDynamicModuleImport(
+      cx, evaluationPromise, referencingPrivate, moduleRequest, promise);
 }
 
 template <typename Unit>
@@ -112,7 +128,7 @@ JS_PUBLIC_API void JS::SetModulePrivate(JSObject* module, const Value& value) {
 }
 
 JS_PUBLIC_API JS::Value JS::GetModulePrivate(JSObject* module) {
-  return module->as<ModuleObject>().scriptSourceObject()->canonicalPrivate();
+  return module->as<ModuleObject>().scriptSourceObject()->getPrivate();
 }
 
 JS_PUBLIC_API bool JS::ModuleInstantiate(JSContext* cx,
@@ -125,12 +141,23 @@ JS_PUBLIC_API bool JS::ModuleInstantiate(JSContext* cx,
 }
 
 JS_PUBLIC_API bool JS::ModuleEvaluate(JSContext* cx,
-                                      Handle<JSObject*> moduleArg) {
+                                      Handle<JSObject*> moduleRecord,
+                                      MutableHandle<JS::Value> rval) {
   AssertHeapIsIdle();
   CHECK_THREAD(cx);
-  cx->releaseCheck(moduleArg);
+  cx->releaseCheck(moduleRecord);
 
-  return ModuleObject::Evaluate(cx, moduleArg.as<ModuleObject>());
+  return ModuleObject::Evaluate(cx, moduleRecord.as<ModuleObject>(), rval);
+}
+
+JS_PUBLIC_API bool JS::ThrowOnModuleEvaluationFailure(
+    JSContext* cx, Handle<JSObject*> evaluationPromise,
+    ModuleErrorBehaviour errorBehaviour) {
+  AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  cx->releaseCheck(evaluationPromise);
+
+  return js::OnModuleEvaluationFailure(cx, evaluationPromise, errorBehaviour);
 }
 
 JS_PUBLIC_API JSObject* JS::GetRequestedModules(JSContext* cx,
@@ -149,7 +176,7 @@ JS_PUBLIC_API JSString* JS::GetRequestedModuleSpecifier(JSContext* cx,
   cx->check(value);
 
   JSObject* obj = &value.toObject();
-  return obj->as<RequestedModuleObject>().moduleSpecifier();
+  return obj->as<RequestedModuleObject>().moduleRequest()->specifier();
 }
 
 JS_PUBLIC_API void JS::GetRequestedModuleSourcePos(JSContext* cx,
@@ -171,4 +198,64 @@ JS_PUBLIC_API JSScript* JS::GetModuleScript(JS::HandleObject moduleRecord) {
   AssertHeapIsIdle();
 
   return moduleRecord->as<ModuleObject>().script();
+}
+
+JS_PUBLIC_API JSObject* JS::GetModuleObject(HandleScript moduleScript) {
+  AssertHeapIsIdle();
+  MOZ_ASSERT(moduleScript->isModule());
+
+  return moduleScript->module();
+}
+
+JS_PUBLIC_API JSObject* JS::GetModuleNamespace(JSContext* cx,
+                                               HandleObject moduleRecord) {
+  AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  cx->check(moduleRecord);
+  MOZ_ASSERT(moduleRecord->is<ModuleObject>());
+
+  return ModuleObject::GetOrCreateModuleNamespace(
+      cx, moduleRecord.as<ModuleObject>());
+}
+
+JS_PUBLIC_API JSObject* JS::GetModuleForNamespace(
+    JSContext* cx, HandleObject moduleNamespace) {
+  AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  cx->check(moduleNamespace);
+  MOZ_ASSERT(moduleNamespace->is<js::ModuleNamespaceObject>());
+
+  return &moduleNamespace->as<js::ModuleNamespaceObject>().module();
+}
+
+JS_PUBLIC_API JSObject* JS::GetModuleEnvironment(JSContext* cx,
+                                                 Handle<JSObject*> moduleObj) {
+  AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  cx->check(moduleObj);
+  MOZ_ASSERT(moduleObj->is<js::ModuleObject>());
+
+  return moduleObj->as<js::ModuleObject>().environment();
+}
+
+JS_PUBLIC_API JSObject* JS::CreateModuleRequest(
+    JSContext* cx, Handle<JSString*> specifierArg) {
+  AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+
+  js::RootedAtom specifierAtom(cx, AtomizeString(cx, specifierArg));
+  if (!specifierAtom) {
+    return nullptr;
+  }
+
+  return js::ModuleRequestObject::create(cx, specifierAtom, nullptr);
+}
+
+JS_PUBLIC_API JSString* JS::GetModuleRequestSpecifier(
+    JSContext* cx, Handle<JSObject*> moduleRequestArg) {
+  AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  cx->check(moduleRequestArg);
+
+  return moduleRequestArg->as<js::ModuleRequestObject>().specifier();
 }

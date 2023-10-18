@@ -13,7 +13,9 @@
 
 #include <stdint.h>
 
-#include "jspubtd.h"
+#include "jstypes.h"
+
+#include "js/TypeDecls.h"
 
 struct JSStructuredCloneReader;
 struct JSStructuredCloneWriter;
@@ -64,11 +66,22 @@ extern JS_PUBLIC_API void JS_DropPrincipals(JSContext* cx,
 // engine when determining, e.g., which stack frames to display in a backtrace.
 typedef bool (*JSSubsumesOp)(JSPrincipals* first, JSPrincipals* second);
 
+namespace JS {
+enum class RuntimeCode { JS, WASM };
+}  // namespace JS
+
 /*
  * Used to check if a CSP instance wants to disable eval() and friends.
- * See GlobalObject::isRuntimeCodeGenEnabled() in vm/GlobalObject.cpp.
+ * See JSContext::isRuntimeCodeGenEnabled() in vm/JSContext.cpp.
+ *
+ * `code` is the JavaScript source code passed to eval/Function, but nullptr
+ * for Wasm.
+ *
+ * Returning `false` from this callback will prevent the execution/compilation
+ * of the code.
  */
-typedef bool (*JSCSPEvalChecker)(JSContext* cx, JS::HandleString code);
+typedef bool (*JSCSPEvalChecker)(JSContext* cx, JS::RuntimeCode kind,
+                                 JS::HandleString code);
 
 struct JSSecurityCallbacks {
   JSCSPEvalChecker contentSecurityPolicyAllows;

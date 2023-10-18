@@ -8,12 +8,17 @@
 // a different version of init_db.  That causes explosions as they get
 // different versions of the Once instance they use and they initialize NSS
 // twice, probably likely in parallel.  That doesn't work out well.
-use neqo_crypto::*;
+use neqo_crypto::{assert_initialized, init_db};
 
 // Pull in the NSS internals so that we can ask NSS if it thinks that
 // it is properly initialized.
-#[allow(dead_code, non_upper_case_globals)]
-#[allow(clippy::redundant_static_lifetimes, clippy::unseparated_literal_suffix)]
+#[allow(
+    dead_code,
+    non_upper_case_globals,
+    clippy::redundant_static_lifetimes,
+    clippy::unseparated_literal_suffix,
+    clippy::upper_case_acronyms
+)]
 mod nss {
     include!(concat!(env!("OUT_DIR"), "/nss_init.rs"));
 }

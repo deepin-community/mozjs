@@ -7,7 +7,6 @@
 
 use super::*;
 
-use cocoa::foundation::NSUInteger;
 use objc::runtime::{NO, YES};
 
 #[repr(u64)]
@@ -48,10 +47,12 @@ pub enum MTLBlendOperation {
 
 bitflags! {
     pub struct MTLColorWriteMask: NSUInteger {
+        const None  = 0;
         const Red   = 0x1 << 3;
         const Green = 0x1 << 2;
         const Blue  = 0x1 << 1;
         const Alpha = 0x1 << 0;
+        const All   = 0xf;
     }
 }
 
@@ -64,6 +65,11 @@ pub enum MTLPrimitiveTopologyClass {
     Line = 2,
     Triangle = 3,
 }
+
+// TODO: MTLTessellationPartitionMode
+// TODO: MTLTessellationFactorStepFunction
+// TODO: MTLTessellationFactorFormat
+// TODO: MTLTessellationControlPointIndexType
 
 pub enum MTLRenderPipelineColorAttachmentDescriptor {}
 
@@ -187,12 +193,52 @@ impl RenderPipelineReflection {
 }
 
 impl RenderPipelineReflectionRef {
-    pub fn fragment_arguments(&self) -> &Array<Argument> {
+    /// An array of objects that describe the arguments of a fragment function.
+    pub fn fragment_arguments(&self) -> &ArgumentArrayRef {
         unsafe { msg_send![self, fragmentArguments] }
     }
 
-    pub fn vertex_arguments(&self) -> &Array<Argument> {
+    /// An array of objects that describe the arguments of a vertex function.
+    pub fn vertex_arguments(&self) -> &ArgumentArrayRef {
         unsafe { msg_send![self, vertexArguments] }
+    }
+
+    /// An array of objects that describe the arguments of a tile shading function.
+    pub fn tile_arguments(&self) -> &ArgumentArrayRef {
+        unsafe { msg_send![self, tileArguments] }
+    }
+}
+
+pub enum MTLArgumentArray {}
+
+foreign_obj_type! {
+    type CType = MTLArgumentArray;
+    pub struct ArgumentArray;
+    pub struct ArgumentArrayRef;
+}
+
+impl ArgumentArrayRef {
+    pub fn object_at(&self, index: NSUInteger) -> Option<&ArgumentRef> {
+        unsafe { msg_send![self, objectAtIndexedSubscript: index] }
+    }
+
+    pub fn count(&self) -> NSUInteger {
+        unsafe { msg_send![self, count] }
+    }
+}
+
+pub enum MTLComputePipelineReflection {}
+
+foreign_obj_type! {
+    type CType = MTLComputePipelineReflection;
+    pub struct ComputePipelineReflection;
+    pub struct ComputePipelineReflectionRef;
+}
+
+impl ComputePipelineReflectionRef {
+    /// An array of objects that describe the arguments of a compute function.
+    pub fn arguments(&self) -> &ArgumentArrayRef {
+        unsafe { msg_send![self, arguments] }
     }
 }
 
@@ -252,12 +298,30 @@ impl RenderPipelineDescriptorRef {
         unsafe { msg_send![self, setVertexDescriptor: descriptor] }
     }
 
+    /// DEPRECATED - aliases rasterSampleCount property
     pub fn sample_count(&self) -> NSUInteger {
         unsafe { msg_send![self, sampleCount] }
     }
 
+    /// DEPRECATED - aliases rasterSampleCount property
     pub fn set_sample_count(&self, count: NSUInteger) {
         unsafe { msg_send![self, setSampleCount: count] }
+    }
+
+    pub fn raster_sample_count(&self) -> NSUInteger {
+        unsafe { msg_send![self, rasterSampleCount] }
+    }
+
+    pub fn set_raster_sample_count(&self, count: NSUInteger) {
+        unsafe { msg_send![self, setRasterSampleCount: count] }
+    }
+
+    pub fn max_vertex_amplification_count(&self) -> NSUInteger {
+        unsafe { msg_send![self, maxVertexAmplificationCount] }
+    }
+
+    pub fn set_max_vertex_amplification_count(&self, count: NSUInteger) {
+        unsafe { msg_send![self, setMaxVertexAmplificationCount: count] }
     }
 
     pub fn is_alpha_to_coverage_enabled(&self) -> bool {
@@ -366,6 +430,31 @@ impl RenderPipelineDescriptorRef {
         unsafe { msg_send![self, fragmentBuffers] }
     }
 
+    // TODO: tesselation stuff
+
+    /// API_AVAILABLE(macos(11.0), ios(14.0));
+    /// Marshal to Rust Vec
+    pub fn binary_archives(&self) -> Vec<BinaryArchive> {
+        unsafe {
+            let archives: *mut Object = msg_send![self, binaryArchives];
+            let count: NSUInteger = msg_send![archives, count];
+            let ret = (0..count)
+                .map(|i| {
+                    let a = msg_send![archives, objectAtIndex: i];
+                    BinaryArchive::from_ptr(a)
+                })
+                .collect();
+            ret
+        }
+    }
+
+    /// API_AVAILABLE(macos(11.0), ios(14.0));
+    /// Marshal from Rust slice
+    pub fn set_binary_archives(&self, archives: &[&BinaryArchiveRef]) {
+        let ns_array = Array::<BinaryArchive>::from_slice(archives);
+        unsafe { msg_send![self, setBinaryArchives: ns_array] }
+    }
+
     pub fn reset(&self) {
         unsafe { msg_send![self, reset] }
     }
@@ -380,17 +469,14 @@ foreign_obj_type! {
 }
 
 impl RenderPipelineStateRef {
+    pub fn device(&self) -> &DeviceRef {
+        unsafe { msg_send![self, device] }
+    }
+
     pub fn label(&self) -> &str {
         unsafe {
             let label = msg_send![self, label];
             crate::nsstring_as_str(label)
-        }
-    }
-
-    pub fn set_label(&self, label: &str) {
-        unsafe {
-            let nslabel = crate::nsstring_from_str(label);
-            let () = msg_send![self, setLabel: nslabel];
         }
     }
 }
@@ -404,7 +490,10 @@ foreign_obj_type! {
 }
 
 impl RenderPipelineColorAttachmentDescriptorArrayRef {
-    pub fn object_at(&self, index: NSUInteger) -> Option<&RenderPipelineColorAttachmentDescriptorRef> {
+    pub fn object_at(
+        &self,
+        index: NSUInteger,
+    ) -> Option<&RenderPipelineColorAttachmentDescriptorRef> {
         unsafe { msg_send![self, objectAtIndexedSubscript: index] }
     }
 

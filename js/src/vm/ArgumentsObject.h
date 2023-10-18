@@ -40,9 +40,6 @@ class RareArgumentsData {
   static RareArgumentsData* create(JSContext* cx, ArgumentsObject* obj);
   static size_t bytesRequired(size_t numActuals);
 
-  bool isAnyElementDeleted(size_t len) const {
-    return IsAnyBitArrayElementSet(deletedBits_, len);
-  }
   bool isElementDeleted(size_t len, size_t i) const {
     MOZ_ASSERT(i < len);
     return IsBitArrayElementSet(deletedBits_, len, i);
@@ -90,12 +87,25 @@ struct ArgumentsData {
   }
 };
 
-// Maximum supported value of arguments.length. This bounds the maximum
-// number of arguments that can be supplied to Function.prototype.apply.
-// This value also bounds the number of elements parsed in an array
-// initializer.
-// NB: keep this in sync with the copy in builtin/SelfHostingDefines.h.
+// Maximum supported value of arguments.length. This bounds the
+// maximum number of arguments that can be supplied to a spread call
+// or Function.prototype.apply.  This value also bounds the number of
+// elements parsed in an array initializer.  NB: keep this in sync
+// with the copy in builtin/SelfHostingDefines.h.
 static const unsigned ARGS_LENGTH_MAX = 500 * 1000;
+
+// Maximum number of arguments supported in jitcode. This bounds the
+// maximum number of arguments that can be supplied to a spread call
+// or Function.prototype.apply without entering the VM. We limit the
+// number of parameters we can handle to a number that does not risk
+// us allocating too much stack, notably on Windows where there is a
+// 4K guard page that has to be touched to extend the stack. The value
+// "3000" is the size of the guard page minus an arbitrary, but large,
+// safety margin. See bug 1351278.
+static const uint32_t JIT_ARGS_LENGTH_MAX = 3000 / sizeof(JS::Value);
+
+static_assert(JIT_ARGS_LENGTH_MAX <= ARGS_LENGTH_MAX,
+              "maximum jit arguments should be <= maximum arguments");
 
 /*
  * [SMDOC] ArgumentsObject
@@ -144,21 +154,31 @@ static const unsigned ARGS_LENGTH_MAX = 500 * 1000;
  *     mapped arguments objects, see hasOverriddenCallee.
  */
 class ArgumentsObject : public NativeObject {
- protected:
+ public:
   static const uint32_t INITIAL_LENGTH_SLOT = 0;
   static const uint32_t DATA_SLOT = 1;
   static const uint32_t MAYBE_CALL_SLOT = 2;
   static const uint32_t CALLEE_SLOT = 3;
 
- public:
   static const uint32_t LENGTH_OVERRIDDEN_BIT = 0x1;
   static const uint32_t ITERATOR_OVERRIDDEN_BIT = 0x2;
   static const uint32_t ELEMENT_OVERRIDDEN_BIT = 0x4;
   static const uint32_t CALLEE_OVERRIDDEN_BIT = 0x8;
-  static const uint32_t PACKED_BITS_COUNT = 4;
+  static const uint32_t FORWARDED_ARGUMENTS_BIT = 0x10;
+  static const uint32_t PACKED_BITS_COUNT = 5;
+  static const uint32_t PACKED_BITS_MASK = (1 << PACKED_BITS_COUNT) - 1;
 
   static_assert(ARGS_LENGTH_MAX <= (UINT32_MAX >> PACKED_BITS_COUNT),
                 "Max arguments length must fit in available bits");
+
+// Our ability to inline functions that use |arguments| is limited by
+// the number of registers available to represent Value operands to
+// CreateInlinedArgumentsObject.
+#if defined(JS_CODEGEN_X86)
+  static const uint32_t MaxInlinedArgs = 1;
+#else
+  static const uint32_t MaxInlinedArgs = 3;
+#endif
 
  protected:
   template <typename CopyArgs>
@@ -172,7 +192,7 @@ class ArgumentsObject : public NativeObject {
 
   RareArgumentsData* maybeRareData() const { return data()->rareData; }
 
-  MOZ_MUST_USE bool createRareData(JSContext* cx);
+  [[nodiscard]] bool createRareData(JSContext* cx);
 
   RareArgumentsData* getOrCreateRareData(JSContext* cx) {
     if (!data()->rareData && !createRareData(cx)) {
@@ -203,10 +223,27 @@ class ArgumentsObject : public NativeObject {
                                            ScriptFrameIter& iter);
   static ArgumentsObject* createUnexpected(JSContext* cx,
                                            AbstractFramePtr frame);
+
   static ArgumentsObject* createForIon(JSContext* cx,
                                        jit::JitFrameLayout* frame,
                                        HandleObject scopeChain);
+  static ArgumentsObject* createForInlinedIon(JSContext* cx, Value* args,
+                                              HandleFunction callee,
+                                              HandleObject scopeChain,
+                                              uint32_t numActuals);
+  static ArgumentsObject* createFromValueArray(JSContext* cx,
+                                               HandleValueArray argsArray,
+                                               HandleFunction callee,
+                                               HandleObject scopeChain,
+                                               uint32_t numActuals);
 
+ private:
+  template <typename CopyArgs>
+  static ArgumentsObject* finishPure(JSContext* cx, ArgumentsObject* obj,
+                                     JSFunction* callee, JSObject* callObj,
+                                     unsigned numActuals, CopyArgs& copy);
+
+ public:
   /*
    * Allocate ArgumentsData and fill reserved slots after allocating an
    * ArgumentsObject in Ion code.
@@ -215,6 +252,14 @@ class ArgumentsObject : public NativeObject {
                                            jit::JitFrameLayout* frame,
                                            JSObject* scopeChain,
                                            ArgumentsObject* obj);
+
+  /*
+   * Allocate ArgumentsData for inlined arguments and fill reserved slots after
+   * allocating an ArgumentsObject in Ion code.
+   */
+  static ArgumentsObject* finishInlineForIonPure(
+      JSContext* cx, JSObject* rawCallObj, JSFunction* rawCallee, Value* args,
+      uint32_t numActuals, ArgumentsObject* obj);
 
   static ArgumentsObject* createTemplateObject(JSContext* cx, bool mapped);
 
@@ -229,7 +274,7 @@ class ArgumentsObject : public NativeObject {
     return argc;
   }
 
-  /* True iff arguments.length has been assigned or its attributes changed. */
+  // True iff arguments.length has been assigned or deleted.
   bool hasOverriddenLength() const {
     const Value& v = getFixedSlot(INITIAL_LENGTH_SLOT);
     return v.toInt32() & LENGTH_OVERRIDDEN_BIT;
@@ -246,8 +291,7 @@ class ArgumentsObject : public NativeObject {
    */
   static bool reifyLength(JSContext* cx, Handle<ArgumentsObject*> obj);
 
-  /* True iff arguments[@@iterator] has been assigned or its attributes
-   * changed. */
+  // True iff arguments[@@iterator] has been assigned or deleted.
   bool hasOverriddenIterator() const {
     const Value& v = getFixedSlot(INITIAL_LENGTH_SLOT);
     return v.toInt32() & ITERATOR_OVERRIDDEN_BIT;
@@ -264,8 +308,12 @@ class ArgumentsObject : public NativeObject {
    */
   static bool reifyIterator(JSContext* cx, Handle<ArgumentsObject*> obj);
 
-  /* True iff any element has been assigned or its attributes
-   * changed. */
+  /*
+   * Return the arguments iterator function.
+   */
+  static bool getArgumentsIterator(JSContext* cx, MutableHandleValue val);
+
+  // True iff any element has been assigned or deleted.
   bool hasOverriddenElement() const {
     const Value& v = getFixedSlot(INITIAL_LENGTH_SLOT);
     return v.toInt32() & ELEMENT_OVERRIDDEN_BIT;
@@ -277,6 +325,7 @@ class ArgumentsObject : public NativeObject {
     setFixedSlot(INITIAL_LENGTH_SLOT, Int32Value(v));
   }
 
+ private:
   /*
    * Because the arguments object is a real object, its elements may be
    * deleted. This is implemented by setting a 'deleted' flag for the arg
@@ -289,23 +338,36 @@ class ArgumentsObject : public NativeObject {
    *
    * This works because, once a property is deleted from an arguments object,
    * it gets regular properties with regular getters/setters that don't alias
-   * ArgumentsData::slots.
+   * ArgumentsData::args.
    */
   bool isElementDeleted(uint32_t i) const {
     MOZ_ASSERT(i < data()->numArgs);
     if (i >= initialLength()) {
       return false;
     }
-    return maybeRareData() &&
-           maybeRareData()->isElementDeleted(initialLength(), i);
+    bool result = maybeRareData() &&
+                  maybeRareData()->isElementDeleted(initialLength(), i);
+    MOZ_ASSERT_IF(result, hasOverriddenElement());
+    return result;
   }
 
-  bool isAnyElementDeleted() const {
-    return maybeRareData() &&
-           maybeRareData()->isAnyElementDeleted(initialLength());
-  }
-
+ protected:
   bool markElementDeleted(JSContext* cx, uint32_t i);
+
+ public:
+  /*
+   * Return true iff the index is a valid element index for this arguments
+   * object.
+   *
+   * Returning true here doesn't imply that the element value can be read
+   * through |ArgumentsObject::element()|. For example unmapped arguments
+   * objects can have an element index property redefined without having marked
+   * the element as deleted. Instead use |maybeGetElement()| or manually check
+   * for |hasOverriddenElement()|.
+   */
+  bool isElement(uint32_t i) const {
+    return i < initialLength() && !isElementDeleted(i);
+  }
 
   /*
    * An ArgumentsObject serves two roles:
@@ -324,7 +386,7 @@ class ArgumentsObject : public NativeObject {
    */
   const Value& element(uint32_t i) const;
 
-  inline void setElement(JSContext* cx, uint32_t i, const Value& v);
+  inline void setElement(uint32_t i, const Value& v);
 
   const Value& arg(unsigned i) const {
     MOZ_ASSERT(i < data()->numArgs);
@@ -341,6 +403,28 @@ class ArgumentsObject : public NativeObject {
   }
 
   /*
+   * Test if an argument is forwarded, i.e. its actual value is stored in the
+   * CallObject and can't be directly read from |ArgumentsData::args|.
+   */
+  bool argIsForwarded(unsigned i) const {
+    MOZ_ASSERT(i < data()->numArgs);
+    const Value& v = data()->args[i];
+    MOZ_ASSERT_IF(IsMagicScopeSlotValue(v), anyArgIsForwarded());
+    return IsMagicScopeSlotValue(v);
+  }
+
+  bool anyArgIsForwarded() const {
+    const Value& v = getFixedSlot(INITIAL_LENGTH_SLOT);
+    return v.toInt32() & FORWARDED_ARGUMENTS_BIT;
+  }
+
+  void markArgumentForwarded() {
+    uint32_t v =
+        getFixedSlot(INITIAL_LENGTH_SLOT).toInt32() | FORWARDED_ARGUMENTS_BIT;
+    setFixedSlot(INITIAL_LENGTH_SLOT, Int32Value(v));
+  }
+
+  /*
    * Attempt to speedily and efficiently access the i-th element of this
    * arguments object.  Return true if the element was speedily returned.
    * Return false if the element must be looked up more slowly using
@@ -350,7 +434,7 @@ class ArgumentsObject : public NativeObject {
    * NB: Returning false does not indicate error!
    */
   bool maybeGetElement(uint32_t i, MutableHandleValue vp) {
-    if (i >= initialLength() || isElementDeleted(i)) {
+    if (i >= initialLength() || hasOverriddenElement()) {
       return false;
     }
     vp.set(element(i));
@@ -375,7 +459,7 @@ class ArgumentsObject : public NativeObject {
                             : 0);
   }
 
-  static void finalize(JSFreeOp* fop, JSObject* obj);
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
   static void trace(JSTracer* trc, JSObject* obj);
   static size_t objectMoved(JSObject* dst, JSObject* src);
 
@@ -407,8 +491,7 @@ class ArgumentsObject : public NativeObject {
   static void MaybeForwardToCallObject(AbstractFramePtr frame,
                                        ArgumentsObject* obj,
                                        ArgumentsData* data);
-  static void MaybeForwardToCallObject(jit::JitFrameLayout* frame,
-                                       HandleObject callObj,
+  static void MaybeForwardToCallObject(JSFunction* callee, JSObject* callObj,
                                        ArgumentsObject* obj,
                                        ArgumentsData* data);
 };
@@ -436,6 +519,10 @@ class MappedArgumentsObject : public ArgumentsObject {
     setFixedSlot(INITIAL_LENGTH_SLOT, Int32Value(v));
   }
 
+  static size_t getCalleeSlotOffset() {
+    return getFixedSlotOffset(CALLEE_SLOT);
+  }
+
  private:
   static bool obj_enumerate(JSContext* cx, HandleObject obj);
   static bool obj_resolve(JSContext* cx, HandleObject obj, HandleId id,
@@ -457,6 +544,18 @@ class UnmappedArgumentsObject : public ArgumentsObject {
   static bool obj_resolve(JSContext* cx, HandleObject obj, HandleId id,
                           bool* resolvedp);
 };
+
+extern bool MappedArgGetter(JSContext* cx, HandleObject obj, HandleId id,
+                            MutableHandleValue vp);
+
+extern bool MappedArgSetter(JSContext* cx, HandleObject obj, HandleId id,
+                            HandleValue v, ObjectOpResult& result);
+
+extern bool UnmappedArgGetter(JSContext* cx, HandleObject obj, HandleId id,
+                              MutableHandleValue vp);
+
+extern bool UnmappedArgSetter(JSContext* cx, HandleObject obj, HandleId id,
+                              HandleValue v, ObjectOpResult& result);
 
 }  // namespace js
 

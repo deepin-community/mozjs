@@ -12,17 +12,24 @@ assertThrowsInstanceOf(() => evaluate("saveStack().column", { columnNumber: Math
                        RangeError);
 
 if (helperThreadCount() > 0) {
-  print("offThreadCompileScript 1");
-  offThreadCompileScript("saveStack().column", { columnNumber: -10 });
-  assertThrowsInstanceOf(runOffThreadScript, RangeError);
+  print("offThreadCompileToStencil 1");
+  offThreadCompileToStencil("saveStack().column", { columnNumber: -10 });
+  assertThrowsInstanceOf(() => {
+    var stencil = finishOffThreadCompileToStencil();
+    evalStencil(stencil);
+  }, RangeError);
 
-  print("offThreadCompileScript 2");
-  offThreadCompileScript("saveStack().column", { columnNumber: Math.pow(2,30) });
-  assertThrowsInstanceOf(runOffThreadScript, RangeError);
+  print("offThreadCompileToStencil 2");
+  offThreadCompileToStencil("saveStack().column", { columnNumber: Math.pow(2,30) });
+  assertThrowsInstanceOf(() => {
+    var stencil = finishOffThreadCompileToStencil();
+    evalStencil();
+  }, RangeError);
 
-  print("offThreadCompileScript 3");
-  offThreadCompileScript("saveStack().column", { columnNumber: 10000 });
-  assertEq(runOffThreadScript(), 10001);
+  print("offThreadCompileToStencil 3");
+  offThreadCompileToStencil("saveStack().column", { columnNumber: 10000 });
+  stencil = finishOffThreadCompileToStencil();
+  assertEq(evalStencil(stencil), 10001);
 }
 
 // Check handling of columns near the limit of our ability to represent them.
@@ -32,10 +39,10 @@ const maxColumn = Math.pow(2, 30) - 1;
 assertEq(evaluate("saveStack().column", { columnNumber: maxColumn }),
          maxColumn + 1);
 
-// Check the 'silently zero' behavior when we reach the limit of the srcnotes
-// column encoding.
+// Check the saturation behavior when we reach the limit of the column
+// representation.
 assertEq(evaluate(" saveStack().column", { columnNumber: maxColumn }),
-         1);
+         maxColumn + 1);
 
 // Gathering source text for inclusion in error messages should not try to reach
 // outside the buffer to find the start of the source line. The below should

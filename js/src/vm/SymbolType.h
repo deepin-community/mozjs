@@ -7,11 +7,7 @@
 #ifndef vm_SymbolType_h
 #define vm_SymbolType_h
 
-#include "mozilla/Attributes.h"
-
 #include <stdio.h>
-
-#include "jsapi.h"
 
 #include "gc/Barrier.h"
 #include "gc/Tracer.h"
@@ -19,24 +15,22 @@
 #include "js/GCHashTable.h"
 #include "js/HeapAPI.h"
 #include "js/RootingAPI.h"
+#include "js/shadow/Symbol.h"  // JS::shadow::Symbol
 #include "js/Symbol.h"
 #include "js/TypeDecls.h"
 #include "js/Utility.h"
 #include "vm/Printer.h"
 #include "vm/StringType.h"
 
-namespace js {
-class AutoAccessAtomsZone;
-}  // namespace js
-
 namespace JS {
 
-class Symbol : public js::gc::TenuredCell {
- private:
-  // User description of symbol. Also meets gc::Cell requirements.
-  using HeaderWithAtom = js::gc::CellHeaderWithTenuredGCPointer<JSAtom>;
-  HeaderWithAtom headerAndDescription_;
+class Symbol
+    : public js::gc::CellWithTenuredGCPointer<js::gc::TenuredCell, JSAtom> {
+ public:
+  // User description of symbol, stored in the cell header.
+  JSAtom* description() const { return headerPtr(); }
 
+ private:
   SymbolCode code_;
 
   // Each Symbol gets its own hash code so that we don't have to use
@@ -44,7 +38,7 @@ class Symbol : public js::gc::TenuredCell {
   js::HashNumber hash_;
 
   Symbol(SymbolCode code, js::HashNumber hash, JSAtom* desc)
-      : headerAndDescription_(desc), code_(code), hash_(hash) {}
+      : CellWithTenuredGCPointer(desc), code_(code), hash_(hash) {}
 
   Symbol(const Symbol&) = delete;
   void operator=(const Symbol&) = delete;
@@ -65,9 +59,10 @@ class Symbol : public js::gc::TenuredCell {
  public:
   static Symbol* new_(JSContext* cx, SymbolCode code,
                       js::HandleString description);
+  static Symbol* newWellKnown(JSContext* cx, SymbolCode code,
+                              js::HandlePropertyName description);
   static Symbol* for_(JSContext* cx, js::HandleString description);
 
-  JSAtom* description() const { return headerAndDescription_.ptr(); }
   SymbolCode code() const { return code_; }
   js::HashNumber hash() const { return hash_; }
 
@@ -84,19 +79,18 @@ class Symbol : public js::gc::TenuredCell {
     return code_ == SymbolCode::toStringTag || code_ == SymbolCode::toPrimitive;
   }
 
+  // Symbol created for the #PrivateName syntax.
+  bool isPrivateName() const { return code_ == SymbolCode::PrivateNameSymbol; }
+
   static const JS::TraceKind TraceKind = JS::TraceKind::Symbol;
-  const js::gc::CellHeader& cellHeader() const { return headerAndDescription_; }
 
-  inline void traceChildren(JSTracer* trc) {
-    js::TraceNullableEdge(trc, &headerAndDescription_, "symbol description");
+  void traceChildren(JSTracer* trc) {
+    js::TraceNullableCellHeaderEdge(trc, this, "symbol description");
   }
-  inline void finalize(JSFreeOp*) {}
+  void finalize(JS::GCContext* gcx) {}
 
-  static MOZ_ALWAYS_INLINE void writeBarrierPre(Symbol* thing) {
-    if (thing && !thing->isWellKnownSymbol()) {
-      thing->asTenured().writeBarrierPre(thing);
-    }
-  }
+  // Override base class implementation to tell GC about well-known symbols.
+  bool isPermanentAndMayBeShared() const { return isWellKnownSymbol(); }
 
   size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
     return mallocSizeOf(this);
@@ -106,6 +100,8 @@ class Symbol : public js::gc::TenuredCell {
   void dump();  // Debugger-friendly stderr dump.
   void dump(js::GenericPrinter& out);
 #endif
+
+  static constexpr size_t offsetOfHash() { return offsetof(Symbol, hash_); }
 };
 
 } /* namespace JS */

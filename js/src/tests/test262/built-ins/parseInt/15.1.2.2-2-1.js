@@ -4,10 +4,10 @@
 /*---
 esid: sec-parseint-string-radix
 description: >
-    pareseInt - 'S' is the empty string when inputString does not
+    parseInt - 'S' is the empty string when inputString does not
     contain any such characters
 ---*/
 
-assert.sameValue(parseInt(""), NaN, 'parseInt("")');
+assert.sameValue(parseInt(""), NaN, 'parseInt("") must return NaN');
 
 reportCompare(0, 0);

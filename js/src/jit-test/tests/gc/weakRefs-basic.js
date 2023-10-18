@@ -1,5 +1,3 @@
-// |jit-test| --enable-weak-refs
-
 assertEq('WeakRef' in this, true);
 
 function checkPropertyDescriptor(obj, property, writable, enumerable,
@@ -80,10 +78,4 @@ checkPropertyDescriptor(proto, Symbol.toStringTag, false, false, true);
 // WeakRef prototype
 let weakRef = new WeakRef({});
 assertEq(Object.getPrototypeOf(weakRef), proto);
-
-let obj = {};
-let wr = new WeakRef(obj);
-gc();
-drainJobQueue();
-assertEq(obj, wr.deref());
 

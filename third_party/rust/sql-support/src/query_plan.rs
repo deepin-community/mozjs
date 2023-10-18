@@ -117,7 +117,7 @@ mod plan_log {
     impl PlanLogger {
         fn new() -> Self {
             let out_file = std::env::var("QUERY_PLAN_LOG").unwrap_or_default();
-            let output: Box<dyn Write + Send> = if out_file != "" {
+            let output: Box<dyn Write + Send> = if !out_file.is_empty() {
                 let mut file = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -168,6 +168,10 @@ mod plan_log {
         if sql.starts_with("EXPLAIN") {
             return;
         }
+        let _ = conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_TRIGGER_EQP,
+            true,
+        );
         let plan = match QueryPlan::new(conn, sql, params) {
             Ok(plan) => plan,
             Err(e) => {

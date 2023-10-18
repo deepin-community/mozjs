@@ -8,6 +8,7 @@
 #define jit_BaselineFrameInfo_h
 
 #include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
 
 #include <new>
 
@@ -21,6 +22,7 @@ namespace js {
 namespace jit {
 
 struct BytecodeInfo;
+class MacroAssembler;
 
 // [SMDOC] Baseline FrameInfo overview.
 //
@@ -70,11 +72,9 @@ class StackValue {
     LocalSlot,
     ArgSlot,
     ThisSlot,
-    EvalNewTargetSlot
 #ifdef DEBUG
     // In debug builds, assert Kind is initialized.
-    ,
-    Uninitialized
+    Uninitialized,
 #endif
   };
 
@@ -157,10 +157,6 @@ class StackValue {
     kind_ = ThisSlot;
     knownType_ = JSVAL_TYPE_UNKNOWN;
   }
-  void setEvalNewTarget() {
-    kind_ = EvalNewTargetSlot;
-    knownType_ = JSVAL_TYPE_UNKNOWN;
-  }
   void setStack() {
     kind_ = Stack;
     knownType_ = JSVAL_TYPE_UNKNOWN;
@@ -177,50 +173,47 @@ class FrameInfo {
   explicit FrameInfo(MacroAssembler& masm) : masm(masm) {}
 
   Address addressOfLocal(size_t local) const {
-    return Address(BaselineFrameReg,
-                   BaselineFrame::reverseOffsetOfLocal(local));
+    return Address(FramePointer, BaselineFrame::reverseOffsetOfLocal(local));
   }
   Address addressOfArg(size_t arg) const {
-    return Address(BaselineFrameReg, BaselineFrame::offsetOfArg(arg));
+    return Address(FramePointer, BaselineFrame::offsetOfArg(arg));
   }
   Address addressOfThis() const {
-    return Address(BaselineFrameReg, BaselineFrame::offsetOfThis());
-  }
-  Address addressOfEvalNewTarget() const {
-    return Address(BaselineFrameReg, BaselineFrame::offsetOfEvalNewTarget());
+    return Address(FramePointer, BaselineFrame::offsetOfThis());
   }
   Address addressOfCalleeToken() const {
-    return Address(BaselineFrameReg, BaselineFrame::offsetOfCalleeToken());
+    return Address(FramePointer, BaselineFrame::offsetOfCalleeToken());
   }
   Address addressOfEnvironmentChain() const {
-    return Address(BaselineFrameReg,
+    return Address(FramePointer,
                    BaselineFrame::reverseOffsetOfEnvironmentChain());
   }
+  Address addressOfICScript() const {
+    return Address(FramePointer, BaselineFrame::reverseOffsetOfICScript());
+  }
   Address addressOfFlags() const {
-    return Address(BaselineFrameReg, BaselineFrame::reverseOffsetOfFlags());
+    return Address(FramePointer, BaselineFrame::reverseOffsetOfFlags());
   }
   Address addressOfReturnValue() const {
-    return Address(BaselineFrameReg,
-                   BaselineFrame::reverseOffsetOfReturnValue());
+    return Address(FramePointer, BaselineFrame::reverseOffsetOfReturnValue());
   }
   Address addressOfArgsObj() const {
-    return Address(BaselineFrameReg, BaselineFrame::reverseOffsetOfArgsObj());
+    return Address(FramePointer, BaselineFrame::reverseOffsetOfArgsObj());
   }
   Address addressOfScratchValue() const {
-    return Address(BaselineFrameReg,
-                   BaselineFrame::reverseOffsetOfScratchValue());
+    return Address(FramePointer, BaselineFrame::reverseOffsetOfScratchValue());
   }
   Address addressOfScratchValueLow32() const {
-    return Address(BaselineFrameReg,
+    return Address(FramePointer,
                    BaselineFrame::reverseOffsetOfScratchValueLow32());
   }
   Address addressOfScratchValueHigh32() const {
-    return Address(BaselineFrameReg,
+    return Address(FramePointer,
                    BaselineFrame::reverseOffsetOfScratchValueHigh32());
   }
 #ifdef DEBUG
   Address addressOfDebugFrameSize() const {
-    return Address(BaselineFrameReg,
+    return Address(FramePointer,
                    BaselineFrame::reverseOffsetOfDebugFrameSize());
   }
 #endif
@@ -234,7 +227,7 @@ class CompilerFrameInfo : public FrameInfo {
  public:
   CompilerFrameInfo(JSScript* script, MacroAssembler& masm)
       : FrameInfo(masm), script(script), stack(), spIndex(0) {}
-  MOZ_MUST_USE bool init(TempAllocator& alloc);
+  [[nodiscard]] bool init(TempAllocator& alloc);
 
   size_t nlocals() const { return script->nfixed(); }
   size_t nargs() const { return script->function()->nargs(); }
@@ -295,11 +288,6 @@ class CompilerFrameInfo : public FrameInfo {
     StackValue* sv = rawPush();
     sv->setThis();
   }
-  inline void pushEvalNewTarget() {
-    MOZ_ASSERT(script->isForEval());
-    StackValue* sv = rawPush();
-    sv->setEvalNewTarget();
-  }
 
   inline void pushScratchValue() {
     masm.pushValue(addressOfScratchValue());
@@ -321,7 +309,7 @@ class CompilerFrameInfo : public FrameInfo {
     MOZ_ASSERT(value->kind() == StackValue::Stack);
     size_t slot = value - &stack[0];
     MOZ_ASSERT(slot < stackDepth());
-    return Address(BaselineFrameReg,
+    return Address(FramePointer,
                    BaselineFrame::reverseOffsetOfLocal(nlocals() + slot));
   }
 
@@ -338,6 +326,14 @@ class CompilerFrameInfo : public FrameInfo {
 
   bool stackValueHasKnownType(int32_t depth, JSValueType type) const {
     return peek(depth)->hasKnownType(type);
+  }
+
+  mozilla::Maybe<Value> knownStackValue(int32_t depth) const {
+    StackValue* val = peek(depth);
+    if (val->kind() == StackValue::Constant) {
+      return mozilla::Some(val->constant());
+    }
+    return mozilla::Nothing();
   }
 
   void storeStackValue(int32_t depth, const Address& dest,
@@ -372,6 +368,10 @@ class InterpreterFrameInfo : public FrameInfo {
     return false;
   }
 
+  mozilla::Maybe<Value> knownStackValue(int32_t depth) const {
+    return mozilla::Nothing();
+  }
+
   Address addressOfStackValue(int depth) const {
     MOZ_ASSERT(depth < 0);
     return Address(masm.getStackPointer(),
@@ -384,14 +384,16 @@ class InterpreterFrameInfo : public FrameInfo {
 
   void popRegsAndSync(uint32_t uses);
 
-  void pop() { popn(1); }
+  inline void pop();
 
-  void popn(uint32_t n) { masm.addToStackPtr(Imm32(n * sizeof(Value))); }
+  inline void popn(uint32_t n);
 
   void popn(Register reg) {
     // sp := sp + reg * sizeof(Value)
     Register spReg = AsRegister(masm.getStackPointer());
     masm.computeEffectiveAddress(BaseValueIndex(spReg, reg), spReg);
+    // On arm64, SP may be < PSP now (that's OK).
+    // eg testcase: tests/arguments/strict-args-generator-flushstack.js
   }
 
   void popValue(ValueOperand dest) { masm.popValue(dest); }
@@ -403,7 +405,6 @@ class InterpreterFrameInfo : public FrameInfo {
   void push(const Value& val) { masm.pushValue(val); }
 
   void pushThis() { masm.pushValue(addressOfThis()); }
-  void pushEvalNewTarget() { masm.pushValue(addressOfEvalNewTarget()); }
   void pushScratchValue() { masm.pushValue(addressOfScratchValue()); }
 
   void storeStackValue(int32_t depth, const Address& dest,
@@ -415,15 +416,14 @@ class InterpreterFrameInfo : public FrameInfo {
   void bumpInterpreterICEntry();
 
   Address addressOfInterpreterScript() const {
-    return Address(BaselineFrameReg,
+    return Address(FramePointer,
                    BaselineFrame::reverseOffsetOfInterpreterScript());
   }
   Address addressOfInterpreterPC() const {
-    return Address(BaselineFrameReg,
-                   BaselineFrame::reverseOffsetOfInterpreterPC());
+    return Address(FramePointer, BaselineFrame::reverseOffsetOfInterpreterPC());
   }
   Address addressOfInterpreterICEntry() const {
-    return Address(BaselineFrameReg,
+    return Address(FramePointer,
                    BaselineFrame::reverseOffsetOfInterpreterICEntry());
   }
 };

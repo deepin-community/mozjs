@@ -3,8 +3,8 @@
 use super::*;
 use crate::shared::{update_adler32, HUFFMAN_LENGTH_ORDER};
 
-use std::convert::TryInto;
-use std::{cmp, slice};
+use ::core::convert::TryInto;
+use ::core::{cmp, slice};
 
 use self::output_buffer::OutputBuffer;
 
@@ -26,7 +26,7 @@ struct HuffmanTable {
 }
 
 impl HuffmanTable {
-    fn new() -> HuffmanTable {
+    const fn new() -> HuffmanTable {
         HuffmanTable {
             code_size: [0; MAX_HUFF_SYMBOLS_0],
             look_up: [0; FAST_LOOKUP_SIZE as usize],
@@ -102,15 +102,50 @@ const LITLEN_TABLE: usize = 0;
 const DIST_TABLE: usize = 1;
 const HUFFLEN_TABLE: usize = 2;
 
+/// Flags to [`decompress()`] to control how inflation works.
+///
+/// These define bits for a bitmask argument.
 pub mod inflate_flags {
     /// Should we try to parse a zlib header?
+    ///
+    /// If unset, [`decompress()`] will expect an RFC1951 deflate stream.  If set, it will expect an
+    /// RFC1950 zlib wrapper around the deflate stream.
     pub const TINFL_FLAG_PARSE_ZLIB_HEADER: u32 = 1;
-    /// There is more input that hasn't been given to the decompressor yet.
+
+    /// There will be more input that hasn't been given to the decompressor yet.
+    ///
+    /// This is useful when you want to decompress what you have so far,
+    /// even if you know there is probably more input that hasn't gotten here yet (_e.g._, over a
+    /// network connection).  When [`decompress()`][super::decompress] reaches the end of the input
+    /// without finding the end of the compressed stream, it will return
+    /// [`TINFLStatus::NeedsMoreInput`][super::TINFLStatus::NeedsMoreInput] if this is set,
+    /// indicating that you should get more data before calling again.  If not set, it will return
+    /// [`TINFLStatus::FailedCannotMakeProgress`][super::TINFLStatus::FailedCannotMakeProgress]
+    /// suggesting the stream is corrupt, since you claimed it was all there.
     pub const TINFL_FLAG_HAS_MORE_INPUT: u32 = 2;
+
     /// The output buffer should not wrap around.
     pub const TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF: u32 = 4;
-    /// Should we calculate the adler32 checksum of the output data?
+
+    /// Calculate the adler32 checksum of the output data even if we're not inflating a zlib stream.
+    ///
+    /// If [`TINFL_FLAG_IGNORE_ADLER32`] is specified, it will override this.
+    ///
+    /// NOTE: Enabling/disabling this between calls to decompress will result in an incorect
+    /// checksum.
     pub const TINFL_FLAG_COMPUTE_ADLER32: u32 = 8;
+
+    /// Ignore adler32 checksum even if we are inflating a zlib stream.
+    ///
+    /// Overrides [`TINFL_FLAG_COMPUTE_ADLER32`] if both are enabled.
+    ///
+    /// NOTE: This flag does not exist in miniz as it does not support this and is a
+    /// custom addition for miniz_oxide.
+    ///
+    /// NOTE: Should not be changed from enabled to disabled after decompression has started,
+    /// this will result in checksum failure (outside the unlikely event where the checksum happens
+    /// to match anyway).
+    pub const TINFL_FLAG_IGNORE_ADLER32: u32 = 64;
 }
 
 use self::inflate_flags::*;
@@ -152,8 +187,6 @@ pub struct DecompressorOxide {
     table_sizes: [u32; MAX_HUFF_TABLES],
     /// Buffer of input data.
     bit_buf: BitBuffer,
-    /// Position in the output buffer.
-    dist_from_out_buf_start: usize,
     /// Huffman tables.
     tables: [HuffmanTable; MAX_HUFF_TABLES],
     /// Raw block header.
@@ -176,10 +209,21 @@ impl DecompressorOxide {
     }
 
     /// Returns the adler32 checksum of the currently decompressed data.
+    /// Note: Will return Some(1) if decompressing zlib but ignoring adler32.
     #[inline]
     pub fn adler32(&self) -> Option<u32> {
         if self.state != State::Start && !self.state.is_failure() && self.z_header0 != 0 {
             Some(self.check_adler32)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the adler32 that was read from the zlib header if it exists.
+    #[inline]
+    pub fn adler32_header(&self) -> Option<u32> {
+        if self.state != State::Start && self.state != State::BadZlibHeader && self.z_header0 != 0 {
+            Some(self.z_adler32)
         } else {
             None
         }
@@ -204,7 +248,6 @@ impl Default for DecompressorOxide {
             num_extra: 0,
             table_sizes: [0; MAX_HUFF_TABLES],
             bit_buf: 0,
-            dist_from_out_buf_start: 0,
             // TODO:(oyvindln) Check that copies here are optimized out in release mode.
             tables: [
                 HuffmanTable::new(),
@@ -743,7 +786,6 @@ struct LocalVars {
     pub dist: u32,
     pub counter: u32,
     pub num_extra: u32,
-    pub dist_from_out_buf_start: usize,
 }
 
 #[inline]
@@ -754,8 +796,6 @@ fn transfer(
     match_len: usize,
     out_buf_size_mask: usize,
 ) {
-    debug_assert!(out_pos + match_len <= out_slice.len());
-
     for _ in 0..match_len >> 2 {
         out_slice[out_pos] = out_slice[source_pos & out_buf_size_mask];
         out_slice[out_pos + 1] = out_slice[(source_pos + 1) & out_buf_size_mask];
@@ -962,8 +1002,8 @@ fn decompress_fast(
                 l.dist += extra_bits as u32;
             }
 
-            l.dist_from_out_buf_start = out_buf.position();
-            if l.dist as usize > l.dist_from_out_buf_start
+            let position = out_buf.position();
+            if l.dist as usize > out_buf.position()
                 && (flags & TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF != 0)
             {
                 // We encountered a distance that refers a position before
@@ -974,13 +1014,13 @@ fn decompress_fast(
 
             apply_match(
                 out_buf.get_mut(),
-                l.dist_from_out_buf_start,
+                position,
                 l.dist as usize,
                 l.counter as usize,
                 out_buf_size_mask,
             );
 
-            out_buf.set_position(l.dist_from_out_buf_start + l.counter as usize);
+            out_buf.set_position(position + l.counter as usize);
         }
     };
 
@@ -988,19 +1028,23 @@ fn decompress_fast(
     (status, state)
 }
 
-/// Main decompression function. Keeps decompressing data from `in_buf` until the in_buf is emtpy,
-/// out_cur is full, the end of the deflate stream is hit, or there is an error in the deflate
-/// stream.
+/// Main decompression function. Keeps decompressing data from `in_buf` until the `in_buf` is
+/// empty, `out` is full, the end of the deflate stream is hit, or there is an error in the
+/// deflate stream.
 ///
 /// # Arguments
+///
+/// `r` is a [`DecompressorOxide`] struct with the state of this stream.
 ///
 /// `in_buf` is a reference to the compressed data that is to be decompressed. The decompressor will
 /// start at the first byte of this buffer.
 ///
-/// `out_cur` is a mutable cursor into the buffer that will store the decompressed data, and that
+/// `out` is a reference to the buffer that will store the decompressed data, and that
 /// stores previously decompressed data if any.
-/// * The position of the output cursor indicates where in the output buffer slice writing should
-/// start.
+///
+/// * The offset given by `out_pos` indicates where in the output buffer slice writing should start.
+/// * If [`TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF`] is not set, the output buffer is used in a
+/// wrapping manner, and it's size is required to be a power of 2.
 /// * The decompression function normally needs access to 32KiB of the previously decompressed data
 ///(or to the beginning of the decompressed data if less than 32KiB has been decompressed.)
 ///     - If this data is not available, decompression may fail.
@@ -1009,54 +1053,38 @@ fn decompress_fast(
 /// and thus allows a smaller output buffer. The window size can be specified in the zlib
 /// header structure, however, the header data should not be relied on to be correct.
 ///
-/// `flags`
-/// Flags to indicate settings and status to the decompression function.
-/// * The `TINFL_FLAG_HAS_MORE_INPUT` has to be specified if more compressed data is to be provided
+/// `flags` indicates settings and status to the decompression function.
+/// * The [`TINFL_FLAG_HAS_MORE_INPUT`] has to be specified if more compressed data is to be provided
 /// in a subsequent call to this function.
-/// * See the the [`inflate_flags`](inflate_flags/index.html) module for details on other flags.
+/// * See the the [`inflate_flags`] module for details on other flags.
 ///
 /// # Returns
-/// returns a tuple containing the status of the compressor, the number of input bytes read, and the
-/// number of bytes output to `out_cur`.
-/// Updates the position of `out_cur` to point to the next free spot in the output buffer.
+///
+/// Returns a tuple containing the status of the compressor, the number of input bytes read, and the
+/// number of bytes output to `out`.
 ///
 /// This function shouldn't panic pending any bugs.
 pub fn decompress(
     r: &mut DecompressorOxide,
     in_buf: &[u8],
-    out_cur: &mut Cursor<&mut [u8]>,
+    out: &mut [u8],
+    out_pos: usize,
     flags: u32,
 ) -> (TINFLStatus, usize, usize) {
-    let res = decompress_inner(r, in_buf, out_cur, flags);
-    let new_pos = out_cur.position() + res.2 as u64;
-    out_cur.set_position(new_pos);
-    res
-}
-
-#[inline]
-fn decompress_inner(
-    r: &mut DecompressorOxide,
-    in_buf: &[u8],
-    out_cur: &mut Cursor<&mut [u8]>,
-    flags: u32,
-) -> (TINFLStatus, usize, usize) {
-    let out_buf_start_pos = out_cur.position() as usize;
     let out_buf_size_mask = if flags & TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF != 0 {
         usize::max_value()
     } else {
         // In the case of zero len, any attempt to write would produce HasMoreOutput,
         // so to gracefully process the case of there really being no output,
         // set the mask to all zeros.
-        out_cur.get_ref().len().saturating_sub(1)
+        out.len().saturating_sub(1)
     };
 
     // Ensure the output buffer's size is a power of 2, unless the output buffer
     // is large enough to hold the entire output file (in which case it doesn't
     // matter).
     // Also make sure that the output buffer position is not past the end of the output buffer.
-    if (out_buf_size_mask.wrapping_add(1) & out_buf_size_mask) != 0
-        || out_cur.position() > out_cur.get_ref().len() as u64
-    {
+    if (out_buf_size_mask.wrapping_add(1) & out_buf_size_mask) != 0 || out_pos > out.len() {
         return (TINFLStatus::BadParam, 0, 0);
     }
 
@@ -1064,16 +1092,15 @@ fn decompress_inner(
 
     let mut state = r.state;
 
-    let mut out_buf = OutputBuffer::from_slice_and_pos(out_cur.get_mut(), out_buf_start_pos);
+    let mut out_buf = OutputBuffer::from_slice_and_pos(out, out_pos);
 
-    // TODO: Borrow instead of Copy
+    // Make a local copy of the important variables here so we can work with them on the stack.
     let mut l = LocalVars {
         bit_buf: r.bit_buf,
         num_bits: r.num_bits,
         dist: r.dist,
         counter: r.counter,
         num_extra: r.num_extra,
-        dist_from_out_buf_start: r.dist_from_out_buf_start,
     };
 
     let mut status = 'state_machine: loop {
@@ -1494,8 +1521,7 @@ fn decompress_inner(
             }),
 
             HuffDecodeOuterLoop2 => generate_state!(state, 'state_machine, {
-                l.dist_from_out_buf_start = out_buf.position();
-                if l.dist as usize > l.dist_from_out_buf_start &&
+                if l.dist as usize > out_buf.position() &&
                     (flags & TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF != 0)
                 {
                     // We encountered a distance that refers a position before
@@ -1503,7 +1529,7 @@ fn decompress_inner(
                     Action::Jump(DistanceOutOfBounds)
                 } else {
                     let out_pos = out_buf.position();
-                    let source_pos = l.dist_from_out_buf_start
+                    let source_pos = out_buf.position()
                         .wrapping_sub(l.dist as usize) & out_buf_size_mask;
 
                     let out_len = out_buf.get_ref().len() as usize;
@@ -1537,14 +1563,15 @@ fn decompress_inner(
 
             WriteLenBytesToEnd => generate_state!(state, 'state_machine, {
                 if out_buf.bytes_left() > 0 {
-                    let source_pos = l.dist_from_out_buf_start
-                        .wrapping_sub(l.dist as usize) & out_buf_size_mask;
                     let out_pos = out_buf.position();
+                    let source_pos = out_buf.position()
+                        .wrapping_sub(l.dist as usize) & out_buf_size_mask;
+
 
                     let len = cmp::min(out_buf.bytes_left(), l.counter as usize);
+
                     transfer(out_buf.get_mut(), source_pos, out_pos, len, out_buf_size_mask);
 
-                    l.dist_from_out_buf_start += len;
                     out_buf.set_position(out_pos + len);
                     l.counter -= len as u32;
                     if l.counter == 0 {
@@ -1621,25 +1648,30 @@ fn decompress_inner(
         0
     };
 
+    if status == TINFLStatus::NeedsMoreInput && out_buf.bytes_left() == 0 {
+        status = TINFLStatus::HasMoreOutput
+    }
+
     r.state = state;
     r.bit_buf = l.bit_buf;
     r.num_bits = l.num_bits;
     r.dist = l.dist;
     r.counter = l.counter;
     r.num_extra = l.num_extra;
-    r.dist_from_out_buf_start = l.dist_from_out_buf_start;
 
     r.bit_buf &= ((1 as BitBuffer) << r.num_bits) - 1;
 
     // If this is a zlib stream, and update the adler32 checksum with the decompressed bytes if
     // requested.
-    let need_adler = flags & (TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32) != 0;
+    let need_adler = if (flags & TINFL_FLAG_IGNORE_ADLER32) == 0 {
+        flags & (TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32) != 0
+    } else {
+        // If TINFL_FLAG_IGNORE_ADLER32 is enabled, ignore the checksum.
+        false
+    };
     if need_adler && status as i32 >= 0 {
         let out_buf_pos = out_buf.position();
-        r.check_adler32 = update_adler32(
-            r.check_adler32,
-            &out_buf.get_ref()[out_buf_start_pos..out_buf_pos],
-        );
+        r.check_adler32 = update_adler32(r.check_adler32, &out_buf.get_ref()[out_pos..out_buf_pos]);
 
         // disabled so that random input from fuzzer would not be rejected early,
         // before it has a chance to reach interesting parts of code
@@ -1654,11 +1686,10 @@ fn decompress_inner(
         }
     }
 
-    // NOTE: Status here and in miniz_tester doesn't seem to match.
     (
         status,
         in_buf.len() - in_iter.len() - in_undo,
-        out_buf.position() - out_buf_start_pos,
+        out_buf.position() - out_pos,
     )
 }
 
@@ -1674,8 +1705,7 @@ mod test {
         output_buffer: &mut [u8],
         flags: u32,
     ) -> (TINFLStatus, &'i [u8], usize) {
-        let (status, in_pos, out_pos) =
-            decompress(r, input_buffer, &mut Cursor::new(output_buffer), flags);
+        let (status, in_pos, out_pos) = decompress(r, input_buffer, output_buffer, 0, flags);
         (status, &input_buffer[in_pos..], out_pos)
     }
 
@@ -1753,7 +1783,6 @@ mod test {
             dist: d.dist,
             counter: d.counter,
             num_extra: d.num_extra,
-            dist_from_out_buf_start: d.dist_from_out_buf_start,
         };
         init_tree(&mut d, &mut l);
         let llt = &d.tables[LITLEN_TABLE];
@@ -1776,14 +1805,14 @@ mod test {
     fn check_result(input: &[u8], expected_status: TINFLStatus, expected_state: State, zlib: bool) {
         let mut r = DecompressorOxide::default();
         let mut output_buf = vec![0; 1024 * 32];
-        let mut out_cursor = Cursor::new(output_buf.as_mut_slice());
         let flags = if zlib {
             inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
         } else {
             0
         } | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF
             | TINFL_FLAG_HAS_MORE_INPUT;
-        let (d_status, _in_bytes, _out_bytes) = decompress(&mut r, input, &mut out_cursor, flags);
+        let (d_status, _in_bytes, _out_bytes) =
+            decompress(&mut r, input, &mut output_buf, 0, flags);
         assert_eq!(expected_status, d_status);
         assert_eq!(expected_state, r.state);
     }
@@ -1874,10 +1903,9 @@ mod test {
             | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
         let mut r = DecompressorOxide::new();
         let mut output_buf = vec![];
-        let mut out_cursor = Cursor::new(output_buf.as_mut_slice());
         // Check that we handle an empty buffer properly and not panicking.
         // https://github.com/Frommi/miniz_oxide/issues/23
-        let res = decompress(&mut r, &encoded, &mut out_cursor, flags);
+        let res = decompress(&mut r, &encoded, &mut output_buf, 0, flags);
         assert_eq!(res, (TINFLStatus::HasMoreOutput, 4, 0));
     }
 
@@ -1889,10 +1917,9 @@ mod test {
         let flags = TINFL_FLAG_COMPUTE_ADLER32;
         let mut r = DecompressorOxide::new();
         let mut output_buf = vec![];
-        let mut out_cursor = Cursor::new(output_buf.as_mut_slice());
         // Check that we handle an empty buffer properly and not panicking.
         // https://github.com/Frommi/miniz_oxide/issues/23
-        let res = decompress(&mut r, &encoded, &mut out_cursor, flags);
+        let res = decompress(&mut r, &encoded, &mut output_buf, 0, flags);
         assert_eq!(res, (TINFLStatus::HasMoreOutput, 2, 0));
     }
 }

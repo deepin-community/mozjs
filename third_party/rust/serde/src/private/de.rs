@@ -1,9 +1,10 @@
 use lib::*;
 
-use de::{Deserialize, DeserializeSeed, Deserializer, Error, IntoDeserializer, Visitor};
+use de::value::{BorrowedBytesDeserializer, BytesDeserializer};
+use de::{Deserialize, Deserializer, Error, IntoDeserializer, Visitor};
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-use de::{MapAccess, Unexpected};
+use de::{DeserializeSeed, MapAccess, Unexpected};
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 pub use self::content::{
@@ -11,6 +12,8 @@ pub use self::content::{
     InternallyTaggedUnitVisitor, TagContentOtherField, TagContentOtherFieldVisitor,
     TagOrContentField, TagOrContentFieldVisitor, TaggedContentVisitor, UntaggedUnitVisitor,
 };
+
+pub use seed::InPlaceSeed;
 
 /// If the missing field is of type `Option<T>` then treat is as `None`,
 /// otherwise it is an error.
@@ -53,9 +56,10 @@ where
 }
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-pub fn borrow_cow_str<'de: 'a, 'a, D>(deserializer: D) -> Result<Cow<'a, str>, D::Error>
+pub fn borrow_cow_str<'de: 'a, 'a, D, R>(deserializer: D) -> Result<R, D::Error>
 where
     D: Deserializer<'de>,
+    R: From<Cow<'a, str>>,
 {
     struct CowStrVisitor;
 
@@ -121,13 +125,14 @@ where
         }
     }
 
-    deserializer.deserialize_str(CowStrVisitor)
+    deserializer.deserialize_str(CowStrVisitor).map(From::from)
 }
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-pub fn borrow_cow_bytes<'de: 'a, 'a, D>(deserializer: D) -> Result<Cow<'a, [u8]>, D::Error>
+pub fn borrow_cow_bytes<'de: 'a, 'a, D, R>(deserializer: D) -> Result<R, D::Error>
 where
     D: Deserializer<'de>,
+    R: From<Cow<'a, [u8]>>,
 {
     struct CowBytesVisitor;
 
@@ -181,30 +186,9 @@ where
         }
     }
 
-    deserializer.deserialize_bytes(CowBytesVisitor)
-}
-
-pub mod size_hint {
-    use lib::*;
-
-    pub fn from_bounds<I>(iter: &I) -> Option<usize>
-    where
-        I: Iterator,
-    {
-        helper(iter.size_hint())
-    }
-
-    #[inline]
-    pub fn cautious(hint: Option<usize>) -> usize {
-        cmp::min(hint.unwrap_or(0), 4096)
-    }
-
-    fn helper(bounds: (usize, Option<usize>)) -> Option<usize> {
-        match bounds {
-            (lower, Some(upper)) if lower == upper => Some(upper),
-            _ => None,
-        }
-    }
+    deserializer
+        .deserialize_bytes(CowBytesVisitor)
+        .map(From::from)
 }
 
 #[cfg(any(feature = "std", feature = "alloc"))]
@@ -221,7 +205,8 @@ mod content {
 
     use lib::*;
 
-    use super::size_hint;
+    use __private::size_hint;
+    use actually_private;
     use de::{
         self, Deserialize, DeserializeSeed, Deserializer, EnumAccess, Expected, IgnoredAny,
         MapAccess, SeqAccess, Unexpected, Visitor,
@@ -231,7 +216,7 @@ mod content {
     /// deserializing untagged enums and internally tagged enums.
     ///
     /// Not public API. Use serde-value instead.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub enum Content<'de> {
         Bool(bool),
 
@@ -310,7 +295,7 @@ mod content {
             // Untagged and internally tagged enums are only supported in
             // self-describing formats.
             let visitor = ContentVisitor { value: PhantomData };
-            deserializer.deserialize_any(visitor)
+            deserializer.__deserialize_content(actually_private::T, visitor)
         }
     }
 
@@ -820,15 +805,17 @@ mod content {
     /// Not public API.
     pub struct TaggedContentVisitor<'de, T> {
         tag_name: &'static str,
+        expecting: &'static str,
         value: PhantomData<TaggedContent<'de, T>>,
     }
 
     impl<'de, T> TaggedContentVisitor<'de, T> {
         /// Visitor for the content of an internally tagged enum with the given
         /// tag name.
-        pub fn new(name: &'static str) -> Self {
+        pub fn new(name: &'static str, expecting: &'static str) -> Self {
             TaggedContentVisitor {
                 tag_name: name,
+                expecting: expecting,
                 value: PhantomData,
             }
         }
@@ -857,7 +844,7 @@ mod content {
         type Value = TaggedContent<'de, T>;
 
         fn expecting(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-            fmt.write_str("internally tagged enum")
+            fmt.write_str(self.expecting)
         }
 
         fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
@@ -1036,6 +1023,25 @@ mod content {
                 _ => Err(self.invalid_type(&visitor)),
             }
         }
+
+        fn deserialize_float<V>(self, visitor: V) -> Result<V::Value, E>
+        where
+            V: Visitor<'de>,
+        {
+            match self.content {
+                Content::F32(v) => visitor.visit_f32(v),
+                Content::F64(v) => visitor.visit_f64(v),
+                Content::U8(v) => visitor.visit_u8(v),
+                Content::U16(v) => visitor.visit_u16(v),
+                Content::U32(v) => visitor.visit_u32(v),
+                Content::U64(v) => visitor.visit_u64(v),
+                Content::I8(v) => visitor.visit_i8(v),
+                Content::I16(v) => visitor.visit_i16(v),
+                Content::I32(v) => visitor.visit_i32(v),
+                Content::I64(v) => visitor.visit_i64(v),
+                _ => Err(self.invalid_type(&visitor)),
+            }
+        }
     }
 
     fn visit_content_seq<'de, V, E>(content: Vec<Content<'de>>, visitor: V) -> Result<V::Value, E>
@@ -1175,25 +1181,14 @@ mod content {
         where
             V: Visitor<'de>,
         {
-            match self.content {
-                Content::F32(v) => visitor.visit_f32(v),
-                Content::F64(v) => visitor.visit_f64(v),
-                Content::U64(v) => visitor.visit_u64(v),
-                Content::I64(v) => visitor.visit_i64(v),
-                _ => Err(self.invalid_type(&visitor)),
-            }
+            self.deserialize_float(visitor)
         }
 
         fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
         where
             V: Visitor<'de>,
         {
-            match self.content {
-                Content::F64(v) => visitor.visit_f64(v),
-                Content::U64(v) => visitor.visit_u64(v),
-                Content::I64(v) => visitor.visit_i64(v),
-                _ => Err(self.invalid_type(&visitor)),
-            }
+            self.deserialize_float(visitor)
         }
 
         fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -1293,8 +1288,9 @@ mod content {
                 //     }
                 //
                 // We want {"topic":"Info"} to deserialize even though
-                // ordinarily unit structs do not deserialize from empty map.
+                // ordinarily unit structs do not deserialize from empty map/seq.
                 Content::Map(ref v) if v.is_empty() => visitor.visit_unit(),
+                Content::Seq(ref v) if v.is_empty() => visitor.visit_unit(),
                 _ => self.deserialize_any(visitor),
             }
         }
@@ -1432,6 +1428,18 @@ mod content {
             drop(self);
             visitor.visit_unit()
         }
+
+        fn __deserialize_content<V>(
+            self,
+            _: actually_private::T,
+            visitor: V,
+        ) -> Result<Content<'de>, Self::Error>
+        where
+            V: Visitor<'de, Value = Content<'de>>,
+        {
+            let _ = visitor;
+            Ok(self.content)
+        }
     }
 
     impl<'de, E> ContentDeserializer<'de, E> {
@@ -1558,7 +1566,7 @@ mod content {
                     other.unexpected(),
                     &"struct variant",
                 )),
-                _ => Err(de::Error::invalid_type(
+                None => Err(de::Error::invalid_type(
                     de::Unexpected::UnitVariant,
                     &"struct variant",
                 )),
@@ -1747,6 +1755,25 @@ mod content {
                 _ => Err(self.invalid_type(&visitor)),
             }
         }
+
+        fn deserialize_float<V>(self, visitor: V) -> Result<V::Value, E>
+        where
+            V: Visitor<'de>,
+        {
+            match *self.content {
+                Content::F32(v) => visitor.visit_f32(v),
+                Content::F64(v) => visitor.visit_f64(v),
+                Content::U8(v) => visitor.visit_u8(v),
+                Content::U16(v) => visitor.visit_u16(v),
+                Content::U32(v) => visitor.visit_u32(v),
+                Content::U64(v) => visitor.visit_u64(v),
+                Content::I8(v) => visitor.visit_i8(v),
+                Content::I16(v) => visitor.visit_i16(v),
+                Content::I32(v) => visitor.visit_i32(v),
+                Content::I64(v) => visitor.visit_i64(v),
+                _ => Err(self.invalid_type(&visitor)),
+            }
+        }
     }
 
     fn visit_content_seq_ref<'a, 'de, V, E>(
@@ -1894,25 +1921,14 @@ mod content {
         where
             V: Visitor<'de>,
         {
-            match *self.content {
-                Content::F32(v) => visitor.visit_f32(v),
-                Content::F64(v) => visitor.visit_f64(v),
-                Content::U64(v) => visitor.visit_u64(v),
-                Content::I64(v) => visitor.visit_i64(v),
-                _ => Err(self.invalid_type(&visitor)),
-            }
+            self.deserialize_float(visitor)
         }
 
         fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
         where
             V: Visitor<'de>,
         {
-            match *self.content {
-                Content::F64(v) => visitor.visit_f64(v),
-                Content::U64(v) => visitor.visit_u64(v),
-                Content::I64(v) => visitor.visit_i64(v),
-                _ => Err(self.invalid_type(&visitor)),
-            }
+            self.deserialize_float(visitor)
         }
 
         fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -2135,6 +2151,18 @@ mod content {
         {
             visitor.visit_unit()
         }
+
+        fn __deserialize_content<V>(
+            self,
+            _: actually_private::T,
+            visitor: V,
+        ) -> Result<Content<'de>, Self::Error>
+        where
+            V: Visitor<'de, Value = Content<'de>>,
+        {
+            let _ = visitor;
+            Ok(self.content.clone())
+        }
     }
 
     impl<'a, 'de, E> ContentRefDeserializer<'a, 'de, E> {
@@ -2248,7 +2276,7 @@ mod content {
                     other.unexpected(),
                     &"struct variant",
                 )),
-                _ => Err(de::Error::invalid_type(
+                None => Err(de::Error::invalid_type(
                     de::Unexpected::UnitVariant,
                     &"struct variant",
                 )),
@@ -2470,7 +2498,7 @@ mod content {
         where
             M: MapAccess<'de>,
         {
-            while let Some(_) = try!(access.next_entry::<IgnoredAny, IgnoredAny>()) {}
+            while try!(access.next_entry::<IgnoredAny, IgnoredAny>()).is_some() {}
             Ok(())
         }
     }
@@ -2538,11 +2566,13 @@ pub trait IdentifierDeserializer<'de, E: Error> {
     fn from(self) -> Self::Deserializer;
 }
 
-impl<'de, E> IdentifierDeserializer<'de, E> for u32
+pub struct Borrowed<'de, T: 'de + ?Sized>(pub &'de T);
+
+impl<'de, E> IdentifierDeserializer<'de, E> for u64
 where
     E: Error,
 {
-    type Deserializer = <u32 as IntoDeserializer<'de, E>>::Deserializer;
+    type Deserializer = <u64 as IntoDeserializer<'de, E>>::Deserializer;
 
     fn from(self) -> Self::Deserializer {
         self.into_deserializer()
@@ -2552,20 +2582,6 @@ where
 pub struct StrDeserializer<'a, E> {
     value: &'a str,
     marker: PhantomData<E>,
-}
-
-impl<'a, E> IdentifierDeserializer<'a, E> for &'a str
-where
-    E: Error,
-{
-    type Deserializer = StrDeserializer<'a, E>;
-
-    fn from(self) -> Self::Deserializer {
-        StrDeserializer {
-            value: self,
-            marker: PhantomData,
-        }
-    }
 }
 
 impl<'de, 'a, E> Deserializer<'de> for StrDeserializer<'a, E>
@@ -2588,26 +2604,12 @@ where
     }
 }
 
-pub struct BytesDeserializer<'a, E> {
-    value: &'a [u8],
+pub struct BorrowedStrDeserializer<'de, E> {
+    value: &'de str,
     marker: PhantomData<E>,
 }
 
-impl<'a, E> IdentifierDeserializer<'a, E> for &'a [u8]
-where
-    E: Error,
-{
-    type Deserializer = BytesDeserializer<'a, E>;
-
-    fn from(self) -> Self::Deserializer {
-        BytesDeserializer {
-            value: self,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<'de, 'a, E> Deserializer<'de> for BytesDeserializer<'a, E>
+impl<'de, E> Deserializer<'de> for BorrowedStrDeserializer<'de, E>
 where
     E: Error,
 {
@@ -2617,7 +2619,7 @@ where
     where
         V: Visitor<'de>,
     {
-        visitor.visit_bytes(self.value)
+        visitor.visit_borrowed_str(self.value)
     }
 
     forward_to_deserialize_any! {
@@ -2627,21 +2629,53 @@ where
     }
 }
 
-/// A DeserializeSeed helper for implementing deserialize_in_place Visitors.
-///
-/// Wraps a mutable reference and calls deserialize_in_place on it.
-pub struct InPlaceSeed<'a, T: 'a>(pub &'a mut T);
-
-impl<'a, 'de, T> DeserializeSeed<'de> for InPlaceSeed<'a, T>
+impl<'a, E> IdentifierDeserializer<'a, E> for &'a str
 where
-    T: Deserialize<'de>,
+    E: Error,
 {
-    type Value = ();
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        T::deserialize_in_place(deserializer, self.0)
+    type Deserializer = StrDeserializer<'a, E>;
+
+    fn from(self) -> Self::Deserializer {
+        StrDeserializer {
+            value: self,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'de, E> IdentifierDeserializer<'de, E> for Borrowed<'de, str>
+where
+    E: Error,
+{
+    type Deserializer = BorrowedStrDeserializer<'de, E>;
+
+    fn from(self) -> Self::Deserializer {
+        BorrowedStrDeserializer {
+            value: self.0,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, E> IdentifierDeserializer<'a, E> for &'a [u8]
+where
+    E: Error,
+{
+    type Deserializer = BytesDeserializer<'a, E>;
+
+    fn from(self) -> Self::Deserializer {
+        BytesDeserializer::new(self)
+    }
+}
+
+impl<'de, E> IdentifierDeserializer<'de, E> for Borrowed<'de, [u8]>
+where
+    E: Error,
+{
+    type Deserializer = BorrowedBytesDeserializer<'de, E>;
+
+    fn from(self) -> Self::Deserializer {
+        BorrowedBytesDeserializer::new(self.0)
     }
 }
 
@@ -2759,6 +2793,13 @@ where
         }
     }
 
+    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
     forward_to_deserialize_other! {
         deserialize_bool()
         deserialize_i8()
@@ -2776,7 +2817,6 @@ where
         deserialize_string()
         deserialize_bytes()
         deserialize_byte_buf()
-        deserialize_unit()
         deserialize_unit_struct(&'static str)
         deserialize_seq()
         deserialize_tuple(usize)
@@ -2817,7 +2857,7 @@ where
     where
         T: DeserializeSeed<'de>,
     {
-        while let Some(item) = self.iter.next() {
+        for item in &mut self.iter {
             // Items in the vector are nulled out when used by a struct.
             if let Some((ref key, ref content)) = *item {
                 self.pending_content = Some(content);
@@ -2919,7 +2959,7 @@ where
     where
         T: DeserializeSeed<'de>,
     {
-        while let Some(item) = self.iter.next() {
+        for item in &mut self.iter {
             if let Some((ref key, ref content)) = *item {
                 // Do not take(), instead borrow this entry. The internally tagged
                 // enum does its own buffering so we can't tell whether this entry

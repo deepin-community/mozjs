@@ -7,6 +7,7 @@
 #ifndef vm_JSAtom_h
 #define vm_JSAtom_h
 
+#include "mozilla/HashFunctions.h"
 #include "mozilla/Maybe.h"
 
 #include "gc/MaybeRooted.h"
@@ -16,6 +17,8 @@
 #include "vm/CommonPropertyNames.h"
 
 namespace js {
+
+class AtomSet;
 
 /*
  * Return a printable, lossless char[] representation of a string-type atom.
@@ -27,38 +30,47 @@ class PropertyName;
 
 } /* namespace js */
 
-/* Well-known predefined C strings. */
-#define DECLARE_PROTO_STR(name, clasp) extern const char js_##name##_str[];
-JS_FOR_EACH_PROTOTYPE(DECLARE_PROTO_STR)
-#undef DECLARE_PROTO_STR
-
-#define DECLARE_CONST_CHAR_STR(idpart, id, text) \
-  extern const char js_##idpart##_str[];
-FOR_EACH_COMMON_PROPERTYNAME(DECLARE_CONST_CHAR_STR)
-#undef DECLARE_CONST_CHAR_STR
-
 namespace js {
-
-class AutoAccessAtomsZone;
 
 /*
  * Atom tracing and garbage collection hooks.
  */
-void TraceAtoms(JSTracer* trc, const AutoAccessAtomsZone& access);
-
-void TraceWellKnownSymbols(JSTracer* trc);
-
-/* N.B. must correspond to boolean tagging behavior. */
-enum PinningBehavior { DoNotPinAtom = false, PinAtom = true };
+void TraceAtoms(JSTracer* trc);
 
 extern JSAtom* Atomize(
     JSContext* cx, const char* bytes, size_t length,
-    js::PinningBehavior pin = js::DoNotPinAtom,
     const mozilla::Maybe<uint32_t>& indexValue = mozilla::Nothing());
 
+extern JSAtom* AtomizeWithoutActiveZone(JSContext* cx, const char* bytes,
+                                        size_t length);
+
 template <typename CharT>
-extern JSAtom* AtomizeChars(JSContext* cx, const CharT* chars, size_t length,
-                            js::PinningBehavior pin = js::DoNotPinAtom);
+extern JSAtom* AtomizeChars(JSContext* cx, const CharT* chars, size_t length);
+
+/*
+ * Optimized entry points for atomization.
+ *
+ * The meaning of suffix:
+ *   * "NonStatic": characters don't match StaticStrings
+ *   * "ValidLength": length fits JSString::MAX_LENGTH
+ */
+
+/* Atomize characters when the value of HashString is already known. */
+template <typename CharT>
+extern JSAtom* AtomizeCharsNonStaticValidLength(JSContext* cx,
+                                                mozilla::HashNumber hash,
+                                                const CharT* chars,
+                                                size_t length);
+
+/**
+ * Permanently atomize characters.
+ *
+ * `chars` shouldn't match any of StaticStrings entry.
+ * `length` should be validated by JSString::validateLength.
+ */
+extern JSAtom* PermanentlyAtomizeCharsNonStaticValidLength(
+    JSContext* cx, AtomSet& atomSet, mozilla::HashNumber hash,
+    const Latin1Char* chars, size_t length);
 
 /**
  * Create an atom whose contents are those of the |utf8ByteLength| code units
@@ -69,31 +81,22 @@ extern JSAtom* AtomizeChars(JSContext* cx, const CharT* chars, size_t length,
 extern JSAtom* AtomizeUTF8Chars(JSContext* cx, const char* utf8Chars,
                                 size_t utf8ByteLength);
 
-/**
- * Create an atom whose contents are those of the |wtf8ByteLength| code units
- * starting at |wtf8Chars|, interpreted as WTF-8.
- *
- * Throws if the code units do not contain valid WTF-8.
- */
-extern JSAtom* AtomizeWTF8Chars(JSContext* cx, const char* wtf8Chars,
-                                size_t wtf8ByteLength);
-
-extern JSAtom* AtomizeString(JSContext* cx, JSString* str,
-                             js::PinningBehavior pin = js::DoNotPinAtom);
+extern JSAtom* AtomizeString(JSContext* cx, JSString* str);
 
 template <AllowGC allowGC>
 extern JSAtom* ToAtom(JSContext* cx,
                       typename MaybeRooted<JS::Value, allowGC>::HandleType v);
 
-// These functions are declared in vm/Xdr.h
-//
-// template<XDRMode mode>
-// XDRResult
-// XDRAtom(XDRState<mode>* xdr, js::MutableHandleAtom atomp);
+/*
+ * Pin an atom so that it is never collected. Avoid using this if possible.
+ *
+ * This function does not GC.
+ */
+extern bool PinAtom(JSContext* cx, JSAtom* atom);
 
-// template<XDRMode mode>
-// XDRResult
-// XDRAtomOrNull(XDRState<mode>* xdr, js::MutableHandleAtom atomp);
+#ifdef ENABLE_RECORD_TUPLE
+extern bool EnsureAtomized(JSContext* cx, MutableHandleValue v, bool* updated);
+#endif
 
 extern JS::Handle<PropertyName*> ClassName(JSProtoKey key, JSContext* cx);
 

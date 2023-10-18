@@ -1,3 +1,7 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
 use crate::preferences::{Pref, Preferences};
 use crate::prefreader::{parse, serialize, PrefReaderError};
 use std::collections::btree_map::Iter;
@@ -15,9 +19,21 @@ pub struct Profile {
     user_prefs: Option<PrefFile>,
 }
 
+impl PartialEq for Profile {
+    fn eq(&self, other: &Profile) -> bool {
+        self.path == other.path
+    }
+}
+
 impl Profile {
-    pub fn new() -> IoResult<Profile> {
-        let dir = Builder::new().prefix("rust_mozprofile").tempdir()?;
+    pub fn new(temp_root: Option<&Path>) -> IoResult<Profile> {
+        let mut dir_builder = Builder::new();
+        dir_builder.prefix("rust_mozprofile");
+        let dir = if let Some(temp_root) = temp_root {
+            dir_builder.tempdir_in(temp_root)
+        } else {
+            dir_builder.tempdir()
+        }?;
         let path = dir.path().to_path_buf();
         let temp_dir = Some(dir);
         Ok(Profile {
@@ -62,7 +78,7 @@ impl Profile {
 
 #[derive(Debug)]
 pub struct PrefFile {
-    path: PathBuf,
+    pub path: PathBuf,
     pub prefs: Preferences,
 }
 

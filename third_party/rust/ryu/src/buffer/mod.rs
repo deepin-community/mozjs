@@ -1,32 +1,24 @@
-use core::{mem, slice, str};
-
-#[cfg(maybe_uninit)]
+use crate::raw;
 use core::mem::MaybeUninit;
-
-use raw;
-
+use core::{slice, str};
 #[cfg(feature = "no-panic")]
 use no_panic::no_panic;
 
-const NAN: &'static str = "NaN";
-const INFINITY: &'static str = "inf";
-const NEG_INFINITY: &'static str = "-inf";
+const NAN: &str = "NaN";
+const INFINITY: &str = "inf";
+const NEG_INFINITY: &str = "-inf";
 
 /// Safe API for formatting floating point numbers to text.
 ///
 /// ## Example
 ///
-/// ```edition2018
+/// ```
 /// let mut buffer = ryu::Buffer::new();
 /// let printed = buffer.format_finite(1.234);
 /// assert_eq!(printed, "1.234");
 /// ```
-#[derive(Copy, Clone)]
 pub struct Buffer {
-    #[cfg(maybe_uninit)]
     bytes: [MaybeUninit<u8>; 24],
-    #[cfg(not(maybe_uninit))]
-    bytes: [u8; 24],
 }
 
 impl Buffer {
@@ -35,14 +27,8 @@ impl Buffer {
     #[inline]
     #[cfg_attr(feature = "no-panic", no_panic)]
     pub fn new() -> Self {
-        // assume_init is safe here, since this is an array of MaybeUninit, which does not need
-        // to be initialized.
-        #[cfg(maybe_uninit)]
-        let bytes = unsafe { MaybeUninit::uninit().assume_init() };
-        #[cfg(not(maybe_uninit))]
-        let bytes = unsafe { mem::uninitialized() };
-
-        Buffer { bytes: bytes }
+        let bytes = [MaybeUninit::<u8>::uninit(); 24];
+        Buffer { bytes }
     }
 
     /// Print a floating point number into this buffer and return a reference to
@@ -85,35 +71,20 @@ impl Buffer {
     #[cfg_attr(feature = "no-panic", no_panic)]
     pub fn format_finite<F: Float>(&mut self, f: F) -> &str {
         unsafe {
-            let n = f.write_to_ryu_buffer(self.first_byte_pointer_mut());
+            let n = f.write_to_ryu_buffer(self.bytes.as_mut_ptr() as *mut u8);
             debug_assert!(n <= self.bytes.len());
-            let slice = slice::from_raw_parts(self.first_byte_pointer(), n);
+            let slice = slice::from_raw_parts(self.bytes.as_ptr() as *const u8, n);
             str::from_utf8_unchecked(slice)
         }
     }
+}
 
-    #[inline]
-    #[cfg(maybe_uninit)]
-    fn first_byte_pointer(&self) -> *const u8 {
-        self.bytes[0].as_ptr()
-    }
+impl Copy for Buffer {}
 
+impl Clone for Buffer {
     #[inline]
-    #[cfg(not(maybe_uninit))]
-    fn first_byte_pointer(&self) -> *const u8 {
-        &self.bytes[0] as *const u8
-    }
-
-    #[inline]
-    #[cfg(maybe_uninit)]
-    fn first_byte_pointer_mut(&mut self) -> *mut u8 {
-        self.bytes[0].as_mut_ptr()
-    }
-
-    #[inline]
-    #[cfg(not(maybe_uninit))]
-    fn first_byte_pointer_mut(&mut self) -> *mut u8 {
-        &mut self.bytes[0] as *mut u8
+    fn clone(&self) -> Self {
+        Buffer::new()
     }
 }
 
@@ -144,7 +115,7 @@ impl Sealed for f32 {
     #[inline]
     fn is_nonfinite(self) -> bool {
         const EXP_MASK: u32 = 0x7f800000;
-        let bits = unsafe { mem::transmute::<f32, u32>(self) };
+        let bits = self.to_bits();
         bits & EXP_MASK == EXP_MASK
     }
 
@@ -153,7 +124,7 @@ impl Sealed for f32 {
     fn format_nonfinite(self) -> &'static str {
         const MANTISSA_MASK: u32 = 0x007fffff;
         const SIGN_MASK: u32 = 0x80000000;
-        let bits = unsafe { mem::transmute::<f32, u32>(self) };
+        let bits = self.to_bits();
         if bits & MANTISSA_MASK != 0 {
             NAN
         } else if bits & SIGN_MASK != 0 {
@@ -173,7 +144,7 @@ impl Sealed for f64 {
     #[inline]
     fn is_nonfinite(self) -> bool {
         const EXP_MASK: u64 = 0x7ff0000000000000;
-        let bits = unsafe { mem::transmute::<f64, u64>(self) };
+        let bits = self.to_bits();
         bits & EXP_MASK == EXP_MASK
     }
 
@@ -182,7 +153,7 @@ impl Sealed for f64 {
     fn format_nonfinite(self) -> &'static str {
         const MANTISSA_MASK: u64 = 0x000fffffffffffff;
         const SIGN_MASK: u64 = 0x8000000000000000;
-        let bits = unsafe { mem::transmute::<f64, u64>(self) };
+        let bits = self.to_bits();
         if bits & MANTISSA_MASK != 0 {
             NAN
         } else if bits & SIGN_MASK != 0 {

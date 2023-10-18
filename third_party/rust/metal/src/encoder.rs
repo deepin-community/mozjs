@@ -7,8 +7,6 @@
 
 use super::*;
 
-use cocoa::foundation::{NSInteger, NSRange, NSUInteger};
-
 use std::ops::Range;
 
 #[repr(u64)]
@@ -22,6 +20,7 @@ pub enum MTLPrimitiveType {
 }
 
 #[repr(u64)]
+#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum MTLIndexType {
     UInt16 = 0,
@@ -66,10 +65,16 @@ pub enum MTLTriangleFillMode {
 }
 
 bitflags! {
+    /// https://developer.apple.com/documentation/metal/mtlblitoption
     #[allow(non_upper_case_globals)]
     pub struct MTLBlitOption: NSUInteger {
+        /// https://developer.apple.com/documentation/metal/mtlblitoption/mtlblitoptionnone
+        const None = 0;
+        /// https://developer.apple.com/documentation/metal/mtlblitoption/mtlblitoptiondepthfromdepthstencil
         const DepthFromDepthStencil   = 1 << 0;
+        /// https://developer.apple.com/documentation/metal/mtlblitoption/mtlblitoptionstencilfromdepthstencil
         const StencilFromDepthStencil = 1 << 1;
+        /// https://developer.apple.com/documentation/metal/mtlblitoption/mtlblitoptionrowlinearpvrtc
         const RowLinearPVRTC          = 1 << 2;
     }
 }
@@ -113,6 +118,13 @@ pub struct MTLDrawIndexedPrimitivesIndirectArguments {
     pub baseInstance: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct VertexAmplificationViewMapping {
+    pub renderTargetArrayIndexOffset: u32,
+    pub viewportArrayIndexOffset: u32,
+}
+
 pub enum MTLCommandEncoder {}
 
 foreign_obj_type! {
@@ -137,9 +149,7 @@ impl CommandEncoderRef {
     }
 
     pub fn end_encoding(&self) {
-        unsafe {
-            msg_send![self, endEncoding]
-        }
+        unsafe { msg_send![self, endEncoding] }
     }
 
     pub fn insert_debug_signpost(&self, name: &str) {
@@ -157,9 +167,7 @@ impl CommandEncoderRef {
     }
 
     pub fn pop_debug_group(&self) {
-        unsafe {
-            msg_send![self, popDebugGroup]
-        }
+        unsafe { msg_send![self, popDebugGroup] }
     }
 }
 
@@ -255,6 +263,16 @@ impl RenderCommandEncoderRef {
         }
     }
 
+    pub fn set_vertex_amplification_count(
+        &self,
+        count: NSUInteger,
+        view_mappings: Option<&[VertexAmplificationViewMapping]>,
+    ) {
+        unsafe {
+            msg_send! [self, setVertexAmplificationCount: count viewMappings: view_mappings.map_or(std::ptr::null(), |vm| vm.as_ptr())]
+        }
+    }
+
     // Specifying Resources for a Vertex Shader Function
 
     pub fn set_vertex_bytes(
@@ -287,11 +305,7 @@ impl RenderCommandEncoderRef {
         }
     }
 
-    pub fn set_vertex_buffer_offset(
-        &self,
-        index: NSUInteger,
-        offset: NSUInteger,
-    ) {
+    pub fn set_vertex_buffer_offset(&self, index: NSUInteger, offset: NSUInteger) {
         unsafe {
             msg_send![self,
                 setVertexBufferOffset:offset
@@ -413,11 +427,7 @@ impl RenderCommandEncoderRef {
         }
     }
 
-    pub fn set_fragment_buffer_offset(
-        &self,
-        index: NSUInteger,
-        offset: NSUInteger,
-    ) {
+    pub fn set_fragment_buffer_offset(&self, index: NSUInteger, offset: NSUInteger) {
         unsafe {
             msg_send![self,
                 setFragmentBufferOffset:offset
@@ -664,15 +674,140 @@ impl RenderCommandEncoderRef {
     // fn setVertexBuffers_offsets_withRange(self, buffers: *const id, offsets: *const NSUInteger, range: NSRange);
     // fn setVertexSamplerStates_lodMinClamps_lodMaxClamps_withRange(self, samplers: *const id, lodMinClamps: *const f32, lodMaxClamps: *const f32, range: NSRange);
 
+    /// Adds an untracked resource to the render pass.
+    ///
+    /// Availability: iOS 11.0+, macOS 10.13+
+    ///
+    /// # Arguments
+    /// * `resource`: A resource within an argument buffer.
+    /// * `usage`: Options for describing how a graphics function uses the resource.
+    ///
+    /// See <https://developer.apple.com/documentation/metal/mtlrendercommandencoder/2866168-useresource?language=objc>
+    #[deprecated(note = "Use use_resource_at instead")]
     pub fn use_resource(&self, resource: &ResourceRef, usage: MTLResourceUsage) {
         unsafe {
-            msg_send![self, useResource:resource
-                                  usage:usage]
+            msg_send![self,
+                useResource:resource
+                usage:usage
+            ]
         }
     }
 
+    /// Adds an untracked resource to the render pass, specifying which render stages need it.
+    ///
+    /// Availability: iOS 13.0+, macOS 10.15+
+    ///
+    /// # Arguments
+    /// * `resource`: A resource within an argument buffer.
+    /// * `usage`: Options for describing how a graphics function uses the resource.
+    /// * `stages`: The render stages where the resource must be resident.
+    ///
+    /// See <https://developer.apple.com/documentation/metal/mtlrendercommandencoder/3043404-useresource>
+    pub fn use_resource_at(
+        &self,
+        resource: &ResourceRef,
+        usage: MTLResourceUsage,
+        stages: MTLRenderStages,
+    ) {
+        unsafe {
+            msg_send![self,
+                useResource: resource
+                usage: usage
+                stages: stages
+            ]
+        }
+    }
+
+    /// Adds an array of untracked resources to the render pass, specifying which stages need them.
+    ///
+    /// When working with color render targets, call this method as late as possible to improve performance.
+    ///
+    /// Availability: iOS 13.0+, macOS 10.15+
+    ///
+    /// # Arguments
+    /// * `resources`: A slice of resources within an argument buffer.
+    /// * `usage`: Options for describing how a graphics function uses the resources.
+    /// * `stages`: The render stages where the resources must be resident.
+    pub fn use_resources(
+        &self,
+        resources: &[&ResourceRef],
+        usage: MTLResourceUsage,
+        stages: MTLRenderStages,
+    ) {
+        unsafe {
+            msg_send![self,
+                useResources: resources.as_ptr()
+                count: resources.len() as NSUInteger
+                usage: usage
+                stages: stages
+            ]
+        }
+    }
+
+    /// Adds the resources in a heap to the render pass.
+    ///
+    /// Availability: iOS 11.0+, macOS 10.13+
+    ///
+    /// # Arguments:
+    /// * `heap`: A heap that contains resources within an argument buffer.
+    ///
+    /// See <https://developer.apple.com/documentation/metal/mtlrendercommandencoder/2866163-useheap?language=objc>
+    #[deprecated(note = "Use use_heap_at instead")]
     pub fn use_heap(&self, heap: &HeapRef) {
         unsafe { msg_send![self, useHeap: heap] }
+    }
+
+    /// Adds the resources in a heap to the render pass, specifying which render stages need them.
+    ///
+    /// Availability: iOS 13.0+, macOS 10.15+
+    ///
+    /// # Arguments
+    /// * `heap`: A heap that contains resources within an argument buffer.
+    /// * `stages`: The render stages where the resources must be resident.
+    ///
+    pub fn use_heap_at(&self, heap: &HeapRef, stages: MTLRenderStages) {
+        unsafe {
+            msg_send![self,
+                useHeap: heap
+                stages: stages
+            ]
+        }
+    }
+
+    /// Adds the resources in an array of heaps to the render pass, specifying which render stages need them.
+    ///
+    /// Availability: iOS 13.0+, macOS 10.15+
+    ///
+    /// # Arguments
+    ///
+    /// * `heaps`: A slice of heaps that contains resources within an argument buffer.
+    /// * `stages`: The render stages where the resources must be resident.
+    pub fn use_heaps(&self, heaps: &[&HeapRef], stages: MTLRenderStages) {
+        unsafe {
+            msg_send![self,
+                useHeaps: heaps.as_ptr()
+                count: heaps.len() as NSUInteger
+                stages: stages
+            ]
+        }
+    }
+
+    pub fn update_fence(&self, fence: &FenceRef, after_stages: MTLRenderStages) {
+        unsafe {
+            msg_send![self,
+                updateFence: fence
+                afterStages: after_stages
+            ]
+        }
+    }
+
+    pub fn wait_for_fence(&self, fence: &FenceRef, before_stages: MTLRenderStages) {
+        unsafe {
+            msg_send![self,
+                waitForFence: fence
+                beforeStages: before_stages
+            ]
+        }
     }
 }
 
@@ -690,7 +825,7 @@ impl BlitCommandEncoderRef {
         unsafe { msg_send![self, synchronizeResource: resource] }
     }
 
-    pub fn fill_buffer(&self, destination_buffer: &BufferRef, range: NSRange, value: u8) {
+    pub fn fill_buffer(&self, destination_buffer: &BufferRef, range: crate::NSRange, value: u8) {
         unsafe {
             msg_send![self,
                 fillBuffer: destination_buffer
@@ -698,6 +833,10 @@ impl BlitCommandEncoderRef {
                 value: value
             ]
         }
+    }
+
+    pub fn generate_mipmaps(&self, texture: &TextureRef) {
+        unsafe { msg_send![self, generateMipmapsForTexture: texture] }
     }
 
     pub fn copy_from_buffer(
@@ -775,6 +914,7 @@ impl BlitCommandEncoderRef {
         }
     }
 
+    /// https://developer.apple.com/documentation/metal/mtlblitcommandencoder/1400756-copy
     pub fn copy_from_texture_to_buffer(
         &self,
         source_texture: &TextureRef,
@@ -840,6 +980,14 @@ impl BlitCommandEncoderRef {
                 level: level
             ]
         }
+    }
+
+    pub fn update_fence(&self, fence: &FenceRef) {
+        unsafe { msg_send![self, updateFence: fence] }
+    }
+
+    pub fn wait_for_fence(&self, fence: &FenceRef) {
+        unsafe { msg_send![self, waitForFence: fence] }
     }
 }
 
@@ -951,11 +1099,20 @@ impl ComputeCommandEncoderRef {
     pub fn dispatch_thread_groups(
         &self,
         thread_groups_count: MTLSize,
-        threads_per_thread_group: MTLSize,
+        threads_per_threadgroup: MTLSize,
     ) {
         unsafe {
             msg_send![self,
                 dispatchThreadgroups:thread_groups_count
+                threadsPerThreadgroup:threads_per_threadgroup
+            ]
+        }
+    }
+
+    pub fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_thread_group: MTLSize) {
+        unsafe {
+            msg_send![self,
+                dispatchThreads:threads_per_grid
                 threadsPerThreadgroup:threads_per_thread_group
             ]
         }
@@ -965,28 +1122,95 @@ impl ComputeCommandEncoderRef {
         &self,
         buffer: &BufferRef,
         offset: NSUInteger,
-        threads_per_thread_group: MTLSize,
+        threads_per_threadgroup: MTLSize,
     ) {
         unsafe {
             msg_send![self,
                 dispatchThreadgroupsWithIndirectBuffer:buffer
                 indirectBufferOffset:offset
-                threadsPerThreadgroup:threads_per_thread_group
+                threadsPerThreadgroup:threads_per_threadgroup
             ]
         }
     }
 
+    pub fn set_threadgroup_memory_length(&self, at_index: NSUInteger, size: NSUInteger) {
+        unsafe {
+            msg_send![self,
+                setThreadgroupMemoryLength:size
+                atIndex: at_index
+            ]
+        }
+    }
+
+    /// Specifies that a resource in an argument buffer can be safely used by a compute pass.
+    ///
+    /// Availability: iOS 11.0+, macOS 10.13+
+    ///
+    /// # Arguments
+    /// * `resource`: A specific resource within an argument buffer.
+    /// * `usage`: The options that describe how the resource will be used by a compute function.
     pub fn use_resource(&self, resource: &ResourceRef, usage: MTLResourceUsage) {
         unsafe {
             msg_send![self,
-                useResource:resource
-                usage:usage
+                useResource: resource
+                usage: usage
             ]
         }
     }
 
+    /// Specifies that an array of resources in an argument buffer can be safely used by a compute pass.
+    ///
+    /// Availability: iOS 11.0+, macOS 10.13+
+    ///
+    /// See <https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/2866561-useresources>
+    ///
+    /// # Arguments
+    /// * `resources`: A slice of resources within an argument buffer.
+    /// * `usage`: The options that describe how the array of resources will be used by a compute function.
+    pub fn use_resources(&self, resources: &[&ResourceRef], usage: MTLResourceUsage) {
+        unsafe {
+            msg_send![self,
+                useResources: resources.as_ptr()
+                count: resources.len() as NSUInteger
+                usage: usage
+            ]
+        }
+    }
+
+    /// Specifies that a heap containing resources in an argument buffer can be safely used by a compute pass.
+    ///
+    /// Availability: iOS 11.0+, macOS 10.13+
+    ///
+    /// See <https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/2866530-useheap>
+    ///
+    /// # Arguments
+    /// * `heap`: A heap that contains resources within an argument buffer.
     pub fn use_heap(&self, heap: &HeapRef) {
         unsafe { msg_send![self, useHeap: heap] }
+    }
+
+    /// Specifies that an array of heaps containing resources in an argument buffer can be safely
+    /// used by a compute pass.
+    ///
+    /// Availability: iOS 11.0+, macOS 10.13+
+    ///
+    /// # Arguments
+    /// * `heaps`: A slice of heaps that contains resources within an argument buffer.
+    pub fn use_heaps(&self, heaps: &[&HeapRef]) {
+        unsafe {
+            msg_send![self,
+                useHeaps: heaps.as_ptr()
+                count: heaps.len() as NSUInteger
+            ]
+        }
+    }
+
+    pub fn update_fence(&self, fence: &FenceRef) {
+        unsafe { msg_send![self, updateFence: fence] }
+    }
+
+    pub fn wait_for_fence(&self, fence: &FenceRef) {
+        unsafe { msg_send![self, waitForFence: fence] }
     }
 }
 
@@ -1031,12 +1255,7 @@ impl ArgumentEncoderRef {
         }
     }
 
-    pub fn set_buffer(
-        &self,
-        at_index: NSUInteger,
-        buffer: &BufferRef,
-        offset: NSUInteger,
-    ) {
+    pub fn set_buffer(&self, at_index: NSUInteger, buffer: &BufferRef, offset: NSUInteger) {
         unsafe {
             msg_send![self,
                 setBuffer: buffer
@@ -1102,6 +1321,35 @@ impl ArgumentEncoderRef {
                 withRange: NSRange {
                     location: start_index,
                     length: data.len() as _,
+                }
+            ]
+        }
+    }
+
+    pub fn set_render_pipeline_state(
+        &self,
+        at_index: NSUInteger,
+        pipeline: &RenderPipelineStateRef,
+    ) {
+        unsafe {
+            msg_send![self,
+                setRenderPipelineState: pipeline
+                atIndex: at_index
+            ]
+        }
+    }
+
+    pub fn set_render_pipeline_states(
+        &self,
+        start_index: NSUInteger,
+        pipelines: &[&RenderPipelineStateRef],
+    ) {
+        unsafe {
+            msg_send![self,
+                setRenderPipelineStates: pipelines.as_ptr()
+                withRange: NSRange {
+                    location: start_index,
+                    length: pipelines.len() as _,
                 }
             ]
         }

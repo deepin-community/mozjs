@@ -23,8 +23,13 @@ pub type CGFontRef = *mut CGFont;
 pub enum CGContext {}
 pub type CGContextRef = *mut CGContext;
 
+pub enum CGGradient {}
+pub type CGGradientRef = *mut CGGradient;
+
 #[cfg(target_os = "macos")]
 mod macos {
+	pub enum CGEventTap {}
+	pub type CGEventTapRef = core_foundation::mach_port::CFMachPortRef;
 	pub enum CGEvent {}
 	pub type CGEventRef = *mut CGEvent;
 

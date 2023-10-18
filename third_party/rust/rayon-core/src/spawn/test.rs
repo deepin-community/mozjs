@@ -1,10 +1,10 @@
-use scope;
+use crate::scope;
 use std::any::Any;
 use std::sync::mpsc::channel;
 use std::sync::Mutex;
 
 use super::{spawn, spawn_fifo};
-use ThreadPoolBuilder;
+use crate::ThreadPoolBuilder;
 
 #[test]
 fn spawn_then_join_in_worker() {
@@ -166,7 +166,7 @@ macro_rules! test_order {
 
 #[test]
 fn lifo_order() {
-    // In the absense of stealing, `spawn()` jobs on a thread will run in LIFO order.
+    // In the absence of stealing, `spawn()` jobs on a thread will run in LIFO order.
     let vec = test_order!(spawn, spawn);
     let expected: Vec<i32> = (0..100).rev().collect(); // LIFO -> reversed
     assert_eq!(vec, expected);
@@ -174,7 +174,7 @@ fn lifo_order() {
 
 #[test]
 fn fifo_order() {
-    // In the absense of stealing, `spawn_fifo()` jobs on a thread will run in FIFO order.
+    // In the absence of stealing, `spawn_fifo()` jobs on a thread will run in FIFO order.
     let vec = test_order!(spawn_fifo, spawn_fifo);
     let expected: Vec<i32> = (0..100).collect(); // FIFO -> natural order
     assert_eq!(vec, expected);

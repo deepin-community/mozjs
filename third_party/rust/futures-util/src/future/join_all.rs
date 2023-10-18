@@ -1,68 +1,50 @@
 //! Definition of the `JoinAll` combinator, waiting for all of a list of futures
 //! to finish.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
 use core::iter::FromIterator;
 use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 
-#[derive(Debug)]
-enum ElemState<F>
-where
-    F: Future,
-{
-    Pending(F),
-    Done(Option<F::Output>),
-}
+use super::{assert_future, MaybeDone};
 
-impl<F> ElemState<F>
-where
-    F: Future,
-{
-    fn pending_pin_mut(self: Pin<&mut Self>) -> Option<Pin<&mut F>> {
-        // Safety: Basic enum pin projection, no drop + optionally Unpin based
-        // on the type of this variant
-        match unsafe { self.get_unchecked_mut() } {
-            ElemState::Pending(f) => Some(unsafe { Pin::new_unchecked(f) }),
-            ElemState::Done(_) => None,
-        }
-    }
-
-    fn take_done(self: Pin<&mut Self>) -> Option<F::Output> {
-        // Safety: Going from pin to a variant we never pin-project
-        match unsafe { self.get_unchecked_mut() } {
-            ElemState::Pending(_) => None,
-            ElemState::Done(output) => output.take(),
-        }
-    }
-}
-
-impl<F> Unpin for ElemState<F>
-where
-    F: Future + Unpin,
-{
-}
+#[cfg(not(futures_no_atomic_cas))]
+use crate::stream::{Collect, FuturesOrdered, StreamExt};
 
 fn iter_pin_mut<T>(slice: Pin<&mut [T]>) -> impl Iterator<Item = Pin<&mut T>> {
     // Safety: `std` _could_ make this unsound if it were to decide Pin's
     // invariants aren't required to transmit through slices. Otherwise this has
     // the same safety as a normal field pin projection.
-    unsafe { slice.get_unchecked_mut() }
-        .iter_mut()
-        .map(|t| unsafe { Pin::new_unchecked(t) })
+    unsafe { slice.get_unchecked_mut() }.iter_mut().map(|t| unsafe { Pin::new_unchecked(t) })
 }
 
-/// Future for the [`join_all`] function.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
+/// Future for the [`join_all`] function.
 pub struct JoinAll<F>
 where
     F: Future,
 {
-    elems: Pin<Box<[ElemState<F>]>>,
+    kind: JoinAllKind<F>,
+}
+
+#[cfg(not(futures_no_atomic_cas))]
+const SMALL: usize = 30;
+
+pub(crate) enum JoinAllKind<F>
+where
+    F: Future,
+{
+    Small {
+        elems: Pin<Box<[MaybeDone<F>]>>,
+    },
+    #[cfg(not(futures_no_atomic_cas))]
+    Big {
+        fut: Collect<FuturesOrdered<F>, Vec<F::Output>>,
+    },
 }
 
 impl<F> fmt::Debug for JoinAll<F>
@@ -71,9 +53,13 @@ where
     F::Output: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JoinAll")
-            .field("elems", &self.elems)
-            .finish()
+        match self.kind {
+            JoinAllKind::Small { ref elems } => {
+                f.debug_struct("JoinAll").field("elems", elems).finish()
+            }
+            #[cfg(not(futures_no_atomic_cas))]
+            JoinAllKind::Big { ref fut, .. } => fmt::Debug::fmt(fut, f),
+        }
     }
 }
 
@@ -89,10 +75,11 @@ where
 ///
 /// # See Also
 ///
-/// This is purposefully a very simple API for basic use-cases. In a lot of
-/// cases you will want to use the more powerful
-/// [`FuturesUnordered`][crate::stream::FuturesUnordered] APIs, some
-/// examples of additional functionality that provides:
+/// `join_all` will switch to the more powerful [`FuturesOrdered`] for performance
+/// reasons if the number of futures is large. You may want to look into using it or
+/// it's counterpart [`FuturesUnordered`][crate::stream::FuturesUnordered] directly.
+///
+/// Some examples for additional functionality provided by these are:
 ///
 ///  * Adding new futures to the set even after it has been started.
 ///
@@ -112,13 +99,33 @@ where
 /// assert_eq!(join_all(futures).await, [1, 2, 3]);
 /// # });
 /// ```
-pub fn join_all<I>(i: I) -> JoinAll<I::Item>
+pub fn join_all<I>(iter: I) -> JoinAll<I::Item>
 where
     I: IntoIterator,
     I::Item: Future,
 {
-    let elems: Box<[_]> = i.into_iter().map(ElemState::Pending).collect();
-    JoinAll { elems: elems.into() }
+    #[cfg(futures_no_atomic_cas)]
+    {
+        let elems = iter.into_iter().map(MaybeDone::Future).collect::<Box<[_]>>().into();
+        let kind = JoinAllKind::Small { elems };
+        assert_future::<Vec<<I::Item as Future>::Output>, _>(JoinAll { kind })
+    }
+    #[cfg(not(futures_no_atomic_cas))]
+    {
+        let iter = iter.into_iter();
+        let kind = match iter.size_hint().1 {
+            None => JoinAllKind::Big { fut: iter.collect::<FuturesOrdered<_>>().collect() },
+            Some(max) => {
+                if max <= SMALL {
+                    let elems = iter.map(MaybeDone::Future).collect::<Box<[_]>>().into();
+                    JoinAllKind::Small { elems }
+                } else {
+                    JoinAllKind::Big { fut: iter.collect::<FuturesOrdered<_>>().collect() }
+                }
+            }
+        };
+        assert_future::<Vec<<I::Item as Future>::Output>, _>(JoinAll { kind })
+    }
 }
 
 impl<F> Future for JoinAll<F>
@@ -128,26 +135,27 @@ where
     type Output = Vec<F::Output>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut all_done = true;
+        match &mut self.kind {
+            JoinAllKind::Small { elems } => {
+                let mut all_done = true;
 
-        for mut elem in iter_pin_mut(self.elems.as_mut()) {
-            if let Some(pending) = elem.as_mut().pending_pin_mut() {
-                if let Poll::Ready(output) = pending.poll(cx) {
-                    elem.set(ElemState::Done(Some(output)));
+                for elem in iter_pin_mut(elems.as_mut()) {
+                    if elem.poll(cx).is_pending() {
+                        all_done = false;
+                    }
+                }
+
+                if all_done {
+                    let mut elems = mem::replace(elems, Box::pin([]));
+                    let result =
+                        iter_pin_mut(elems.as_mut()).map(|e| e.take_output().unwrap()).collect();
+                    Poll::Ready(result)
                 } else {
-                    all_done = false;
+                    Poll::Pending
                 }
             }
-        }
-
-        if all_done {
-            let mut elems = mem::replace(&mut self.elems, Box::pin([]));
-            let result = iter_pin_mut(elems.as_mut())
-                .map(|e| e.take_done().unwrap())
-                .collect();
-            Poll::Ready(result)
-        } else {
-            Poll::Pending
+            #[cfg(not(futures_no_atomic_cas))]
+            JoinAllKind::Big { fut } => Pin::new(fut).poll(cx),
         }
     }
 }

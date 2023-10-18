@@ -44,7 +44,7 @@ class MOZ_RAII AutoProfilerLabelData {
   };
 
   // Mutex protecting access to the following static members.
-  static Mutex sAPLMutex;
+  static Mutex sAPLMutex MOZ_UNANNOTATED;
 
   static ProfilerLabelEnter sEnter;
   static ProfilerLabelExit sExit;
@@ -96,11 +96,8 @@ void ProfilerLabelEnd(const ProfilerLabel& aLabel) {
   }
 }
 
-AutoProfilerLabel::AutoProfilerLabel(
-    const char* aLabel,
-    const char* aDynamicString MOZ_GUARD_OBJECT_NOTIFIER_PARAM_IN_IMPL) {
-  MOZ_GUARD_OBJECT_NOTIFIER_INIT;
-
+AutoProfilerLabel::AutoProfilerLabel(const char* aLabel,
+                                     const char* aDynamicString) {
   Tie(mEntryContext, mGeneration) =
       ProfilerLabelBegin(aLabel, aDynamicString, this);
 }

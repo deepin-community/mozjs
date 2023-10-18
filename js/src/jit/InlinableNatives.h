@@ -7,6 +7,8 @@
 #ifndef jit_InlinableNatives_h
 #define jit_InlinableNatives_h
 
+#include <stdint.h>  // For uint16_t
+
 #define INLINABLE_NATIVE_LIST(_)                   \
   _(Array)                                         \
   _(ArrayIsArray)                                  \
@@ -26,6 +28,9 @@
   _(AtomicsOr)                                     \
   _(AtomicsXor)                                    \
   _(AtomicsIsLockFree)                             \
+                                                   \
+  _(BigIntAsIntN)                                  \
+  _(BigIntAsUintN)                                 \
                                                    \
   _(Boolean)                                       \
                                                    \
@@ -57,6 +62,9 @@
   _(IntlGuardToNumberFormat)                       \
   _(IntlGuardToPluralRules)                        \
   _(IntlGuardToRelativeTimeFormat)                 \
+                                                   \
+  _(MapGet)                                        \
+  _(MapHas)                                        \
                                                    \
   _(MathAbs)                                       \
   _(MathFloor)                                     \
@@ -94,6 +102,8 @@
   _(MathTrunc)                                     \
   _(MathCbrt)                                      \
                                                    \
+  _(NumberToString)                                \
+                                                   \
   _(ReflectGetPrototypeOf)                         \
                                                    \
   _(RegExpMatcher)                                 \
@@ -105,7 +115,11 @@
   _(RegExpInstanceOptimizable)                     \
   _(GetFirstDollarIndex)                           \
                                                    \
+  _(SetHas)                                        \
+                                                   \
   _(String)                                        \
+  _(StringToString)                                \
+  _(StringValueOf)                                 \
   _(StringCharCodeAt)                              \
   _(StringFromCharCode)                            \
   _(StringFromCodePoint)                           \
@@ -119,6 +133,7 @@
   _(Object)                                        \
   _(ObjectCreate)                                  \
   _(ObjectIs)                                      \
+  _(ObjectIsPrototypeOf)                           \
   _(ObjectToString)                                \
                                                    \
   _(TestBailout)                                   \
@@ -138,7 +153,7 @@
   _(IntrinsicIsObject)                             \
   _(IntrinsicIsCrossRealmArrayConstructor)         \
   _(IntrinsicToInteger)                            \
-  _(IntrinsicToString)                             \
+  _(IntrinsicToLength)                             \
   _(IntrinsicIsConstructing)                       \
   _(IntrinsicSubstringKernel)                      \
   _(IntrinsicObjectHasPrototype)                   \
@@ -152,6 +167,9 @@
   _(IntrinsicGuardToSetIterator)                   \
   _(IntrinsicGuardToStringIterator)                \
   _(IntrinsicGuardToRegExpStringIterator)          \
+  _(IntrinsicGuardToWrapForValidIterator)          \
+  _(IntrinsicGuardToIteratorHelper)                \
+  _(IntrinsicGuardToAsyncIteratorHelper)           \
                                                    \
   _(IntrinsicGuardToMapObject)                     \
   _(IntrinsicGetNextMapEntryForIterator)           \
@@ -177,9 +195,10 @@
   _(IntrinsicTypedArrayLength)                     \
   _(IntrinsicPossiblyWrappedTypedArrayLength)      \
   _(IntrinsicTypedArrayByteOffset)                 \
-  _(IntrinsicTypedArrayElementShift)
+  _(IntrinsicTypedArrayElementSize)
 
-struct JSJitInfo;
+struct JSClass;
+class JSJitInfo;
 
 namespace js {
 namespace jit {
@@ -194,6 +213,10 @@ enum class InlinableNative : uint16_t {
 #define ADD_NATIVE(native) extern const JSJitInfo JitInfo_##native;
 INLINABLE_NATIVE_LIST(ADD_NATIVE)
 #undef ADD_NATIVE
+
+const JSClass* InlinableNativeGuardToClass(InlinableNative native);
+
+bool CanInlineNativeCrossRealm(InlinableNative native);
 
 }  // namespace jit
 }  // namespace js

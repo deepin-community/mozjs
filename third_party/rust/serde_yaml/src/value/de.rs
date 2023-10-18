@@ -1,12 +1,11 @@
-use std::fmt;
-use std::vec;
-
+use crate::{number, Error, Mapping, Sequence, Value};
 use serde::de::{
     self, Deserialize, DeserializeSeed, Deserializer, EnumAccess, Error as SError, Expected,
     MapAccess, SeqAccess, Unexpected, VariantAccess, Visitor,
 };
-
-use {private, Error, Mapping, Sequence, Value};
+use serde::forward_to_deserialize_any;
+use std::fmt;
+use std::vec;
 
 impl<'de> Deserialize<'de> for Value {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -213,13 +212,11 @@ impl<'de> Deserializer<'de> for Value {
         self.deserialize_number(visitor)
     }
 
-    serde_if_integer128! {
-        fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value, Error>
-        where
-            V: Visitor<'de>,
-        {
-            self.deserialize_number(visitor)
-        }
+    fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value, Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_number(visitor)
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Error>
@@ -250,13 +247,11 @@ impl<'de> Deserializer<'de> for Value {
         self.deserialize_number(visitor)
     }
 
-    serde_if_integer128! {
-        fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value, Error>
-        where
-            V: Visitor<'de>,
-        {
-            self.deserialize_number(visitor)
-        }
+    fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value, Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_number(visitor)
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Error>
@@ -444,10 +439,7 @@ impl<'de> Deserializer<'de> for Value {
             }
         };
 
-        visitor.visit_enum(EnumDeserializer {
-            variant: variant,
-            value: value,
-        })
+        visitor.visit_enum(EnumDeserializer { variant, value })
     }
 
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Error>
@@ -540,7 +532,7 @@ impl<'de> VariantAccess<'de> for VariantDeserializer {
                 Deserializer::deserialize_any(MapDeserializer::new(v), visitor)
             }
             Some(other) => Err(Error::invalid_type(other.unexpected(), &"struct variant")),
-            _ => Err(Error::invalid_type(
+            None => Err(Error::invalid_type(
                 Unexpected::UnitVariant,
                 &"struct variant",
             )),
@@ -694,7 +686,7 @@ impl<'de> Deserializer<'de> for MapDeserializer {
 
 impl Value {
     #[cold]
-    fn invalid_type<E>(&self, exp: &Expected) -> E
+    fn invalid_type<E>(&self, exp: &dyn Expected) -> E
     where
         E: de::Error,
     {
@@ -703,11 +695,11 @@ impl Value {
 
     #[cold]
     fn unexpected(&self) -> Unexpected {
-        match *self {
+        match self {
             Value::Null => Unexpected::Unit,
-            Value::Bool(b) => Unexpected::Bool(b),
-            Value::Number(ref n) => private::number_unexpected(n),
-            Value::String(ref s) => Unexpected::Str(s),
+            Value::Bool(b) => Unexpected::Bool(*b),
+            Value::Number(n) => number::unexpected(n),
+            Value::String(s) => Unexpected::Str(s),
             Value::Sequence(_) => Unexpected::Seq,
             Value::Mapping(_) => Unexpected::Map,
         }

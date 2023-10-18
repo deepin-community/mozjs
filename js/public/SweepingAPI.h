@@ -7,7 +7,35 @@
 #ifndef js_SweepingAPI_h
 #define js_SweepingAPI_h
 
-#include "js/HeapAPI.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/Maybe.h"
+
+#include "jstypes.h"
+
+#include "js/GCAnnotations.h"
+#include "js/GCPolicyAPI.h"
+#include "js/RootingAPI.h"
+
+namespace js {
+namespace gc {
+
+class StoreBuffer;
+
+JS_PUBLIC_API void LockStoreBuffer(StoreBuffer* sb);
+JS_PUBLIC_API void UnlockStoreBuffer(StoreBuffer* sb);
+
+class AutoLockStoreBuffer {
+  StoreBuffer* sb;
+
+ public:
+  explicit AutoLockStoreBuffer(StoreBuffer* sb) : sb(sb) {
+    LockStoreBuffer(sb);
+  }
+  ~AutoLockStoreBuffer() { UnlockStoreBuffer(sb); }
+};
+
+}  // namespace gc
+}  // namespace js
 
 namespace JS {
 namespace detail {
@@ -32,10 +60,14 @@ class WeakCacheBase : public mozilla::LinkedListElement<WeakCacheBase> {
   WeakCacheBase(WeakCacheBase&& other) = default;
   virtual ~WeakCacheBase() = default;
 
-  virtual size_t sweep() = 0;
-  virtual bool needsSweep() = 0;
+  virtual size_t traceWeak(JSTracer* trc, js::gc::StoreBuffer* sbToLock) = 0;
 
-  virtual bool setNeedsIncrementalBarrier(bool needs) {
+  // Sweeping will be skipped if the cache is empty already.
+  virtual bool empty() = 0;
+
+  // Enable/disable read barrier during incremental sweeping and set the tracer
+  // to use.
+  virtual bool setIncrementalBarrierTracer(JSTracer* trc) {
     // Derived classes do not support incremental barriers by default.
     return false;
   }
@@ -68,12 +100,20 @@ class WeakCache : protected detail::WeakCacheBase,
   const T& get() const { return cache; }
   T& get() { return cache; }
 
-  size_t sweep() override {
-    GCPolicy<T>::sweep(&cache);
+  size_t traceWeak(JSTracer* trc, js::gc::StoreBuffer* sbToLock) override {
+    // Take the store buffer lock in case sweeping triggers any generational
+    // post barriers. This is not always required and WeakCache specializations
+    // may delay or skip taking the lock as appropriate.
+    mozilla::Maybe<js::gc::AutoLockStoreBuffer> lock;
+    if (sbToLock) {
+      lock.emplace(sbToLock);
+    }
+
+    GCPolicy<T>::traceWeak(trc, &cache);
     return 0;
   }
 
-  bool needsSweep() override { return cache.needsSweep(); }
+  bool empty() override { return cache.empty(); }
 } JS_HAZ_NON_GC_POINTER;
 
 }  // namespace JS

@@ -9,11 +9,16 @@
 #include "jit/LIR.h"
 #include "jit/Lowering.h"
 #include "jit/MIR.h"
+#include "jit/ScalarTypeUtils.h"
 
 #include "vm/SymbolType.h"
 
 using namespace js;
 using namespace jit;
+
+using mozilla::Maybe;
+using mozilla::Nothing;
+using mozilla::Some;
 
 bool LIRGeneratorShared::ShouldReorderCommutative(MDefinition* lhs,
                                                   MDefinition* rhs,
@@ -138,9 +143,22 @@ bool LRecoverInfo::OperandIter::canOptimizeOutIfUnused() {
 }
 #endif
 
+LAllocation LIRGeneratorShared::useRegisterOrIndexConstant(
+    MDefinition* mir, Scalar::Type type, int32_t offsetAdjustment) {
+  if (CanUseInt32Constant(mir)) {
+    MConstant* cst = mir->toConstant();
+    int32_t val =
+        cst->type() == MIRType::Int32 ? cst->toInt32() : cst->toIntPtr();
+    int32_t offset;
+    if (ArrayOffsetFitsInInt32(val, type, offsetAdjustment, &offset)) {
+      return LAllocation(mir->toConstant());
+    }
+  }
+  return useRegister(mir);
+}
+
 #ifdef JS_NUNBOX32
-LSnapshot* LIRGeneratorShared::buildSnapshot(LInstruction* ins,
-                                             MResumePoint* rp,
+LSnapshot* LIRGeneratorShared::buildSnapshot(MResumePoint* rp,
                                              BailoutKind kind) {
   LRecoverInfo* recoverInfo = getRecoverInfo(rp);
   if (!recoverInfo) {
@@ -201,8 +219,7 @@ LSnapshot* LIRGeneratorShared::buildSnapshot(LInstruction* ins,
 
 #elif JS_PUNBOX64
 
-LSnapshot* LIRGeneratorShared::buildSnapshot(LInstruction* ins,
-                                             MResumePoint* rp,
+LSnapshot* LIRGeneratorShared::buildSnapshot(MResumePoint* rp,
                                              BailoutKind kind) {
   LRecoverInfo* recoverInfo = getRecoverInfo(rp);
   if (!recoverInfo) {
@@ -255,8 +272,9 @@ void LIRGeneratorShared::assignSnapshot(LInstruction* ins, BailoutKind kind) {
   // assignSnapshot must be called before define/add, since
   // it may add new instructions for emitted-at-use operands.
   MOZ_ASSERT(ins->id() == 0);
+  MOZ_ASSERT(kind != BailoutKind::Unknown);
 
-  LSnapshot* snapshot = buildSnapshot(ins, lastResumePoint_, kind);
+  LSnapshot* snapshot = buildSnapshot(lastResumePoint_, kind);
   if (!snapshot) {
     abort(AbortReason::Alloc, "buildSnapshot failed");
     return;
@@ -274,7 +292,7 @@ void LIRGeneratorShared::assignSafepoint(LInstruction* ins, MInstruction* mir,
 
   MResumePoint* mrp =
       mir->resumePoint() ? mir->resumePoint() : lastResumePoint_;
-  LSnapshot* postSnapshot = buildSnapshot(ins, mrp, kind);
+  LSnapshot* postSnapshot = buildSnapshot(mrp, kind);
   if (!postSnapshot) {
     abort(AbortReason::Alloc, "buildSnapshot failed");
     return;
@@ -288,8 +306,7 @@ void LIRGeneratorShared::assignSafepoint(LInstruction* ins, MInstruction* mir,
   }
 }
 
-void LIRGeneratorShared::assignWasmSafepoint(LInstruction* ins,
-                                             MInstruction* mir) {
+void LIRGeneratorShared::assignWasmSafepoint(LInstruction* ins) {
   MOZ_ASSERT(!osiPoint_);
   MOZ_ASSERT(!ins->safepoint());
 
@@ -300,39 +317,3 @@ void LIRGeneratorShared::assignWasmSafepoint(LInstruction* ins,
     return;
   }
 }
-
-#ifndef ENABLE_WASM_SIMD
-
-void LIRGenerator::visitWasmBitselectSimd128(MWasmBitselectSimd128*) {
-  MOZ_CRASH("SIMD not enabled");
-}
-
-void LIRGenerator::visitWasmBinarySimd128(MWasmBinarySimd128*) {
-  MOZ_CRASH("SIMD not enabled");
-}
-
-void LIRGenerator::visitWasmShiftSimd128(MWasmShiftSimd128*) {
-  MOZ_CRASH("SIMD not enabled");
-}
-
-void LIRGenerator::visitWasmShuffleSimd128(MWasmShuffleSimd128*) {
-  MOZ_CRASH("SIMD not enabled");
-}
-
-void LIRGenerator::visitWasmReplaceLaneSimd128(MWasmReplaceLaneSimd128*) {
-  MOZ_CRASH("SIMD not enabled");
-}
-
-void LIRGenerator::visitWasmScalarToSimd128(MWasmScalarToSimd128*) {
-  MOZ_CRASH("SIMD not enabled");
-}
-
-void LIRGenerator::visitWasmUnarySimd128(MWasmUnarySimd128*) {
-  MOZ_CRASH("SIMD not enabled");
-}
-
-void LIRGenerator::visitWasmReduceSimd128(MWasmReduceSimd128*) {
-  MOZ_CRASH("SIMD not enabled");
-}
-
-#endif  // !ENABLE_WASM_SIMD

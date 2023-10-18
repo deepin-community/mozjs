@@ -6,29 +6,26 @@
 
 #include "vm/TraceLogging.h"
 
-#include "mozilla/EndianUtils.h"
 #include "mozilla/MemoryReporting.h"
-#include "mozilla/ScopeExit.h"
 
 #include <algorithm>
 #include <string.h>
 #include <utility>
 
 #include "jit/BaselineJIT.h"
-#include "jit/CompileWrappers.h"
 #include "jit/JitSpewer.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
 #include "js/Printf.h"
 #include "js/TraceLoggerAPI.h"
 #include "threading/LockGuard.h"
+#include "util/GetPidProvider.h"  // getpid()
 #include "util/Text.h"
 #include "vm/Activation.h"  // js::ActivationIterator
 #include "vm/FrameIter.h"   // js::JitFrameIter
+#include "vm/JSContext.h"
 #include "vm/JSScript.h"
 #include "vm/Runtime.h"
-#include "vm/Time.h"
 #include "vm/TraceLoggingGraph.h"
-
-#include "jit/JitFrames-inl.h"
 
 using namespace js;
 
@@ -79,8 +76,10 @@ void js::DestroyTraceLoggerThreadState() {
 }
 
 #ifdef DEBUG
-bool js::CurrentThreadOwnsTraceLoggerThreadStateLock() {
-  return traceLoggerState && traceLoggerState->lock.ownedByCurrentThread();
+void js::AssertCurrentThreadOwnsTraceLoggerThreadStateLock() {
+  if (traceLoggerState) {
+    traceLoggerState->lock.assertOwnedByCurrentThread();
+  }
 }
 #endif
 
@@ -120,7 +119,7 @@ void TraceLoggerThread::initGraph() {
   MOZ_ASSERT(traceLoggerState);
   bool graphFile = traceLoggerState->isGraphFileEnabled();
   double delta =
-      traceLoggerState->getTimeStampOffset(mozilla::TimeStamp::NowUnfuzzed());
+      traceLoggerState->getTimeStampOffset(mozilla::TimeStamp::Now());
   uint64_t start = static_cast<uint64_t>(delta);
   if (!graph_->init(start, graphFile)) {
     graph_ = nullptr;
@@ -221,7 +220,6 @@ void TraceLoggerThreadState::enableIonLogging() {
   enabledTextIds[TraceLogger_RegisterAllocation] = true;
   enabledTextIds[TraceLogger_GenerateCode] = true;
   enabledTextIds[TraceLogger_Scripts] = true;
-  enabledTextIds[TraceLogger_IonBuilderRestartLoop] = true;
 }
 
 void TraceLoggerThreadState::enableFrontendLogging() {
@@ -973,7 +971,7 @@ void TraceLoggerThread::log(uint32_t id) {
   // we record the time it took to make more space. To log this information
   // we need 2 extra free entries.
   if (!events_.hasSpaceForAdd(3)) {
-    mozilla::TimeStamp start = mozilla::TimeStamp::NowUnfuzzed();
+    mozilla::TimeStamp start = mozilla::TimeStamp::Now();
 
     if (!events_.ensureSpaceBeforeAdd(3)) {
       if (graph_.get()) {
@@ -1003,12 +1001,12 @@ void TraceLoggerThread::log(uint32_t id) {
       entryStart.textId = TraceLogger_Internal;
 
       EventEntry& entryStop = events_.pushUninitialized();
-      entryStop.time = mozilla::TimeStamp::NowUnfuzzed();
+      entryStop.time = mozilla::TimeStamp::Now();
       entryStop.textId = TraceLogger_Stop;
     }
   }
 
-  mozilla::TimeStamp time = mozilla::TimeStamp::NowUnfuzzed();
+  mozilla::TimeStamp time = mozilla::TimeStamp::Now();
 
   EventEntry& entry = events_.pushUninitialized();
   entry.time = time;
@@ -1154,7 +1152,7 @@ bool TraceLoggerThreadState::init() {
           "                 EdgeCaseAnalysis, EliminateRedundantChecks,\n"
           "                 AddKeepAliveInstructions, GenerateLIR, "
           "RegisterAllocation,\n"
-          "                 GenerateCode, Scripts, IonBuilderRestartLoop\n"
+          "                 GenerateCode, Scripts\n"
           "\n"
           "  VMSpecific     Output the specific name of the VM call\n"
           "\n"
@@ -1258,7 +1256,7 @@ bool TraceLoggerThreadState::init() {
     spewErrors = false;
   }
 
-  startTime = mozilla::TimeStamp::NowUnfuzzed();
+  startTime = mozilla::TimeStamp::Now();
 
 #ifdef DEBUG
   initialized = true;
@@ -1274,7 +1272,7 @@ void TraceLoggerThreadState::enableTextId(JSContext* cx, uint32_t textId) {
     return;
   }
 
-  ReleaseAllJITCode(cx->runtime()->defaultFreeOp());
+  ReleaseAllJITCode(cx->gcContext());
 
   enabledTextIds[textId] = true;
   if (textId == TraceLogger_Engine) {
@@ -1297,7 +1295,7 @@ void TraceLoggerThreadState::disableTextId(JSContext* cx, uint32_t textId) {
     return;
   }
 
-  ReleaseAllJITCode(cx->runtime()->defaultFreeOp());
+  ReleaseAllJITCode(cx->gcContext());
 
   enabledTextIds[textId] = false;
   if (textId == TraceLogger_Engine) {
@@ -1354,7 +1352,7 @@ TraceLoggerThread* TraceLoggerThreadState::forCurrentThread(
       logger->initGraph();
     }
 
-    if (CurrentHelperThread() ? helperThreadEnabled : mainThreadEnabled) {
+    if (cx->isHelperThreadContext() ? helperThreadEnabled : mainThreadEnabled) {
       logger->enable();
     }
   }
@@ -1682,8 +1680,6 @@ bool TraceLoggerThread::sortTraceLoggerStats(ScriptMap& map,
 //                  encountered that matches a script event on the top of
 //                  eventStack.
 bool TraceLoggerThread::collectTraceLoggerStats(ScriptMap& map) {
-  uint32_t totalJSTime = 0;
-
   struct eventInfo {
     uint32_t textId;
     uint32_t time;
@@ -1733,7 +1729,6 @@ bool TraceLoggerThread::collectTraceLoggerStats(ScriptMap& map) {
             }
           }
         }
-        totalJSTime += deltaTime;
       }
 
       if (TLTextIdIsScriptEvent(textId)) {
@@ -1780,7 +1775,6 @@ bool TraceLoggerThread::collectTraceLoggerStats(ScriptMap& map) {
           funcStack.popBack();
         }
 
-        totalJSTime += deltaTime;
         startTime = events_[i].time;
       }
     }

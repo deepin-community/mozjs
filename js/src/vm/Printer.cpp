@@ -17,7 +17,7 @@
 #include "js/CharacterEncoding.h"
 #include "util/Memory.h"
 #include "util/Text.h"
-#include "util/Windows.h"
+#include "util/WindowsWrapper.h"
 #include "vm/JSContext.h"
 
 using mozilla::PodCopy;
@@ -209,7 +209,7 @@ bool Sprinter::putString(JSString* s) {
   }
 
   mozilla::DebugOnly<size_t> written =
-      JS::DeflateStringToUTF8Buffer(linear, mozilla::MakeSpan(buffer, length));
+      JS::DeflateStringToUTF8Buffer(linear, mozilla::Span(buffer, length));
   MOZ_ASSERT(written == length);
 
   buffer[length] = '\0';

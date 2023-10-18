@@ -7,6 +7,8 @@
 
 #include "jsapi.h"
 #include "jsfriendapi.h"
+#include "js/experimental/TypedData.h"  // JS_GetArrayBufferViewData, JS_IsUint8Array
+#include "js/PropertyAndElement.h"  // JS_GetProperty, JS_HasProperty, JS_SetProperty
 #include "js/Stream.h"
 #include "jsapi-tests/tests.h"
 
@@ -39,7 +41,7 @@ struct StubExternalUnderlyingSource
   }
 
   void writeIntoReadRequestBuffer(JSContext* cx, HandleObject stream,
-                                  void* buffer, size_t length,
+                                  JS::HandleObject chunk, size_t length,
                                   size_t* bytesWritten) override {
     js::AssertSameCompartment(cx, stream);
     MOZ_RELEASE_ASSERT(!writeIntoRequestBufferCBCalled, "Invalid test setup");
@@ -49,6 +51,13 @@ struct StubExternalUnderlyingSource
     MOZ_RELEASE_ASSERT(StubExternalUnderlyingSource::instance.buffer ==
                        testBufferData);
     MOZ_RELEASE_ASSERT(length <= sizeof(testBufferData));
+
+    JS::AutoCheckCannotGC noGC;
+    bool isSharedMemory;
+
+    void* buffer = JS_GetArrayBufferViewData(chunk, &isSharedMemory, noGC);
+    MOZ_ASSERT(!isSharedMemory);
+
     memcpy(buffer, testBufferData, length);
     *bytesWritten = length;
   }

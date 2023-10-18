@@ -7,12 +7,13 @@
 #ifndef jit_none_SharedICRegisters_none_h
 #define jit_none_SharedICRegisters_none_h
 
-#include "jit/MacroAssembler.h"
+#include "jit/none/MacroAssembler-none.h"
+#include "jit/Registers.h"
+#include "jit/RegisterSets.h"
 
 namespace js {
 namespace jit {
 
-static constexpr Register BaselineFrameReg{Registers::invalid_reg};
 static constexpr Register BaselineStackReg{Registers::invalid_reg};
 
 static constexpr ValueOperand R0 = JSReturnOperand;
@@ -22,11 +23,10 @@ static constexpr ValueOperand R2 = JSReturnOperand;
 static constexpr Register ICTailCallReg{Registers::invalid_reg};
 static constexpr Register ICStubReg{Registers::invalid_reg};
 
-static constexpr Register ExtractTemp0{Registers::invalid_reg};
-static constexpr Register ExtractTemp1{Registers::invalid_reg};
-
 static constexpr FloatRegister FloatReg0 = {FloatRegisters::invalid_reg};
 static constexpr FloatRegister FloatReg1 = {FloatRegisters::invalid_reg};
+static constexpr FloatRegister FloatReg2 = {FloatRegisters::invalid_reg};
+static constexpr FloatRegister FloatReg3 = {FloatRegisters::invalid_reg};
 
 }  // namespace jit
 }  // namespace js

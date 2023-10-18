@@ -8,8 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use super::{Guid, Payload, ServerTimestamp};
 
-/// A bridged Sync engine implements all the methods needed to support
-/// Desktop Sync.
+/// A BridgedEngine acts as a bridge between application-services, rust
+/// implemented sync engines and sync engines as defined by Desktop Firefox.
+///
+/// [Desktop Firefox has an abstract implementation of a Sync
+/// Engine](https://searchfox.org/mozilla-central/source/services/sync/modules/engines.js)
+/// with a number of functions each engine is expected to override. Engines
+/// implemented in Rust use a different shape (specifically, the
+/// [SyncEngine](crate::SyncEngine) trait), so this BridgedEngine trait adapts
+/// between the 2.
 pub trait BridgedEngine {
     /// The type returned for errors.
     type Error;
@@ -110,6 +117,11 @@ impl From<Vec<OutgoingEnvelope>> for ApplyResults {
 /// Envelopes are a halfway point between BSOs, the format used for all items on
 /// the Sync server, and records, which are specific to each engine.
 ///
+/// Specifically, the "envelope" has all the metadata plus the JSON payload
+/// as clear-text - the analogy is that it's got all the info needed to get the
+/// data from the server to the engine without knowing what the contents holds,
+/// and without the engine needing to know how to decrypt.
+///
 /// A BSO is a JSON object with metadata fields (`id`, `modifed`, `sortindex`),
 /// and a BSO payload that is itself a JSON string. For encrypted records, the
 /// BSO payload has a ciphertext, which must be decrypted to yield a cleartext.
@@ -125,6 +137,8 @@ pub struct IncomingEnvelope {
     pub modified: ServerTimestamp,
     #[serde(default)]
     pub sortindex: Option<i32>,
+    #[serde(default)]
+    pub ttl: Option<u32>,
     // Don't provide access to the cleartext directly. We want all callers to
     // use `IncomingEnvelope::payload`, so that we can validate the cleartext.
     cleartext: String,
@@ -142,25 +156,35 @@ impl IncomingEnvelope {
                 payload: payload.id,
             });
         }
-        Ok(payload)
+        // Remove auto field data from payload and replace with real data
+        Ok(payload
+            .with_auto_field("ttl", self.ttl)
+            .with_auto_field("sortindex", self.sortindex))
     }
 }
 
 /// An envelope for an outgoing item, returned from `BridgedEngine::apply`. This
-/// is similar to `IncomingEnvelope`, but omits fields that are only set by the
-/// server, like `modified`.
+/// is conceptually identical to [IncomingEnvelope], but omits fields that are
+/// only set by the server, like `modified`.
 #[derive(Clone, Debug, Serialize)]
 pub struct OutgoingEnvelope {
     id: Guid,
     cleartext: String,
+    sortindex: Option<i32>,
+    ttl: Option<u32>,
 }
 
 impl From<Payload> for OutgoingEnvelope {
-    fn from(payload: Payload) -> Self {
+    fn from(mut payload: Payload) -> Self {
         let id = payload.id.clone();
+        // Remove auto field data from OutgoingEnvelope payload
+        let ttl = payload.take_auto_field("ttl");
+        let sortindex = payload.take_auto_field("sortindex");
         OutgoingEnvelope {
             id,
             cleartext: payload.into_json_string(),
+            sortindex,
+            ttl,
         }
     }
 }

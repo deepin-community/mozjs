@@ -6,17 +6,19 @@
 
 #include "jit/Bailouts.h"
 
+#include "mozilla/ArrayUtils.h"
 #include "mozilla/ScopeExit.h"
 
 #include "jit/BaselineJIT.h"
-#include "jit/Ion.h"
-#include "jit/JitRealm.h"
+#include "jit/JitFrames.h"
+#include "jit/JitRuntime.h"
 #include "jit/JitSpewer.h"
-#include "jit/Snapshots.h"
+#include "jit/JSJitFrameIter.h"
+#include "jit/SafepointIndex.h"
 #include "vm/JSContext.h"
+#include "vm/Stack.h"
 #include "vm/TraceLogging.h"
 
-#include "jit/JSJitFrameIter-inl.h"
 #include "vm/Probes-inl.h"
 #include "vm/Stack-inl.h"
 
@@ -63,8 +65,7 @@ bool jit::Bailout(BailoutStack* sp, BaselineBailoutInfo** bailoutInfo) {
 
   *bailoutInfo = nullptr;
   bool success = BailoutIonToBaseline(cx, bailoutData.activation(), frame,
-                                      false, bailoutInfo,
-                                      /* excInfo = */ nullptr);
+                                      bailoutInfo, /*exceptionInfo=*/nullptr);
   MOZ_ASSERT_IF(success, *bailoutInfo != nullptr);
 
   if (!success) {
@@ -83,8 +84,7 @@ bool jit::Bailout(BailoutStack* sp, BaselineBailoutInfo** bailoutInfo) {
   // increment the reference counter for each activation that appear on the
   // stack. As the bailed frame is one of them, we have to decrement it now.
   if (frame.ionScript()->invalidated()) {
-    frame.ionScript()->decrementInvalidationCount(
-        cx->runtime()->defaultFreeOp());
+    frame.ionScript()->decrementInvalidationCount(cx->gcContext());
   }
 
   // NB: Commentary on how |lastProfilingFrame| is set from bailouts.
@@ -139,12 +139,15 @@ bool jit::InvalidationBailout(InvalidationBailoutStack* sp,
   MOZ_ASSERT(IsBaselineJitEnabled(cx));
 
   *bailoutInfo = nullptr;
-  bool success = BailoutIonToBaseline(cx, bailoutData.activation(), frame, true,
-                                      bailoutInfo,
-                                      /* excInfo = */ nullptr);
+  bool success = BailoutIonToBaseline(cx, bailoutData.activation(), frame,
+                                      bailoutInfo, /*exceptionInfo=*/nullptr);
   MOZ_ASSERT_IF(success, *bailoutInfo != nullptr);
 
-  if (!success) {
+  if (success) {
+    // Update the bailout kind.
+    (*bailoutInfo)->bailoutKind =
+        mozilla::Some(BailoutKind::OnStackInvalidation);
+  } else {
     MOZ_ASSERT(cx->isExceptionPending());
 
     // If the bailout failed, then bailout trampoline will pop the
@@ -173,7 +176,7 @@ bool jit::InvalidationBailout(InvalidationBailoutStack* sp,
 #endif
   }
 
-  frame.ionScript()->decrementInvalidationCount(cx->runtime()->defaultFreeOp());
+  frame.ionScript()->decrementInvalidationCount(cx->gcContext());
 
   // Make the frame being bailed out the top profiled frame.
   if (cx->runtime()->jitRuntime()->isProfilerInstrumentationEnabled(
@@ -200,11 +203,16 @@ bool jit::ExceptionHandlerBailout(JSContext* cx,
                                   const InlineFrameIterator& frame,
                                   ResumeFromException* rfe,
                                   const ExceptionBailoutInfo& excInfo) {
-  // We can be propagating debug mode exceptions without there being an
+  // If we are resuming in a finally block, the exception has already
+  // been captured.
+  // We can also be propagating debug mode exceptions without there being an
   // actual exception pending. For instance, when we return false from an
   // operation callback like a timeout handler.
-  MOZ_ASSERT_IF(!excInfo.propagatingIonExceptionForDebugMode(),
-                cx->isExceptionPending());
+  MOZ_ASSERT_IF(
+      !cx->isExceptionPending(),
+      excInfo.isFinally() || excInfo.propagatingIonExceptionForDebugMode());
+
+  JS::AutoSaveExceptionState savedExc(cx);
 
   JitActivation* act = cx->activation()->asJit();
   uint8_t* prevExitFP = act->jsExitFP();
@@ -221,20 +229,26 @@ bool jit::ExceptionHandlerBailout(JSContext* cx,
 
   BaselineBailoutInfo* bailoutInfo = nullptr;
   bool success = BailoutIonToBaseline(cx, bailoutData.activation(), frameView,
-                                      true, &bailoutInfo, &excInfo);
+                                      &bailoutInfo, &excInfo);
   if (success) {
     MOZ_ASSERT(bailoutInfo);
 
     // Overwrite the kind so HandleException after the bailout returns
     // false, jumping directly to the exception tail.
     if (excInfo.propagatingIonExceptionForDebugMode()) {
-      bailoutInfo->bailoutKind = mozilla::Some(Bailout_IonExceptionDebugMode);
+      bailoutInfo->bailoutKind =
+          mozilla::Some(BailoutKind::IonExceptionDebugMode);
+    } else if (excInfo.isFinally()) {
+      bailoutInfo->bailoutKind = mozilla::Some(BailoutKind::Finally);
     }
 
-    rfe->kind = ResumeFromException::RESUME_BAILOUT;
+    rfe->kind = ExceptionResumeKind::Bailout;
     rfe->target = cx->runtime()->jitRuntime()->getBailoutTail().value;
     rfe->bailoutInfo = bailoutInfo;
   } else {
+    // Drop the exception that triggered the bailout and instead propagate the
+    // failure caused by processing the bailout (eg. OOM).
+    savedExc.drop();
     MOZ_ASSERT(!bailoutInfo);
     MOZ_ASSERT(cx->isExceptionPending());
   }
@@ -248,51 +262,20 @@ bool jit::ExceptionHandlerBailout(JSContext* cx,
   return success;
 }
 
-// Initialize the decl env Object, call object, and any arguments obj of the
-// current frame.
+// Initialize the NamedLambdaObject and CallObject of the current frame if
+// needed.
 bool jit::EnsureHasEnvironmentObjects(JSContext* cx, AbstractFramePtr fp) {
   // Ion does not compile eval scripts.
   MOZ_ASSERT(!fp.isEvalFrame());
 
-  if (fp.isFunctionFrame()) {
-    // Ion does not handle extra var environments due to parameter
-    // expressions yet.
-    MOZ_ASSERT(!fp.callee()->needsExtraBodyVarEnvironment());
-
-    if (!fp.hasInitialEnvironment() &&
-        fp.callee()->needsFunctionEnvironmentObjects()) {
-      if (!fp.initFunctionEnvironmentObjects(cx)) {
-        return false;
-      }
+  if (fp.isFunctionFrame() && !fp.hasInitialEnvironment() &&
+      fp.callee()->needsFunctionEnvironmentObjects()) {
+    if (!fp.initFunctionEnvironmentObjects(cx)) {
+      return false;
     }
   }
 
   return true;
-}
-
-void jit::CheckFrequentBailouts(JSContext* cx, JSScript* script,
-                                BailoutKind bailoutKind) {
-  if (script->hasIonScript()) {
-    // Invalidate if this script keeps bailing out without invalidation. Next
-    // time we compile this script LICM will be disabled.
-    IonScript* ionScript = script->ionScript();
-
-    if (ionScript->bailoutExpected()) {
-      // If we bailout because of the first execution of a basic block,
-      // then we should record which basic block we are returning in,
-      // which should prevent this from happening again.  Also note that
-      // the first execution bailout can be related to an inlined script,
-      // so there is no need to penalize the caller.
-      if (bailoutKind != Bailout_FirstExecution &&
-          !script->hadFrequentBailouts()) {
-        script->setHadFrequentBailouts();
-      }
-
-      JitSpew(JitSpew_IonInvalidate, "Invalidating due to too many bailouts");
-
-      Invalidate(cx, script);
-    }
-  }
 }
 
 void BailoutFrameInfo::attachOnJitActivation(

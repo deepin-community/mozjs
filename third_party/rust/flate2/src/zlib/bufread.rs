@@ -2,18 +2,13 @@ use std::io;
 use std::io::prelude::*;
 use std::mem;
 
-#[cfg(feature = "tokio")]
-use futures::Poll;
-#[cfg(feature = "tokio")]
-use tokio_io::{AsyncRead, AsyncWrite};
-
 use crate::zio;
 use crate::{Compress, Decompress};
 
 /// A ZLIB encoder, or compressor.
 ///
-/// This structure implements a [`BufRead`] interface and will read uncompressed
-/// data from an underlying stream and emit a stream of compressed data.
+/// This structure consumes a [`BufRead`] interface, reading uncompressed data
+/// from the underlying reader, and emitting compressed data.
 ///
 /// [`BufRead`]: https://doc.rust-lang.org/std/io/trait.BufRead.html
 ///
@@ -112,9 +107,6 @@ impl<R: BufRead> Read for ZlibEncoder<R> {
     }
 }
 
-#[cfg(feature = "tokio")]
-impl<R: AsyncRead + BufRead> AsyncRead for ZlibEncoder<R> {}
-
 impl<R: BufRead + Write> Write for ZlibEncoder<R> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.get_mut().write(buf)
@@ -125,17 +117,10 @@ impl<R: BufRead + Write> Write for ZlibEncoder<R> {
     }
 }
 
-#[cfg(feature = "tokio")]
-impl<R: AsyncWrite + BufRead> AsyncWrite for ZlibEncoder<R> {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        self.get_mut().shutdown()
-    }
-}
-
 /// A ZLIB decoder, or decompressor.
 ///
-/// This structure implements a [`BufRead`] interface and takes a stream of
-/// compressed data as input, providing the decompressed data when read from.
+/// This structure consumes a [`BufRead`] interface, reading compressed data
+/// from the underlying reader, and emitting uncompressed data.
 ///
 /// [`BufRead`]: https://doc.rust-lang.org/std/io/trait.BufRead.html
 ///
@@ -237,9 +222,6 @@ impl<R: BufRead> Read for ZlibDecoder<R> {
     }
 }
 
-#[cfg(feature = "tokio")]
-impl<R: AsyncRead + BufRead> AsyncRead for ZlibDecoder<R> {}
-
 impl<R: BufRead + Write> Write for ZlibDecoder<R> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.get_mut().write(buf)
@@ -247,12 +229,5 @@ impl<R: BufRead + Write> Write for ZlibDecoder<R> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.get_mut().flush()
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl<R: AsyncWrite + BufRead> AsyncWrite for ZlibDecoder<R> {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        self.get_mut().shutdown()
     }
 }

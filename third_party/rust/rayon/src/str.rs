@@ -6,16 +6,17 @@
 //! Note: [`ParallelString::par_split()`] and [`par_split_terminator()`]
 //! reference a `Pattern` trait which is not visible outside this crate.
 //! This trait is intentionally kept private, for use only by Rayon itself.
-//! It is implemented for `char` and any `F: Fn(char) -> bool + Sync + Send`.
+//! It is implemented for `char`, `&[char]`, and any function or closure
+//! `F: Fn(char) -> bool + Sync + Send`.
 //!
 //! [`ParallelString::par_split()`]: trait.ParallelString.html#method.par_split
 //! [`par_split_terminator()`]: trait.ParallelString.html#method.par_split_terminator
 //!
 //! [std::str]: https://doc.rust-lang.org/stable/std/str/
 
-use iter::plumbing::*;
-use iter::*;
-use split_producer::*;
+use crate::iter::plumbing::*;
+use crate::iter::*;
+use crate::split_producer::*;
 
 /// Test if a byte is the start of a UTF-8 character.
 /// (extracted from `str::is_char_boundary`)
@@ -34,11 +35,11 @@ fn find_char_midpoint(chars: &str) -> usize {
     // character boundary.  So we look at the raw bytes, first scanning
     // forward from the midpoint for a boundary, then trying backward.
     let (left, right) = chars.as_bytes().split_at(mid);
-    match right.iter().cloned().position(is_char_boundary) {
+    match right.iter().copied().position(is_char_boundary) {
         Some(i) => mid + i,
         None => left
             .iter()
-            .cloned()
+            .copied()
             .rposition(is_char_boundary)
             .unwrap_or(0),
     }
@@ -96,7 +97,7 @@ pub trait ParallelString {
     /// Note that multi-byte sequences (for code points greater than `U+007F`)
     /// are produced as separate items, but will not be split across threads.
     /// If you would prefer an indexed iterator without that guarantee, consider
-    /// `string.as_bytes().par_iter().cloned()` instead.
+    /// `string.as_bytes().par_iter().copied()` instead.
     ///
     /// # Examples
     ///
@@ -139,7 +140,8 @@ pub trait ParallelString {
     /// given character or predicate, similar to `str::split`.
     ///
     /// Note: the `Pattern` trait is private, for use only by Rayon itself.
-    /// It is implemented for `char` and any `F: Fn(char) -> bool + Sync + Send`.
+    /// It is implemented for `char`, `&[char]`, and any function or closure
+    /// `F: Fn(char) -> bool + Sync + Send`.
     ///
     /// # Examples
     ///
@@ -161,7 +163,8 @@ pub trait ParallelString {
     /// substring after a trailing terminator.
     ///
     /// Note: the `Pattern` trait is private, for use only by Rayon itself.
-    /// It is implemented for `char` and any `F: Fn(char) -> bool + Sync + Send`.
+    /// It is implemented for `char`, `&[char]`, and any function or closure
+    /// `F: Fn(char) -> bool + Sync + Send`.
     ///
     /// # Examples
     ///
@@ -218,7 +221,8 @@ pub trait ParallelString {
     /// given character or predicate, similar to `str::matches`.
     ///
     /// Note: the `Pattern` trait is private, for use only by Rayon itself.
-    /// It is implemented for `char` and any `F: Fn(char) -> bool + Sync + Send`.
+    /// It is implemented for `char`, `&[char]`, and any function or closure
+    /// `F: Fn(char) -> bool + Sync + Send`.
     ///
     /// # Examples
     ///
@@ -241,7 +245,8 @@ pub trait ParallelString {
     /// or predicate, with their positions, similar to `str::match_indices`.
     ///
     /// Note: the `Pattern` trait is private, for use only by Rayon itself.
-    /// It is implemented for `char` and any `F: Fn(char) -> bool + Sync + Send`.
+    /// It is implemented for `char`, `&[char]`, and any function or closure
+    /// `F: Fn(char) -> bool + Sync + Send`.
     ///
     /// # Examples
     ///
@@ -274,7 +279,7 @@ impl ParallelString for str {
 /// would be nicer to have its basic existence and implementors public while
 /// keeping all of the methods private.
 mod private {
-    use iter::plumbing::Folder;
+    use crate::iter::plumbing::Folder;
 
     /// Pattern-matching trait for `ParallelString`, somewhat like a mix of
     /// `std::str::pattern::{Pattern, Searcher}`.
@@ -303,89 +308,62 @@ fn offset<T>(base: usize) -> impl Fn((usize, T)) -> (usize, T) {
     move |(i, x)| (base + i, x)
 }
 
-impl Pattern for char {
-    private_impl! {}
+macro_rules! impl_pattern {
+    (&$self:ident => $pattern:expr) => {
+        private_impl! {}
 
-    #[inline]
-    fn find_in(&self, chars: &str) -> Option<usize> {
-        chars.find(*self)
-    }
-
-    #[inline]
-    fn rfind_in(&self, chars: &str) -> Option<usize> {
-        chars.rfind(*self)
-    }
-
-    #[inline]
-    fn is_suffix_of(&self, chars: &str) -> bool {
-        chars.ends_with(*self)
-    }
-
-    fn fold_splits<'ch, F>(&self, chars: &'ch str, folder: F, skip_last: bool) -> F
-    where
-        F: Folder<&'ch str>,
-    {
-        let mut split = chars.split(*self);
-        if skip_last {
-            split.next_back();
+        #[inline]
+        fn find_in(&$self, chars: &str) -> Option<usize> {
+            chars.find($pattern)
         }
-        folder.consume_iter(split)
-    }
 
-    fn fold_matches<'ch, F>(&self, chars: &'ch str, folder: F) -> F
-    where
-        F: Folder<&'ch str>,
-    {
-        folder.consume_iter(chars.matches(*self))
-    }
+        #[inline]
+        fn rfind_in(&$self, chars: &str) -> Option<usize> {
+            chars.rfind($pattern)
+        }
 
-    fn fold_match_indices<'ch, F>(&self, chars: &'ch str, folder: F, base: usize) -> F
-    where
-        F: Folder<(usize, &'ch str)>,
-    {
-        folder.consume_iter(chars.match_indices(*self).map(offset(base)))
+        #[inline]
+        fn is_suffix_of(&$self, chars: &str) -> bool {
+            chars.ends_with($pattern)
+        }
+
+        fn fold_splits<'ch, F>(&$self, chars: &'ch str, folder: F, skip_last: bool) -> F
+        where
+            F: Folder<&'ch str>,
+        {
+            let mut split = chars.split($pattern);
+            if skip_last {
+                split.next_back();
+            }
+            folder.consume_iter(split)
+        }
+
+        fn fold_matches<'ch, F>(&$self, chars: &'ch str, folder: F) -> F
+        where
+            F: Folder<&'ch str>,
+        {
+            folder.consume_iter(chars.matches($pattern))
+        }
+
+        fn fold_match_indices<'ch, F>(&$self, chars: &'ch str, folder: F, base: usize) -> F
+        where
+            F: Folder<(usize, &'ch str)>,
+        {
+            folder.consume_iter(chars.match_indices($pattern).map(offset(base)))
+        }
     }
 }
 
+impl Pattern for char {
+    impl_pattern!(&self => *self);
+}
+
+impl Pattern for &[char] {
+    impl_pattern!(&self => *self);
+}
+
 impl<FN: Sync + Send + Fn(char) -> bool> Pattern for FN {
-    private_impl! {}
-
-    fn find_in(&self, chars: &str) -> Option<usize> {
-        chars.find(self)
-    }
-
-    fn rfind_in(&self, chars: &str) -> Option<usize> {
-        chars.rfind(self)
-    }
-
-    fn is_suffix_of(&self, chars: &str) -> bool {
-        chars.ends_with(self)
-    }
-
-    fn fold_splits<'ch, F>(&self, chars: &'ch str, folder: F, skip_last: bool) -> F
-    where
-        F: Folder<&'ch str>,
-    {
-        let mut split = chars.split(self);
-        if skip_last {
-            split.next_back();
-        }
-        folder.consume_iter(split)
-    }
-
-    fn fold_matches<'ch, F>(&self, chars: &'ch str, folder: F) -> F
-    where
-        F: Folder<&'ch str>,
-    {
-        folder.consume_iter(chars.matches(self))
-    }
-
-    fn fold_match_indices<'ch, F>(&self, chars: &'ch str, folder: F, base: usize) -> F
-    where
-        F: Folder<(usize, &'ch str)>,
-    {
-        folder.consume_iter(chars.match_indices(self).map(offset(base)))
-    }
+    impl_pattern!(&self => self);
 }
 
 // /////////////////////////////////////////////////////////////////////////
@@ -646,7 +624,7 @@ pub struct SplitTerminator<'ch, P: Pattern> {
     terminator: P,
 }
 
-struct SplitTerminatorProducer<'ch, 'sep, P: Pattern + 'sep> {
+struct SplitTerminatorProducer<'ch, 'sep, P: Pattern> {
     splitter: SplitProducer<'sep, P, &'ch str>,
     skip_last: bool,
 }
@@ -766,7 +744,7 @@ pub struct Matches<'ch, P: Pattern> {
     pattern: P,
 }
 
-struct MatchesProducer<'ch, 'pat, P: Pattern + 'pat> {
+struct MatchesProducer<'ch, 'pat, P: Pattern> {
     chars: &'ch str,
     pattern: &'pat P,
 }
@@ -822,7 +800,7 @@ pub struct MatchIndices<'ch, P: Pattern> {
     pattern: P,
 }
 
-struct MatchIndicesProducer<'ch, 'pat, P: Pattern + 'pat> {
+struct MatchIndicesProducer<'ch, 'pat, P: Pattern> {
     index: usize,
     chars: &'ch str,
     pattern: &'pat P,

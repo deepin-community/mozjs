@@ -26,12 +26,11 @@ import time
 def _wrap_stdstream(fh):
     if fh in (sys.stderr, sys.stdout):
         encoding = sys.getdefaultencoding()
-        encoding = 'utf-8' if encoding in ('ascii', 'charmap') else encoding
+        encoding = "utf-8" if encoding in ("ascii", "charmap") else encoding
         if six.PY2:
-            return codecs.getwriter(encoding)(fh, errors='replace')
+            return codecs.getwriter(encoding)(fh, errors="replace")
         else:
-            return codecs.getwriter(encoding)(fh.buffer,
-                                              errors='replace')
+            return codecs.getwriter(encoding)(fh.buffer, errors="replace")
     else:
         return fh
 
@@ -41,18 +40,19 @@ def format_seconds(total):
 
     minutes, seconds = divmod(total, 60)
 
-    return '%2d:%05.2f' % (minutes, seconds)
+    return "%2d:%05.2f" % (minutes, seconds)
 
 
 class ConvertToStructuredFilter(logging.Filter):
     """Filter that converts unstructured records into structured ones."""
+
     def filter(self, record):
-        if hasattr(record, 'action') and hasattr(record, 'params'):
+        if hasattr(record, "action") and hasattr(record, "params"):
             return True
 
-        record.action = 'unstructured'
-        record.params = {'msg': record.getMessage()}
-        record.msg = '{msg}'
+        record.action = "unstructured"
+        record.params = {"msg": record.getMessage()}
+        record.msg = "{msg}"
 
         return True
 
@@ -61,8 +61,8 @@ class StructuredJSONFormatter(logging.Formatter):
     """Log formatter that writes a structured JSON entry."""
 
     def format(self, record):
-        action = getattr(record, 'action', 'UNKNOWN')
-        params = getattr(record, 'params', {})
+        action = getattr(record, "action", "UNKNOWN")
+        params = getattr(record, "params", {})
 
         return json.dumps([record.created, action, params])
 
@@ -78,6 +78,7 @@ class StructuredHumanFormatter(logging.Formatter):
     Because of this limitation, format() will fail with a KeyError if an
     unstructured record is passed or if the structured message is malformed.
     """
+
     def __init__(self, start_time, write_interval=False, write_times=True):
         self.start_time = start_time
         self.write_interval = write_interval
@@ -85,14 +86,20 @@ class StructuredHumanFormatter(logging.Formatter):
         self.last_time = None
 
     def format(self, record):
-        f = record.msg.format(**record.params)
+        formatted_msg = record.msg.format(**record.params)
 
-        if not self.write_times:
-            return f
+        elapsed_time = (
+            format_seconds(self._time(record)) + " " if self.write_times else ""
+        )
 
-        elapsed = self._time(record)
+        rv = elapsed_time + formatted_msg
+        formatted_stack_trace_result = formatted_stack_trace(record, self)
 
-        return '%s %s' % (format_seconds(elapsed), f)
+        if formatted_stack_trace_result != "":
+            stack_trace = "\n" + elapsed_time + formatted_stack_trace_result
+            rv += stack_trace.replace("\n", f"\n{elapsed_time}")
+
+        return rv
 
     def _time(self, record):
         t = record.created - self.start_time
@@ -110,15 +117,22 @@ class StructuredTerminalFormatter(StructuredHumanFormatter):
 
     def set_terminal(self, terminal):
         self.terminal = terminal
-        self._sgr0 = terminal.normal if terminal and blessings else ''
+        self._sgr0 = terminal.normal if terminal and blessings else ""
 
     def format(self, record):
-        f = record.msg.format(**record.params)
+        formatted_msg = record.msg.format(**record.params)
+        elapsed_time = (
+            self.terminal.blue(format_seconds(self._time(record))) + " "
+            if self.write_times
+            else ""
+        )
 
-        if not self.write_times:
-            return f
+        rv = elapsed_time + self._colorize(formatted_msg) + self._sgr0
+        formatted_stack_trace_result = formatted_stack_trace(record, self)
 
-        t = self.terminal.blue(format_seconds(self._time(record)))
+        if formatted_stack_trace_result != "":
+            stack_trace = "\n" + elapsed_time + formatted_stack_trace_result
+            rv += stack_trace.replace("\n", f"\n{elapsed_time}")
 
         # Some processes (notably Clang) don't reset terminal attributes after
         # printing newlines. This can lead to terminal attributes getting in a
@@ -126,7 +140,7 @@ class StructuredTerminalFormatter(StructuredHumanFormatter):
         # line to reset all attributes. For programs that rely on the next line
         # inheriting the same attributes, this will prevent that from happening.
         # But that's better than "corrupting" the terminal.
-        return '%s %s%s' % (t, self._colorize(f), self._sgr0)
+        return rv + self._sgr0
 
     def _colorize(self, s):
         if not self.terminal:
@@ -134,23 +148,45 @@ class StructuredTerminalFormatter(StructuredHumanFormatter):
 
         result = s
 
-        reftest = s.startswith('REFTEST ')
+        reftest = s.startswith("REFTEST ")
         if reftest:
             s = s[8:]
 
-        if s.startswith('TEST-PASS'):
+        if s.startswith("TEST-PASS"):
             result = self.terminal.green(s[0:9]) + s[9:]
-        elif s.startswith('TEST-UNEXPECTED'):
+        elif s.startswith("TEST-UNEXPECTED"):
             result = self.terminal.red(s[0:20]) + s[20:]
-        elif s.startswith('TEST-START'):
+        elif s.startswith("TEST-START"):
             result = self.terminal.yellow(s[0:10]) + s[10:]
-        elif s.startswith('TEST-INFO'):
+        elif s.startswith("TEST-INFO"):
             result = self.terminal.yellow(s[0:9]) + s[9:]
 
         if reftest:
-            result = 'REFTEST ' + result
+            result = "REFTEST " + result
 
         return result
+
+
+def formatted_stack_trace(record, formatter):
+    """
+    Formatting behavior here intended to mimic a portion of the
+    standard library's logging.Formatter::format function
+    """
+    rv = ""
+
+    if record.exc_info:
+        # Cache the traceback text to avoid converting it multiple times
+        # (it's constant anyway)
+        if not record.exc_text:
+            record.exc_text = formatter.formatException(record.exc_info)
+    if record.exc_text:
+        rv = record.exc_text
+    if record.stack_info:
+        if rv[-1:] != "\n":
+            rv = rv + "\n"
+        rv = rv + formatter.formatStack(record.stack_info)
+
+    return rv
 
 
 class LoggingManager(object):
@@ -178,7 +214,7 @@ class LoggingManager(object):
         # complaining about "no handlers could be found for logger XXX."
         self.root_logger.addHandler(logging.NullHandler())
 
-        mach_logger = logging.getLogger('mach')
+        mach_logger = logging.getLogger("mach")
         mach_logger.setLevel(logging.DEBUG)
 
         self.structured_filter = ConvertToStructuredFilter()
@@ -193,8 +229,7 @@ class LoggingManager(object):
             # Sometimes blessings fails to set up the terminal. In that case,
             # silently fail.
             try:
-                terminal = blessings.Terminal(
-                    stream=_wrap_stdstream(sys.stdout))
+                terminal = blessings.Terminal(stream=_wrap_stdstream(sys.stdout))
 
                 if terminal.is_a_tty:
                     self._terminal = terminal
@@ -217,19 +252,20 @@ class LoggingManager(object):
 
         self.json_handlers.append(handler)
 
-    def add_terminal_logging(self, fh=sys.stdout, level=logging.INFO,
-                             write_interval=False, write_times=True):
+    def add_terminal_logging(
+        self, fh=sys.stdout, level=logging.INFO, write_interval=False, write_times=True
+    ):
         """Enable logging to the terminal."""
 
         fh = _wrap_stdstream(fh)
-        formatter = StructuredHumanFormatter(self.start_time,
-                                             write_interval=write_interval,
-                                             write_times=write_times)
+        formatter = StructuredHumanFormatter(
+            self.start_time, write_interval=write_interval, write_times=write_times
+        )
 
         if self.terminal:
-            formatter = StructuredTerminalFormatter(self.start_time,
-                                                    write_interval=write_interval,
-                                                    write_times=write_times)
+            formatter = StructuredTerminalFormatter(
+                self.start_time, write_interval=write_interval, write_times=write_times
+            )
             formatter.set_terminal(self.terminal)
 
         handler = logging.StreamHandler(stream=fh)
@@ -296,6 +332,10 @@ class LoggingManager(object):
         ``terminal`` and ``json`` determine which log handlers to operate
         on. By default, all known handlers are operated on.
         """
+
+        # Glean makes logs that we're not interested in, so we squelch them.
+        logging.getLogger("glean").setLevel(logging.CRITICAL)
+
         # Remove current handlers from all loggers so we don't double
         # register handlers.
         for logger in self.root_logger.manager.loggerDict.values():
@@ -313,5 +353,4 @@ class LoggingManager(object):
         # Wipe out existing registered structured loggers since they
         # all propagate to root logger.
         self.structured_loggers = []
-        self.register_structured_logger(self.root_logger, terminal=terminal,
-                                        json=json)
+        self.register_structured_logger(self.root_logger, terminal=terminal, json=json)

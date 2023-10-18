@@ -1,4 +1,3 @@
-// |reftest| skip-if(release_or_beta) -- AggregateError is not released yet
 // Copyright (C) 2019 Leo Balter. All rights reserved.
 // This code is governed by the BSD license found in the LICENSE file.
 
@@ -28,7 +27,7 @@ info: |
     a. Let realm be ? GetFunctionRealm(constructor).
     b. Set proto to realm's intrinsic object named intrinsicDefaultProto.
   Return proto.
-features: [AggregateError]
+features: [AggregateError, Reflect.construct]
 ---*/
 
 var custom = { x: 42 };

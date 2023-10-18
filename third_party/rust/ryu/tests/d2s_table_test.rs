@@ -19,8 +19,15 @@
 // KIND, either express or implied.
 
 #![allow(dead_code)]
-
-extern crate core;
+#![allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::unreadable_literal,
+    clippy::unseparated_literal_suffix,
+    clippy::wildcard_imports
+)]
 
 #[path = "../src/common.rs"]
 mod common;
@@ -46,7 +53,7 @@ fn test_compute_pow5() {
 
 #[test]
 fn test_compute_inv_pow5() {
-    for (i, entry) in DOUBLE_POW5_INV_SPLIT.iter().enumerate() {
+    for (i, entry) in DOUBLE_POW5_INV_SPLIT[..292].iter().enumerate() {
         assert_eq!(*entry, unsafe { compute_inv_pow5(i as u32) }, "entry {}", i);
     }
 }

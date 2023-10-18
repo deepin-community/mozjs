@@ -3,13 +3,61 @@ if (!wasmIsSupported())
 
 load(libdir + "asserts.js");
 
-function wasmEvalText(str, imports) {
+function canRunHugeMemoryTests() {
+    let conf = getBuildConfiguration();
+    // We're aiming for 64-bit desktop builds with no interesting analysis
+    // running that might inflate memory consumption unreasonably.  It's OK if
+    // they're debug builds, though.
+    //
+    // The build configuration object may be extended at any time with new
+    // properties, so neither an allowlist of properties that can be true or a
+    // blocklist of properties that can't be true is great.  But the latter is
+    // probably better.
+    let blocked = ['rooting-analysis','simulator',
+                   'android','wasi','asan','tsan','ubsan','dtrace','valgrind'];
+    for ( let b of blocked ) {
+        if (conf[b]) {
+            print("Failing canRunHugeMemoryTests() because '" + b + "' is true");
+            return false;
+        }
+    }
+    if (conf['pointer-byte-size'] != 8) {
+        print("Failing canRunHugeMemoryTests() because the build is not 64-bit");
+        return false;
+    }
+    return true;
+}
+
+// On 64-bit systems with explicit bounds checking, ion and baseline can handle
+// 65536 pages but cranelift can handle only 65534 pages; thus the presence of
+// cranelift forces the max for the system as a whole to 65534.  We will
+// probably fix this eventually.
+
+var PageSizeInBytes = 65536;
+var MaxBytesIn32BitMemory = 0;
+if (largeArrayBufferEnabled()) {
+    if (wasmCompilersPresent().indexOf("cranelift") != -1) {
+        MaxBytesIn32BitMemory = 65534*PageSizeInBytes;
+    } else {
+        MaxBytesIn32BitMemory = 65536*PageSizeInBytes;
+    }
+} else {
+    // This is an overestimate twice: first, the max byte value is divisible by
+    // the page size; second, it must be a valid bounds checking immediate.  But
+    // INT32_MAX is fine for testing.
+    MaxBytesIn32BitMemory = 0x7FFF_FFFF;
+}
+var MaxPagesIn32BitMemory = Math.floor(MaxBytesIn32BitMemory / PageSizeInBytes);
+
+// "options" is an extension to facilitate the SIMD wormhole
+
+function wasmEvalText(str, imports, options) {
     let binary = wasmTextToBinary(str);
-    let valid = WebAssembly.validate(binary);
+    let valid = WebAssembly.validate(binary, options);
 
     let m;
     try {
-        m = new WebAssembly.Module(binary);
+        m = new WebAssembly.Module(binary, options);
         assertEq(valid, true);
     } catch(e) {
         if (!e.toString().match(/out of memory/))
@@ -60,12 +108,13 @@ function wasmCompilationShouldFail(bin, compile_error_regex) {
 }
 
 function mismatchError(actual, expect) {
-    var str = `type mismatch: expression has type ${actual} but expected ${expect}`;
+    var str = `(type mismatch: expression has type ${actual} but expected ${expect})|` +
+              `(type mismatch: expected ${expect}, found ${actual}\)`;
     return RegExp(str);
 }
 
-const emptyStackError = /from empty stack/;
-const unusedValuesError = /unused values not explicitly dropped by end of block/;
+const emptyStackError = /(from empty stack)|(nothing on stack)/;
+const unusedValuesError = /(unused values not explicitly dropped by end of block)|(values remaining on stack at end of block)/;
 
 function jsify(wasmVal) {
     if (wasmVal === 'nan')
@@ -93,12 +142,26 @@ function _augmentSrc(src, assertions) {
                 case 'f32':
                     newSrc += `
          i32.reinterpret/f32
+         ${(function () {
+             if (expected == 'nan:arithmetic') {
+               expected = '0x7FC00000';
+               return '(i32.const 0x7FC00000) i32.and';
+             }
+             return '';
+         })()}
          i32.const ${expected}
          i32.eq`;
                     break;
                 case 'f64':
                     newSrc += `
          i64.reinterpret/f64
+         ${(function () {
+             if (expected == 'nan:arithmetic') {
+               expected = '0x7FF8000000000000';
+               return '(i64.const 0x7FF8000000000000) i64.and';
+             }
+             return '';
+         })()}
          i64.const ${expected}
          i64.eq`;
                     break;
@@ -111,6 +174,12 @@ function _augmentSrc(src, assertions) {
                     newSrc += `
          i64.const ${expected}
          i64.eq`;
+                    break;
+                case 'v128':
+                    newSrc += `
+         v128.const ${expected}
+         i8x16.eq
+         i8x16.all_true`;
                     break;
                 default:
                     throw new Error("unexpected usage of wasmAssert");
@@ -126,8 +195,10 @@ function _augmentSrc(src, assertions) {
     return newSrc;
 }
 
-function wasmAssert(src, assertions, maybeImports = {}) {
+function wasmAssert(src, assertions, maybeImports = {}, exportBox = null) {
     let { exports } = wasmEvalText(_augmentSrc(src, assertions), maybeImports);
+    if (exportBox !== null)
+        exportBox.exports = exports;
     for (let i = 0; i < assertions.length; i++) {
         let { func, expected, params } = assertions[i];
         let paramText = params ? params.join(', ') : '';
@@ -159,7 +230,10 @@ function wasmFullPassI64(text, expected, maybeImports, ...args) {
 
     let augmentedSrc = _augmentSrc(text, [ { type: 'i64', func: '$run', args, expected } ]);
     let augmentedBinary = wasmTextToBinary(augmentedSrc);
-    new WebAssembly.Instance(new WebAssembly.Module(augmentedBinary), maybeImports).exports.assert_0();
+
+    let module = new WebAssembly.Module(augmentedBinary);
+    let instance = new WebAssembly.Instance(module, maybeImports);
+    assertEq(instance.exports.assert_0(), 1);
 }
 
 function wasmRunWithDebugger(wast, lib, init, done) {
@@ -343,4 +417,121 @@ WasmHelpers.assertEqPreciseStacks = (observed, expectedStacks) => {
     throw new Error(`no plausible stacks found, observed: ${observed.join('/')}
 Expected one of:
 ${expectedStacks.map(stacks => stacks.join("/")).join('\n')}`);
+}
+
+function fuzzingSafe() {
+    return typeof getErrorNotes == 'undefined';
+}
+
+// Common instantiations of wasm values for dynamic type check testing
+
+let WasmFuncrefValues = [
+    wasmEvalText(`(module (func (export "")))`).exports[''],
+];
+let WasmNonNullEqrefValues = [];
+let WasmEqrefValues = [];
+if (wasmGcEnabled()) {
+    let { newStruct } = wasmEvalText(`
+      (module
+        (type $s (struct))
+        (func (export "newStruct") (result eqref)
+            rtt.canon $s
+            struct.new_with_rtt $s)
+      )`).exports;
+    WasmNonNullEqrefValues.push(newStruct());
+    WasmEqrefValues.push(null, ...WasmNonNullEqrefValues);
+}
+let WasmNonEqrefValues = [
+    undefined,
+    true,
+    false,
+    {x:1337},
+    ["abracadabra"],
+    1337,
+    13.37,
+    "hi",
+    37n,
+    new Number(42),
+    new Boolean(true),
+    Symbol("status"),
+    () => 1337,
+    ...WasmFuncrefValues,
+];
+let WasmNonNullExternrefValues = [
+    ...WasmNonEqrefValues,
+    ...WasmNonNullEqrefValues
+];
+let WasmExternrefValues = [null, ...WasmNonNullExternrefValues];
+
+// Common array utilities
+
+// iota(n) creates an Array of length n with values 0..n-1
+function iota(len) {
+    let xs = [];
+    for ( let i=0 ; i < len ; i++ )
+        xs.push(i);
+    return xs;
+}
+
+// cross(A) where A is an array of length n creates an Array length n*n of
+// two-element Arrays representing all pairs of elements of A.
+function cross(xs) {
+    let results = [];
+    for ( let x of xs )
+        for ( let y of xs )
+            results.push([x,y]);
+    return results;
+}
+
+// Remove all values equal to v from an array xs, comparing equal for NaN.
+function remove(v, xs) {
+    let result = [];
+    for ( let w of xs ) {
+        if (v === w || isNaN(v) && isNaN(w))
+            continue;
+        result.push(w);
+    }
+    return result;
+}
+
+// permute(A) where A is an Array returns an Array of Arrays, each inner Array a
+// distinct permutation of the elements of A.  A is assumed not to have any
+// elements that are pairwise equal in the sense of remove().
+function permute(xs) {
+    if (xs.length == 1)
+        return [xs];
+    let results = [];
+    for (let v of xs)
+        for (let tail of permute(remove(v, xs)))
+            results.push([v, ...tail]);
+    return results;
+}
+
+// interleave([a,b,c,...],[0,1,2,...]) => [a,0,b,1,c,2,...]
+function interleave(xs, ys) {
+    assertEq(xs.length, ys.length);
+    let res = [];
+    for ( let i=0 ; i < xs.length; i++ ) {
+        res.push(xs[i]);
+        res.push(ys[i]);
+    }
+    return res;
+}
+
+// assertSame([a,...],[b,...]) asserts that the two arrays have the same length
+// and that they element-wise assertEq IGNORING Number/BigInt differences.  This
+// predicate is in this file because it is wasm-specific.
+function assertSame(got, expected) {
+    assertEq(got.length, expected.length);
+    for ( let i=0; i < got.length; i++ ) {
+        let g = got[i];
+        let e = expected[i];
+        if (typeof g != typeof e) {
+            if (typeof g == "bigint")
+                e = BigInt(e);
+            else if (typeof e == "bigint")
+                g = BigInt(g);
+        }
+        assertEq(g, e);
+    }
 }

@@ -36,6 +36,7 @@ fn accept_as_ident(ident: &Ident) -> bool {
 }
 
 #[cfg(feature = "parsing")]
+#[cfg_attr(doc_cfg, doc(cfg(feature = "parsing")))]
 impl Parse for Ident {
     fn parse(input: ParseStream) -> Result<Self> {
         input.step(|cursor| {
@@ -89,7 +90,7 @@ impl From<Token![_]> for Ident {
 pub fn xid_ok(symbol: &str) -> bool {
     let mut chars = symbol.chars();
     let first = chars.next().unwrap();
-    if !(UnicodeXID::is_xid_start(first) || first == '_') {
+    if !(first == '_' || UnicodeXID::is_xid_start(first)) {
         return false;
     }
     for ch in chars {

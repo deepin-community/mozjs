@@ -20,7 +20,7 @@
 #include "mozilla/Types.h"
 
 #include "builtin/AtomicsObject.h"
-#include "vm/ArrayBufferObject.h"
+#include "vm/Uint8Clamped.h"
 
 #if !defined(__clang__) && !defined(__GNUC__)
 #  error "This file only for gcc-compatible compilers"
@@ -60,15 +60,6 @@ struct MOZ_RAII AddressGuard {
 
 }  // namespace jit
 }  // namespace js
-
-inline bool js::jit::AtomicOperations::Initialize() {
-  // Nothing
-  return true;
-}
-
-inline void js::jit::AtomicOperations::ShutDown() {
-  // Nothing
-}
 
 inline bool js::jit::AtomicOperations::hasAtomic8() { return true; }
 

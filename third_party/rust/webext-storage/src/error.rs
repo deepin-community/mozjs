@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use failure::Fail;
 use interrupt_support::Interrupted;
 use sync15_traits::bridged_engine;
 
@@ -13,49 +12,46 @@ pub enum QuotaReason {
     MaxItems,
 }
 
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum ErrorKind {
-    #[fail(display = "Quota exceeded: {:?}", _0)]
+    #[error("Quota exceeded: {0:?}")]
     QuotaError(QuotaReason),
 
-    #[fail(display = "Error parsing JSON data: {}", _0)]
-    JsonError(#[fail(cause)] serde_json::Error),
+    #[error("Error parsing JSON data: {0}")]
+    JsonError(#[from] serde_json::Error),
 
-    #[fail(display = "Error executing SQL: {}", _0)]
-    SqlError(#[fail(cause)] rusqlite::Error),
+    #[error("Error executing SQL: {0}")]
+    SqlError(#[from] rusqlite::Error),
 
-    #[fail(display = "A connection of this type is already open")]
+    #[error("A connection of this type is already open")]
     ConnectionAlreadyOpen,
 
-    #[fail(display = "An invalid connection type was specified")]
+    #[error("An invalid connection type was specified")]
     InvalidConnectionType,
 
-    #[fail(display = "IO error: {}", _0)]
-    IoError(#[fail(cause)] std::io::Error),
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
 
-    #[fail(display = "Operation interrupted")]
-    InterruptedError(#[fail(cause)] Interrupted),
+    #[error("Operation interrupted")]
+    InterruptedError(#[from] Interrupted),
 
-    #[fail(display = "Tried to close connection on wrong StorageApi instance")]
+    #[error("Tried to close connection on wrong StorageApi instance")]
     WrongApiForClose,
 
     // This will happen if you provide something absurd like
     // "/" or "" as your database path. For more subtley broken paths,
     // we'll likely return an IoError.
-    #[fail(display = "Illegal database path: {:?}", _0)]
+    #[error("Illegal database path: {0:?}")]
     IllegalDatabasePath(std::path::PathBuf),
 
-    #[fail(display = "UTF8 Error: {}", _0)]
-    Utf8Error(#[fail(cause)] std::str::Utf8Error),
+    #[error("UTF8 Error: {0}")]
+    Utf8Error(#[from] std::str::Utf8Error),
 
-    #[fail(display = "Database cannot be upgraded")]
-    DatabaseUpgradeError,
+    #[error("Error opening database: {0}")]
+    OpenDatabaseError(#[from] sql_support::open_database::Error),
 
-    #[fail(display = "Database version {} is not supported", _0)]
-    UnsupportedDatabaseVersion(i64),
-
-    #[fail(display = "{}", _0)]
-    IncomingPayloadError(#[fail(cause)] bridged_engine::PayloadError),
+    #[error("{0}")]
+    IncomingPayloadError(#[from] bridged_engine::PayloadError),
 }
 
 error_support::define_error! {
@@ -65,6 +61,7 @@ error_support::define_error! {
         (IoError, std::io::Error),
         (InterruptedError, Interrupted),
         (Utf8Error, std::str::Utf8Error),
-        (IncomingPayloadError, bridged_engine::PayloadError)
+        (IncomingPayloadError, bridged_engine::PayloadError),
+        (OpenDatabaseError, sql_support::open_database::Error),
     }
 }

@@ -7,14 +7,11 @@
 #ifndef debugger_Frame_h
 #define debugger_Frame_h
 
-#include "mozilla/Attributes.h"  // for MOZ_MUST_USE
-#include "mozilla/Maybe.h"       // for Maybe
-#include "mozilla/Range.h"       // for Range
-#include "mozilla/Result.h"      // for Result
+#include "mozilla/Maybe.h"   // for Maybe
+#include "mozilla/Range.h"   // for Range
+#include "mozilla/Result.h"  // for Result
 
 #include <stddef.h>  // for size_t
-
-#include "jsapi.h"  // for JSContext, CallArgs
 
 #include "NamespaceImports.h"   // for Value, MutableHandleValue, HandleObject
 #include "debugger/DebugAPI.h"  // for ResumeMode
@@ -25,6 +22,8 @@
 #include "vm/JSObject.h"        // for JSObject
 #include "vm/NativeObject.h"    // for NativeObject
 #include "vm/Stack.h"           // for AbstractFramePtr
+
+struct JS_PUBLIC_API JSContext;
 
 namespace js {
 
@@ -51,7 +50,7 @@ class ScriptedOnStepHandler final : public OnStepHandler {
   explicit ScriptedOnStepHandler(JSObject* object);
   virtual JSObject* object() const override;
   virtual void hold(JSObject* owner) override;
-  virtual void drop(JSFreeOp* fop, JSObject* owner) override;
+  virtual void drop(JS::GCContext* gcx, JSObject* owner) override;
   virtual void trace(JSTracer* tracer) override;
   virtual size_t allocSize() const override;
   virtual bool onStep(JSContext* cx, HandleDebuggerFrame frame,
@@ -84,7 +83,7 @@ class ScriptedOnPopHandler final : public OnPopHandler {
   explicit ScriptedOnPopHandler(JSObject* object);
   virtual JSObject* object() const override;
   virtual void hold(JSObject* owner) override;
-  virtual void drop(JSFreeOp* fop, JSObject* owner) override;
+  virtual void drop(JS::GCContext* gcx, JSObject* owner) override;
   virtual void trace(JSTracer* tracer) override;
   virtual size_t allocSize() const override;
   virtual bool onPop(JSContext* cx, HandleDebuggerFrame frame,
@@ -121,12 +120,11 @@ class DebuggerFrame : public NativeObject {
   static const JSClass class_;
 
   enum {
-    OWNER_SLOT = 0,
+    FRAME_ITER_SLOT = 0,
+    OWNER_SLOT,
     ARGUMENTS_SLOT,
     ONSTEP_HANDLER_SLOT,
     ONPOP_HANDLER_SLOT,
-
-    HAS_INCREMENTED_STEPPER_SLOT,
 
     // If this is a frame for a generator call, and the generator object has
     // been created (which doesn't happen until after default argument
@@ -153,55 +151,54 @@ class DebuggerFrame : public NativeObject {
                                const FrameIter* maybeIter,
                                Handle<AbstractGeneratorObject*> maybeGenerator);
 
-  static MOZ_MUST_USE bool getArguments(JSContext* cx,
-                                        HandleDebuggerFrame frame,
-                                        MutableHandleDebuggerArguments result);
-  static MOZ_MUST_USE bool getCallee(JSContext* cx, HandleDebuggerFrame frame,
-                                     MutableHandleDebuggerObject result);
-  static MOZ_MUST_USE bool getIsConstructing(JSContext* cx,
-                                             HandleDebuggerFrame frame,
-                                             bool& result);
-  static MOZ_MUST_USE bool getEnvironment(
+  [[nodiscard]] static bool getArguments(JSContext* cx,
+                                         HandleDebuggerFrame frame,
+                                         MutableHandleDebuggerArguments result);
+  [[nodiscard]] static bool getCallee(JSContext* cx, HandleDebuggerFrame frame,
+                                      MutableHandleDebuggerObject result);
+  [[nodiscard]] static bool getIsConstructing(JSContext* cx,
+                                              HandleDebuggerFrame frame,
+                                              bool& result);
+  [[nodiscard]] static bool getEnvironment(
       JSContext* cx, HandleDebuggerFrame frame,
       MutableHandleDebuggerEnvironment result);
-  static MOZ_MUST_USE bool getOffset(JSContext* cx, HandleDebuggerFrame frame,
-                                     size_t& result);
-  static MOZ_MUST_USE bool getOlder(JSContext* cx, HandleDebuggerFrame frame,
-                                    MutableHandleDebuggerFrame result);
-  static MOZ_MUST_USE bool getAsyncPromise(JSContext* cx,
-                                           HandleDebuggerFrame frame,
-                                           MutableHandleDebuggerObject result);
-  static MOZ_MUST_USE bool getOlderSavedFrame(JSContext* cx,
-                                              HandleDebuggerFrame frame,
-                                              MutableHandleSavedFrame result);
-  static MOZ_MUST_USE bool getThis(JSContext* cx, HandleDebuggerFrame frame,
-                                   MutableHandleValue result);
+  [[nodiscard]] static bool getOffset(JSContext* cx, HandleDebuggerFrame frame,
+                                      size_t& result);
+  [[nodiscard]] static bool getOlder(JSContext* cx, HandleDebuggerFrame frame,
+                                     MutableHandleDebuggerFrame result);
+  [[nodiscard]] static bool getAsyncPromise(JSContext* cx,
+                                            HandleDebuggerFrame frame,
+                                            MutableHandleDebuggerObject result);
+  [[nodiscard]] static bool getOlderSavedFrame(JSContext* cx,
+                                               HandleDebuggerFrame frame,
+                                               MutableHandleSavedFrame result);
+  [[nodiscard]] static bool getThis(JSContext* cx, HandleDebuggerFrame frame,
+                                    MutableHandleValue result);
   static DebuggerFrameType getType(HandleDebuggerFrame frame);
   static DebuggerFrameImplementation getImplementation(
       HandleDebuggerFrame frame);
-  static MOZ_MUST_USE bool setOnStepHandler(JSContext* cx,
-                                            HandleDebuggerFrame frame,
-                                            OnStepHandler* handler);
+  [[nodiscard]] static bool setOnStepHandler(JSContext* cx,
+                                             HandleDebuggerFrame frame,
+                                             UniquePtr<OnStepHandler> handler);
 
-  static MOZ_MUST_USE JS::Result<Completion> eval(
+  [[nodiscard]] static JS::Result<Completion> eval(
       JSContext* cx, HandleDebuggerFrame frame,
       mozilla::Range<const char16_t> chars, HandleObject bindings,
       const EvalOptions& options);
 
-  static MOZ_MUST_USE DebuggerFrame* check(JSContext* cx, HandleValue thisv);
+  [[nodiscard]] static DebuggerFrame* check(JSContext* cx, HandleValue thisv);
 
   bool isOnStack() const;
 
-  // Like isOnStack, but works even in the midst of a relocating GC.
-  bool isOnStackMaybeForwarded() const;
+  bool isSuspended() const;
 
   OnStepHandler* onStepHandler() const;
   OnPopHandler* onPopHandler() const;
   void setOnPopHandler(JSContext* cx, OnPopHandler* handler);
 
-  inline bool hasGenerator() const;
+  inline bool hasGeneratorInfo() const;
 
-  // If hasGenerator(), return an direct cross-compartment reference to this
+  // If hasGeneratorInfo(), return an direct cross-compartment reference to this
   // Debugger.Frame's generator object.
   AbstractGeneratorObject& unwrappedGenerator() const;
 
@@ -226,8 +223,9 @@ class DebuggerFrame : public NativeObject {
    * association while the call is on the stack, and the relationships are easy
    * to discern.
    */
-  MOZ_MUST_USE bool setGenerator(JSContext* cx,
-                                 Handle<AbstractGeneratorObject*> genObj);
+  [[nodiscard]] static bool setGeneratorInfo(
+      JSContext* cx, HandleDebuggerFrame frame,
+      Handle<AbstractGeneratorObject*> genObj);
 
   /*
    * Undo the effects of a prior call to setGenerator.
@@ -244,10 +242,7 @@ class DebuggerFrame : public NativeObject {
    * function will not otherwise disturb generatorFrames. Passing the enum
    * allows this function to be used while iterating over generatorFrames.
    */
-  void clearGenerator(JSFreeOp* fop);
-  void clearGenerator(
-      JSFreeOp* fop, Debugger* owner,
-      Debugger::GeneratorWeakMap::Enum* maybeGeneratorFramesEnum = nullptr);
+  void clearGeneratorInfo(JS::GCContext* gcx);
 
   /*
    * Called after a generator/async frame is resumed, before exposing this
@@ -257,41 +252,43 @@ class DebuggerFrame : public NativeObject {
 
   bool hasAnyHooks() const;
 
+  bool isInstance() const;
+  Debugger* owner() const;
+
  private:
   static const JSClassOps classOps_;
 
   static const JSPropertySpec properties_[];
   static const JSFunctionSpec methods_[];
 
-  static void finalize(JSFreeOp* fop, JSObject* obj);
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
 
   static AbstractFramePtr getReferent(HandleDebuggerFrame frame);
-  static MOZ_MUST_USE bool getFrameIter(JSContext* cx,
-                                        HandleDebuggerFrame frame,
-                                        mozilla::Maybe<FrameIter>& result);
-  static MOZ_MUST_USE bool requireScriptReferent(JSContext* cx,
-                                                 HandleDebuggerFrame frame);
+  [[nodiscard]] static bool requireScriptReferent(JSContext* cx,
+                                                  HandleDebuggerFrame frame);
 
-  static MOZ_MUST_USE bool construct(JSContext* cx, unsigned argc, Value* vp);
+  [[nodiscard]] static bool construct(JSContext* cx, unsigned argc, Value* vp);
 
   struct CallData;
 
-  Debugger* owner() const;
+  [[nodiscard]] bool incrementStepperCounter(JSContext* cx,
+                                             AbstractFramePtr referent);
+  [[nodiscard]] bool incrementStepperCounter(JSContext* cx,
+                                             HandleScript script);
+  void decrementStepperCounter(JS::GCContext* gcx, JSScript* script);
+  void decrementStepperCounter(JS::GCContext* gcx, AbstractFramePtr referent);
 
-  bool hasIncrementedStepper() const;
-  void setHasIncrementedStepper(bool incremented);
-
-  MOZ_MUST_USE bool maybeIncrementStepperCounter(JSContext* cx,
-                                                 AbstractFramePtr referent);
-  MOZ_MUST_USE bool maybeIncrementStepperCounter(JSContext* cx,
-                                                 JSScript* script);
-  void maybeDecrementStepperCounter(JSFreeOp* fop, JSScript* script);
-
- public:
   FrameIter::Data* frameIterData() const;
   void setFrameIterData(FrameIter::Data*);
-  void freeFrameIterData(JSFreeOp* fop);
-  void maybeDecrementStepperCounter(JSFreeOp* fop, AbstractFramePtr referent);
+  void freeFrameIterData(JS::GCContext* gcx);
+
+ public:
+  FrameIter getFrameIter(JSContext* cx);
+
+  void terminate(JS::GCContext* gcx, AbstractFramePtr frame);
+  void suspend(JS::GCContext* gcx);
+
+  [[nodiscard]] bool replaceFrameIterData(JSContext* cx, const FrameIter&);
 
   class GeneratorInfo;
   inline GeneratorInfo* generatorInfo() const;

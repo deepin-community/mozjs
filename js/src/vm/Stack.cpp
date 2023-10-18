@@ -6,10 +6,10 @@
 
 #include "vm/Stack-inl.h"
 
-#include "mozilla/ArrayUtils.h"  // mozilla::ArrayLength
-#include "mozilla/Maybe.h"       // mozilla::Maybe
+#include "mozilla/Maybe.h"  // mozilla::Maybe
 
 #include <algorithm>  // std::max
+#include <iterator>   // std::size
 #include <stddef.h>   // size_t
 #include <stdint.h>   // uint8_t, uint32_t
 #include <utility>    // std::move
@@ -18,11 +18,13 @@
 #include "gc/Marking.h"
 #include "gc/Tracer.h"  // js::TraceRoot
 #include "jit/JitcodeMap.h"
-#include "js/Value.h"      // JS::Value
-#include "vm/FrameIter.h"  // js::FrameIter
+#include "jit/JitRuntime.h"
+#include "js/friend/ErrorMessages.h"  // JSMSG_*
+#include "js/Value.h"                 // JS::Value
+#include "vm/FrameIter.h"             // js::FrameIter
 #include "vm/JSContext.h"
 #include "vm/Opcodes.h"
-#include "wasm/WasmInstance.h"
+#include "wasm/WasmProcess.h"
 
 #include "jit/JSJitFrameIter-inl.h"
 #include "vm/Compartment-inl.h"
@@ -32,7 +34,6 @@
 
 using namespace js;
 
-using mozilla::ArrayLength;
 using mozilla::Maybe;
 
 using JS::Value;
@@ -41,13 +42,9 @@ using JS::Value;
 
 void InterpreterFrame::initExecuteFrame(JSContext* cx, HandleScript script,
                                         AbstractFramePtr evalInFramePrev,
-                                        HandleValue newTargetValue,
                                         HandleObject envChain) {
   flags_ = 0;
   script_ = script;
-
-  Value* dstvp = (Value*)this - 1;
-  dstvp[0] = newTargetValue;
 
   envChain_ = envChain.get();
   prev_ = nullptr;
@@ -71,8 +68,7 @@ ArrayObject* InterpreterFrame::createRestParameter(JSContext* cx) {
   unsigned nformal = callee().nargs() - 1, nactual = numActualArgs();
   unsigned nrest = (nactual > nformal) ? nactual - nformal : 0;
   Value* restvp = argv() + nformal;
-  return ObjectGroup::newArrayObject(cx, restvp, nrest, GenericObject,
-                                     ObjectGroup::NewArrayKind::UnknownIndex);
+  return NewDenseCopiedArray(cx, nrest, restvp);
 }
 
 static inline void AssertScopeMatchesEnvironment(Scope* scope,
@@ -110,9 +106,11 @@ static inline void AssertScopeMatchesEnvironment(Scope* scope,
         case ScopeKind::NamedLambda:
         case ScopeKind::StrictNamedLambda:
         case ScopeKind::FunctionLexical:
-          MOZ_ASSERT(&env->as<LexicalEnvironmentObject>().scope() ==
+        case ScopeKind::ClassBody:
+          MOZ_ASSERT(&env->as<ScopedLexicalEnvironmentObject>().scope() ==
                      si.scope());
-          env = &env->as<LexicalEnvironmentObject>().enclosingEnvironment();
+          env =
+              &env->as<ScopedLexicalEnvironmentObject>().enclosingEnvironment();
           break;
 
         case ScopeKind::With:
@@ -126,8 +124,8 @@ static inline void AssertScopeMatchesEnvironment(Scope* scope,
           break;
 
         case ScopeKind::Global:
-          MOZ_ASSERT(env->as<LexicalEnvironmentObject>().isGlobal());
-          env = &env->as<LexicalEnvironmentObject>().enclosingEnvironment();
+          env =
+              &env->as<GlobalLexicalEnvironmentObject>().enclosingEnvironment();
           MOZ_ASSERT(env->is<GlobalObject>());
           break;
 
@@ -231,13 +229,15 @@ void InterpreterFrame::epilogue(JSContext* cx, jsbytecode* pc) {
   MOZ_ASSERT(isEvalFrame() || isGlobalFrame() || isModuleFrame());
 }
 
-bool InterpreterFrame::checkReturn(JSContext* cx, HandleValue thisv) {
+bool InterpreterFrame::checkReturn(JSContext* cx, HandleValue thisv,
+                                   MutableHandleValue result) {
   MOZ_ASSERT(script()->isDerivedClassConstructor());
   MOZ_ASSERT(isFunctionFrame());
   MOZ_ASSERT(callee().isClassConstructor());
 
   HandleValue retVal = returnValue();
   if (retVal.isObject()) {
+    result.set(retVal);
     return true;
   }
 
@@ -251,7 +251,7 @@ bool InterpreterFrame::checkReturn(JSContext* cx, HandleValue thisv) {
     return ThrowUninitializedThis(cx);
   }
 
-  setReturnValue(thisv);
+  result.set(thisv);
   return true;
 }
 
@@ -261,8 +261,8 @@ bool InterpreterFrame::pushVarEnvironment(JSContext* cx, HandleScope scope) {
 
 bool InterpreterFrame::pushLexicalEnvironment(JSContext* cx,
                                               Handle<LexicalScope*> scope) {
-  LexicalEnvironmentObject* env =
-      LexicalEnvironmentObject::createForFrame(cx, scope, this);
+  BlockLexicalEnvironmentObject* env =
+      BlockLexicalEnvironmentObject::createForFrame(cx, scope, this);
   if (!env) {
     return false;
   }
@@ -272,9 +272,10 @@ bool InterpreterFrame::pushLexicalEnvironment(JSContext* cx,
 }
 
 bool InterpreterFrame::freshenLexicalEnvironment(JSContext* cx) {
-  Rooted<LexicalEnvironmentObject*> env(
-      cx, &envChain_->as<LexicalEnvironmentObject>());
-  LexicalEnvironmentObject* fresh = LexicalEnvironmentObject::clone(cx, env);
+  Rooted<BlockLexicalEnvironmentObject*> env(
+      cx, &envChain_->as<BlockLexicalEnvironmentObject>());
+  BlockLexicalEnvironmentObject* fresh =
+      BlockLexicalEnvironmentObject::clone(cx, env);
   if (!fresh) {
     return false;
   }
@@ -284,14 +285,27 @@ bool InterpreterFrame::freshenLexicalEnvironment(JSContext* cx) {
 }
 
 bool InterpreterFrame::recreateLexicalEnvironment(JSContext* cx) {
-  Rooted<LexicalEnvironmentObject*> env(
-      cx, &envChain_->as<LexicalEnvironmentObject>());
-  LexicalEnvironmentObject* fresh = LexicalEnvironmentObject::recreate(cx, env);
+  Rooted<BlockLexicalEnvironmentObject*> env(
+      cx, &envChain_->as<BlockLexicalEnvironmentObject>());
+  BlockLexicalEnvironmentObject* fresh =
+      BlockLexicalEnvironmentObject::recreate(cx, env);
   if (!fresh) {
     return false;
   }
 
   replaceInnermostEnvironment(*fresh);
+  return true;
+}
+
+bool InterpreterFrame::pushClassBodyEnvironment(JSContext* cx,
+                                                Handle<ClassBodyScope*> scope) {
+  ClassBodyLexicalEnvironmentObject* env =
+      ClassBodyLexicalEnvironmentObject::createForFrame(cx, scope, this);
+  if (!env) {
+    return false;
+  }
+
+  pushOnEnvironmentChain(*env);
   return true;
 }
 
@@ -318,9 +332,6 @@ void InterpreterFrame::trace(JSTracer* trc, Value* sp, jsbytecode* pc) {
     // Trace arguments.
     unsigned argc = std::max(numActualArgs(), numFormalArgs());
     TraceRootRange(trc, argc + isConstructing(), argv_, "fp argv");
-  } else {
-    // Trace newTarget.
-    TraceRoot(trc, ((Value*)this) - 1, "stack newTarget");
   }
 
   JSScript* script = this->script();
@@ -400,21 +411,20 @@ InterpreterFrame* InterpreterStack::pushInvokeFrame(
 }
 
 InterpreterFrame* InterpreterStack::pushExecuteFrame(
-    JSContext* cx, HandleScript script, HandleValue newTargetValue,
-    HandleObject envChain, AbstractFramePtr evalInFrame) {
+    JSContext* cx, HandleScript script, HandleObject envChain,
+    AbstractFramePtr evalInFrame) {
   LifoAlloc::Mark mark = allocator_.mark();
 
-  unsigned nvars = 1 /* newTarget */ + script->nslots();
+  unsigned nvars = script->nslots();
   uint8_t* buffer =
       allocateFrame(cx, sizeof(InterpreterFrame) + nvars * sizeof(Value));
   if (!buffer) {
     return nullptr;
   }
 
-  InterpreterFrame* fp =
-      reinterpret_cast<InterpreterFrame*>(buffer + 1 * sizeof(Value));
+  InterpreterFrame* fp = reinterpret_cast<InterpreterFrame*>(buffer);
   fp->mark_ = mark;
-  fp->initExecuteFrame(cx, script, evalInFrame, newTargetValue, envChain);
+  fp->initExecuteFrame(cx, script, evalInFrame, envChain);
   fp->initLocals();
 
   return fp;
@@ -718,8 +728,8 @@ uint32_t JS::ProfilingFrameIterator::extractStack(Frame* frames,
   const char* labels[64];
   uint32_t depth = entry.callStackAtAddr(cx_->runtime(),
                                          jsJitIter().resumePCinCurrentFrame(),
-                                         labels, ArrayLength(labels));
-  MOZ_ASSERT(depth < ArrayLength(labels));
+                                         labels, std::size(labels));
+  MOZ_ASSERT(depth < std::size(labels));
   for (uint32_t i = 0; i < depth; i++) {
     if (offset + i >= end) {
       return i;
@@ -744,4 +754,12 @@ bool JS::ProfilingFrameIterator::isWasm() const {
 
 bool JS::ProfilingFrameIterator::isJSJit() const {
   return kind_ == Kind::JSJit;
+}
+
+mozilla::Maybe<JS::ProfilingFrameIterator::RegisterState>
+JS::ProfilingFrameIterator::getCppEntryRegisters() const {
+  if (!isJSJit()) {
+    return mozilla::Nothing{};
+  }
+  return jit::JitRuntime::getCppEntryRegisters(jsJitIter().framePtr());
 }

@@ -10,6 +10,11 @@
 #include "ThreadAllows.h"
 #include "plugin.h"
 
+#if CLANG_VERSION_FULL >= 1300
+// Starting with clang-13 some functions from StringRef have been renamed
+#define compare_lower compare_insensitive
+#endif
+
 inline StringRef getFilename(const SourceManager &SM, SourceLocation Loc) {
   // We use the presumed location to handle #line directives and such, so the
   // plugin is friendly to icecc / sccache users.
@@ -134,7 +139,7 @@ inline bool typeHasVTable(QualType T) {
   return Offender && Offender->hasDefinition() && Offender->isDynamicClass();
 }
 
-inline std::string getDeclarationNamespace(const Decl *Declaration) {
+inline StringRef getDeclarationNamespace(const Decl *Declaration) {
   const DeclContext *DC =
       Declaration->getDeclContext()->getEnclosingNamespaceContext();
   const NamespaceDecl *ND = dyn_cast<NamespaceDecl>(DC);
@@ -154,7 +159,7 @@ inline std::string getDeclarationNamespace(const Decl *Declaration) {
 }
 
 inline bool isInIgnoredNamespaceForImplicitCtor(const Decl *Declaration) {
-  std::string Name = getDeclarationNamespace(Declaration);
+  StringRef Name = getDeclarationNamespace(Declaration);
   if (Name == "") {
     return false;
   }
@@ -164,7 +169,7 @@ inline bool isInIgnoredNamespaceForImplicitCtor(const Decl *Declaration) {
          Name == "boost" ||             // boost
          Name == "webrtc" ||            // upstream webrtc
          Name == "rtc" ||               // upstream webrtc 'base' package
-         Name.substr(0, 4) == "icu_" || // icu
+         Name.startswith("icu_") ||     // icu
          Name == "google" ||            // protobuf
          Name == "google_breakpad" ||   // breakpad
          Name == "soundtouch" ||        // libsoundtouch
@@ -179,7 +184,7 @@ inline bool isInIgnoredNamespaceForImplicitCtor(const Decl *Declaration) {
 }
 
 inline bool isInIgnoredNamespaceForImplicitConversion(const Decl *Declaration) {
-  std::string Name = getDeclarationNamespace(Declaration);
+  StringRef Name = getDeclarationNamespace(Declaration);
   if (Name == "") {
     return false;
   }
@@ -187,6 +192,7 @@ inline bool isInIgnoredNamespaceForImplicitConversion(const Decl *Declaration) {
   return Name == "std" ||             // standard C++ lib
          Name == "__gnu_cxx" ||       // gnu C++ lib
          Name == "google_breakpad" || // breakpad
+         Name == "webrtc" ||          // libwebrtc
          Name == "testing" ||         // gtest
          Name == "rlbox";             // rlbox
 }
@@ -229,7 +235,7 @@ inline bool isIgnoredPathForSprintfLiteral(const CallExpr *Call,
         Begin->compare_lower(StringRef("icu")) == 0 ||
         Begin->compare_lower(StringRef("jsoncpp")) == 0 ||
         Begin->compare_lower(StringRef("libstagefright")) == 0 ||
-        Begin->compare_lower(StringRef("mtransport")) == 0 ||
+        Begin->compare_lower(StringRef("transport")) == 0 ||
         Begin->compare_lower(StringRef("protobuf")) == 0 ||
         Begin->compare_lower(StringRef("skia")) == 0 ||
         Begin->compare_lower(StringRef("sfntly")) == 0 ||
@@ -489,4 +495,5 @@ inline bool isInfixBinaryOp(const CXXOperatorCallExpr *OpCall) {
 #endif
 }
 
+#undef compare_lower
 #endif

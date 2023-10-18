@@ -6,10 +6,12 @@
 
 #include "proxy/DeadObjectProxy.h"
 
-#include "jsapi.h"
-
-#include "vm/JSFunction.h"  // XXXefaust Bug 1064662
+#include "js/ErrorReport.h"           // JS_ReportErrorNumberASCII
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "vm/JSFunction.h"            // XXXefaust Bug 1064662
 #include "vm/ProxyObject.h"
+
+#include "vm/JSObject-inl.h"
 
 using namespace js;
 
@@ -22,7 +24,7 @@ static void ReportDead(JSContext* cx) {
 
 bool DeadObjectProxy::getOwnPropertyDescriptor(
     JSContext* cx, HandleObject wrapper, HandleId id,
-    MutableHandle<PropertyDescriptor> desc) const {
+    MutableHandle<mozilla::Maybe<PropertyDescriptor>> desc) const {
   ReportDead(cx);
   return false;
 }
@@ -92,12 +94,6 @@ bool DeadObjectProxy::nativeCall(JSContext* cx, IsAcceptableThis test,
   return false;
 }
 
-bool DeadObjectProxy::hasInstance(JSContext* cx, HandleObject proxy,
-                                  MutableHandleValue v, bool* bp) const {
-  ReportDead(cx);
-  return false;
-}
-
 bool DeadObjectProxy::getBuiltinClass(JSContext* cx, HandleObject proxy,
                                       ESClass* cls) const {
   ReportDead(cx);
@@ -127,51 +123,34 @@ RegExpShared* DeadObjectProxy::regexp_toShared(JSContext* cx,
   return nullptr;
 }
 
-bool js::IsDeadProxyObject(JSObject* obj) {
+bool js::IsDeadProxyObject(const JSObject* obj) {
   return IsDerivedProxyObject(obj, &DeadObjectProxy::singleton);
 }
 
-Value js::DeadProxyTargetValue(ProxyObject* obj) {
+Value js::DeadProxyTargetValue(JSObject* obj) {
   // When nuking scripted proxies, isCallable and isConstructor values for
   // the proxy needs to be preserved.  So does background-finalization status.
   int32_t flags = 0;
-  if (obj->handler()->isCallable(obj)) {
+  if (obj->isCallable()) {
     flags |= DeadObjectProxyIsCallable;
   }
-  if (obj->handler()->isConstructor(obj)) {
+  if (obj->isConstructor()) {
     flags |= DeadObjectProxyIsConstructor;
   }
-  if (obj->handler()->finalizeInBackground(obj->private_())) {
+  if (obj->isBackgroundFinalized()) {
     flags |= DeadObjectProxyIsBackgroundFinalized;
   }
   return Int32Value(flags);
 }
 
 JSObject* js::NewDeadProxyObject(JSContext* cx, JSObject* origObj) {
-  MOZ_ASSERT_IF(origObj, origObj->is<ProxyObject>());
-
   RootedValue target(cx);
-  if (origObj && origObj->is<ProxyObject>()) {
-    target = DeadProxyTargetValue(&origObj->as<ProxyObject>());
+  if (origObj) {
+    target = DeadProxyTargetValue(origObj);
   } else {
     target = Int32Value(DeadObjectProxyIsBackgroundFinalized);
   }
 
-  return NewProxyObject(cx, &DeadObjectProxy::singleton, target, nullptr,
-                        ProxyOptions());
-}
-
-JSObject* js::NewDeadProxyObject(JSContext* cx, IsCallableFlag isCallable,
-                                 IsConstructorFlag isConstructor) {
-  int32_t flags = 0;
-  if (isCallable == IsCallableFlag::True) {
-    flags |= DeadObjectProxyIsCallable;
-  }
-  if (isConstructor == IsConstructorFlag::True) {
-    flags |= DeadObjectProxyIsConstructor;
-  }
-
-  RootedValue target(cx, Int32Value(flags));
   return NewProxyObject(cx, &DeadObjectProxy::singleton, target, nullptr,
                         ProxyOptions());
 }

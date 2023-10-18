@@ -6,23 +6,15 @@
 
 #include "vm/TraceLoggingGraph.h"
 
-#ifdef XP_WIN
-#  include <process.h>
-#  define getpid _getpid
-#else
-#  include <unistd.h>
-#endif
-
 #include "mozilla/EndianUtils.h"
 #include "mozilla/MemoryReporting.h"
 #include "mozilla/ScopeExit.h"
 
 #include "js/Printf.h"
-#include "js/UniquePtr.h"
 #include "threading/LockGuard.h"
 #include "threading/Thread.h"
+#include "util/GetPidProvider.h"  // getpid()
 #include "util/Text.h"
-#include "vm/TraceLogging.h"
 
 #ifndef DEFAULT_TRACE_LOG_DIR
 #  if defined(_WIN32)

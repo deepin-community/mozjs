@@ -479,6 +479,15 @@ Assembler::Assembler(PositionIndependentCodeOption pic)
 {
   // Mozilla change: always use maximally-present features.
   cpu_features_.Combine(CPUFeatures::InferFromOS());
+
+  // Mozilla change: Compile time hard-coded value from js-config.mozbuild.
+#ifndef MOZ_AARCH64_JSCVT
+#  error "MOZ_AARCH64_JSCVT must be defined."
+#elif MOZ_AARCH64_JSCVT >= 1
+  // Note, vixl backend implements the JSCVT flag as a boolean despite having 3
+  // extra bits reserved for forward compatibility in the ARMv8 documentation.
+  cpu_features_.Combine(CPUFeatures::kJSCVT);
+#endif
 }
 
 
@@ -2274,7 +2283,7 @@ void Assembler::fmov(const VRegister& vd, float imm) {
     VIXL_ASSERT(vd.Is1S());
     Emit(FMOV_s_imm | Rd(vd) | ImmFP32(imm));
   } else {
-    VIXL_ASSERT(vd.Is2S() | vd.Is4S());
+    VIXL_ASSERT(vd.Is2S() || vd.Is4S());
     Instr op = NEONModifiedImmediate_MOVI;
     Instr q = vd.Is4S() ?  NEON_Q : 0;
     uint32_t encoded_imm = FP32ToImm8(imm);
